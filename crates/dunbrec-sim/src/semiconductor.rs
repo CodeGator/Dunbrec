@@ -6,21 +6,29 @@
 //! voltages are limited between iterations (SPICE's `pnjlim`/`fetlim`) so the
 //! exponential curves cannot throw the iteration far off.
 //!
+//! In transient analysis the devices also store charge: depletion charge in
+//! reverse-biased junctions (CJO/CJE/CJC/CBD) and diffusion charge from
+//! minority carriers (TT/TF/TR). Each charge is integrated like a nonlinear
+//! capacitor by a [`ChargeStore`]. In DC the charges play no part.
+//!
 //! Model parameters use SPICE names and defaults, at a fixed temperature of
-//! 27 °C. Charge storage (junction capacitance, transit time) is not
-//! modelled yet, so results are accurate at low and moderate frequencies.
+//! 27 °C.
 
 use std::cell::Cell;
 
 use dunbrec_core::{DeviceModel, NodeId};
 
-use crate::device::{Device, StampContext};
+use crate::device::{
+    Device, History, Integration, Mode, RING_CURRENT_FLOOR, RingDetector, StampContext, Tolerances,
+};
 use crate::stamp::{SolutionView, Stamper};
 
 /// Thermal voltage kT/q at 27 °C.
 pub const VT: f64 = 1.380_649e-23 * 300.15 / 1.602_176_634e-19;
 /// Minimum conductance placed across every junction (SPICE GMIN).
 pub const GMIN: f64 = 1e-12;
+/// Absolute charge tolerance for timestep control (SPICE CHGTOL).
+pub const CHGTOL: f64 = 1e-14;
 /// Changes smaller than this are not counted as limiting.
 const LIMIT_EPS: f64 = 1e-12;
 
@@ -111,6 +119,139 @@ fn param_positive_or_inf(model: &DeviceModel, name: &str) -> f64 {
     if v > 0.0 { v } else { f64::INFINITY }
 }
 
+// ------------------------------------------------------- charge storage ---
+
+/// Depletion (junction) capacitance: `C = CJ0 / (1 - v/VJ)^M`, continued
+/// linearly above `FC·VJ` so it stays finite in forward bias (SPICE).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Depletion {
+    pub cj0: f64,
+    pub vj: f64,
+    pub m: f64,
+    pub fc: f64,
+}
+
+impl Depletion {
+    pub fn is_zero(&self) -> bool {
+        self.cj0 == 0.0
+    }
+
+    /// Charge and capacitance at junction voltage `v`.
+    pub fn eval(&self, v: f64) -> (f64, f64) {
+        let Depletion { cj0, vj, m, fc } = *self;
+        if cj0 == 0.0 {
+            return (0.0, 0.0);
+        }
+        let v_knee = fc * vj;
+        if v < v_knee {
+            let arg = 1.0 - v / vj;
+            let c = cj0 * arg.powf(-m);
+            let q = if (1.0 - m).abs() < 1e-9 {
+                -cj0 * vj * arg.ln()
+            } else {
+                cj0 * vj / (1.0 - m) * (1.0 - arg.powf(1.0 - m))
+            };
+            (q, c)
+        } else {
+            // Charge at the knee plus the integral of the linear extension.
+            let (q_knee, _) = Depletion { fc: 1.0, ..*self }.eval(v_knee);
+            let f2 = (1.0 - fc).powf(1.0 + m);
+            let f3 = 1.0 - fc * (1.0 + m);
+            let c = cj0 / f2 * (f3 + m * v / vj);
+            let q = q_knee
+                + cj0 / f2 * (f3 * (v - v_knee) + m / (2.0 * vj) * (v * v - v_knee * v_knee));
+            (q, c)
+        }
+    }
+}
+
+/// Integrates one nonlinear charge `q(v)` between two nodes across
+/// transient steps. All values are in the device's own polarity frame.
+#[derive(Debug, Clone, Default)]
+pub struct ChargeStore {
+    q_prev: f64,
+    /// Current through the charge at the last accepted point.
+    pub i_prev: f64,
+    history: History,
+    ring: RingDetector,
+    pub ringing: bool,
+}
+
+impl ChargeStore {
+    fn k(h: f64, method: Integration) -> (f64, bool) {
+        match method {
+            Integration::BackwardEuler => (1.0 / h, false),
+            Integration::Trapezoidal => (2.0 / h, true),
+        }
+    }
+
+    pub fn begin(&mut self, q: f64, time: f64) {
+        self.q_prev = q;
+        self.i_prev = 0.0;
+        self.history.clear();
+        self.history.push(time, q);
+        self.ring.reset();
+        self.ringing = false;
+    }
+
+    /// Companion model linearised at `v_lin` where the charge is `q` and
+    /// the capacitance `c`: the current is `geq·v + ieq`.
+    pub fn companion(&self, q: f64, c: f64, v_lin: f64, h: f64, method: Integration) -> (f64, f64) {
+        let (k, trap) = Self::k(h, method);
+        let i_lin = k * (q - self.q_prev) - if trap { self.i_prev } else { 0.0 };
+        let geq = k * c;
+        (geq, i_lin - geq * v_lin)
+    }
+
+    pub fn accept(&mut self, q: f64, time: f64, h: f64, method: Integration, restart: bool) {
+        let (k, trap) = Self::k(h, method);
+        self.i_prev = k * (q - self.q_prev) - if trap { self.i_prev } else { 0.0 };
+        self.ringing = self.ring.push(self.i_prev, RING_CURRENT_FLOOR);
+        if restart {
+            self.history.clear();
+            self.history.push(time - h, self.q_prev);
+        }
+        self.q_prev = q;
+        self.history.push(time, q);
+    }
+
+    pub fn truncation_step(
+        &self,
+        q: f64,
+        time: f64,
+        h: f64,
+        method: Integration,
+        tol: &Tolerances,
+    ) -> Option<f64> {
+        let limit = tol.trtol * (tol.reltol * q.abs().max(self.q_prev.abs()) + CHGTOL);
+        self.history.suggest_step(time, q, h, method, limit)
+    }
+}
+
+/// Stamp a charge between `p` and `n` (current from `p` to `n`) during a
+/// transient step. `sign` converts the device frame to real polarity.
+fn stamp_charge(
+    s: &mut Stamper,
+    store: &ChargeStore,
+    (p, n): (NodeId, NodeId),
+    (q, c, v_lin): (f64, f64, f64),
+    sign: f64,
+    ctx: &StampContext,
+) {
+    if let Mode::Transient { h, method } = ctx.mode {
+        let (geq, ieq) = store.companion(q, c, v_lin, h, method);
+        s.conductance(p, n, geq);
+        s.current(p, n, sign * ieq);
+    }
+}
+
+fn transient_step(ctx: &StampContext) -> Option<(f64, Integration)> {
+    match ctx.mode {
+        Mode::Transient { h, method } => Some((h, method)),
+        Mode::Dc { .. } => None,
+    }
+}
+
 // ---------------------------------------------------------------- Diode ---
 
 #[derive(Debug, Clone, PartialEq)]
@@ -121,6 +262,9 @@ pub struct DiodeParams {
     /// Reverse breakdown voltage (positive), `None` if not modelled.
     pub bv: Option<f64>,
     pub ibv: f64,
+    pub depletion: Depletion,
+    /// Transit time (diffusion charge = TT · current).
+    pub tt: f64,
 }
 
 impl DiodeParams {
@@ -132,7 +276,36 @@ impl DiodeParams {
             rs: m.get_or("RS", 0.0),
             bv: (bv.is_finite() && bv > 0.0).then_some(bv),
             ibv: m.get_or("IBV", 1e-3),
+            depletion: Depletion {
+                // SPICE accepts both spellings.
+                cj0: m.get_or("CJO", m.get_or("CJ0", 0.0)),
+                vj: m.get_or("VJ", 1.0),
+                m: m.get_or("M", 0.5),
+                fc: m.get_or("FC", 0.5),
+            },
+            tt: m.get_or("TT", 0.0),
         }
+    }
+
+    pub fn simple(is: f64, n: f64) -> Self {
+        Self {
+            is,
+            n,
+            rs: 0.0,
+            bv: None,
+            ibv: 1e-3,
+            depletion: Depletion {
+                cj0: 0.0,
+                vj: 1.0,
+                m: 0.5,
+                fc: 0.5,
+            },
+            tt: 0.0,
+        }
+    }
+
+    fn has_charge(&self) -> bool {
+        self.tt != 0.0 || !self.depletion.is_zero()
     }
 }
 
@@ -150,6 +323,7 @@ pub struct Diode {
     bv_eff: Option<f64>,
     v_last: Cell<Option<f64>>,
     limited: Cell<bool>,
+    charge: ChargeStore,
 }
 
 impl Diode {
@@ -167,6 +341,7 @@ impl Diode {
             p,
             v_last: Cell::new(None),
             limited: Cell::new(false),
+            charge: ChargeStore::default(),
         }
     }
 
@@ -187,6 +362,17 @@ impl Diode {
             (-is * e, is * e / nvt)
         };
         (id + GMIN * vd, gd + GMIN)
+    }
+
+    /// Stored charge and capacitance at junction voltage `vd`.
+    pub fn charge(&self, vd: f64) -> (f64, f64) {
+        let (id, gd) = self.eval(vd);
+        let (qd, cd) = self.p.depletion.eval(vd);
+        (self.p.tt * id + qd, self.p.tt * gd + cd)
+    }
+
+    fn junction(&self, sol: &SolutionView) -> f64 {
+        sol.voltage(self.anode_int) - sol.voltage(self.cathode)
     }
 }
 
@@ -230,7 +416,7 @@ impl Device for Diode {
     fn reset_iteration(&self) {
         self.v_last.set(None);
     }
-    fn stamp(&self, s: &mut Stamper, _ctx: &StampContext) {
+    fn stamp(&self, s: &mut Stamper, ctx: &StampContext) {
         if self.p.rs > 0.0 {
             s.conductance(self.anode, self.anode_int, 1.0 / self.p.rs);
         }
@@ -242,21 +428,53 @@ impl Device for Diode {
         self.limited.set((vd - raw).abs() > LIMIT_EPS);
         self.v_last.set(Some(vd));
         let (id, gd) = self.eval(vd);
-        s.conductance(self.anode_int, self.cathode, gd);
-        s.current(self.anode_int, self.cathode, id - gd * vd);
+        let (a, k) = (self.anode_int, self.cathode);
+        s.conductance(a, k, gd);
+        s.current(a, k, id - gd * vd);
+        if self.p.has_charge() {
+            let (q, c) = self.charge(vd);
+            stamp_charge(s, &self.charge, (a, k), (q, c, vd), 1.0, ctx);
+        }
     }
     fn dc_paths(&self) -> Vec<(NodeId, NodeId)> {
         vec![(self.anode, self.cathode)]
     }
+    /// Junction current plus charging current, into the anode.
     fn current(&self, sol: &SolutionView) -> f64 {
-        self.eval(sol.voltage(self.anode_int) - sol.voltage(self.cathode))
-            .0
+        self.eval(self.junction(sol)).0 + self.charge.i_prev
+    }
+    fn ringing(&self) -> bool {
+        self.charge.ringing
+    }
+    fn begin_transient(&mut self, sol: &SolutionView, time: f64) {
+        let q = self.charge(self.junction(sol)).0;
+        self.charge.begin(q, time);
+    }
+    fn accept_step(&mut self, sol: &SolutionView, ctx: &StampContext, restart: bool) {
+        if let Some((h, method)) = transient_step(ctx) {
+            let q = self.charge(self.junction(sol)).0;
+            self.charge.accept(q, ctx.time, h, method, restart);
+        }
+    }
+    fn truncation_step(
+        &self,
+        sol: &SolutionView,
+        ctx: &StampContext,
+        tol: &Tolerances,
+    ) -> Option<f64> {
+        let (h, method) = transient_step(ctx)?;
+        if !self.p.has_charge() {
+            return None;
+        }
+        let q = self.charge(self.junction(sol)).0;
+        self.charge.truncation_step(q, ctx.time, h, method, tol)
     }
 }
 
 // ------------------------------------------------------------------ BJT ---
 
-/// DC Gummel-Poon parameters (SPICE names and defaults).
+/// Gummel-Poon parameters (SPICE names and defaults): DC terms plus
+/// junction capacitances and transit times.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BjtParams {
     pub is: f64,
@@ -275,10 +493,16 @@ pub struct BjtParams {
     pub rb: f64,
     pub rc: f64,
     pub re: f64,
+    pub cje: Depletion,
+    pub cjc: Depletion,
+    /// Forward and reverse transit times.
+    pub tf: f64,
+    pub tr: f64,
 }
 
 impl BjtParams {
     pub fn from_model(m: &DeviceModel) -> Self {
+        let fc = m.get_or("FC", 0.5);
         Self {
             is: m.get_or("IS", 1e-16),
             bf: m.get_or("BF", 100.0),
@@ -296,12 +520,31 @@ impl BjtParams {
             rb: m.get_or("RB", 0.0),
             rc: m.get_or("RC", 0.0),
             re: m.get_or("RE", 0.0),
+            cje: Depletion {
+                cj0: m.get_or("CJE", 0.0),
+                vj: m.get_or("VJE", 0.75),
+                m: m.get_or("MJE", 0.33),
+                fc,
+            },
+            cjc: Depletion {
+                cj0: m.get_or("CJC", 0.0),
+                vj: m.get_or("VJC", 0.75),
+                m: m.get_or("MJC", 0.33),
+                fc,
+            },
+            tf: m.get_or("TF", 0.0),
+            tr: m.get_or("TR", 0.0),
         }
+    }
+
+    fn has_charge(&self) -> bool {
+        self.tf != 0.0 || self.tr != 0.0 || !self.cje.is_zero() || !self.cjc.is_zero()
     }
 }
 
 /// Terminal currents (into collector and base) and their derivatives with
-/// respect to Vbe and Vbc, in the NPN frame.
+/// respect to Vbe and Vbc, in the NPN frame, plus the junction diode
+/// currents the diffusion charges are built from.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BjtOperatingPoint {
     pub ic: f64,
@@ -310,6 +553,11 @@ pub struct BjtOperatingPoint {
     pub dic_dvbc: f64,
     pub dib_dvbe: f64,
     pub dib_dvbc: f64,
+    /// Forward (B-E) and reverse (B-C) ideal diode currents and conductances.
+    pub cbe: f64,
+    pub gbe: f64,
+    pub cbc: f64,
+    pub gbc: f64,
 }
 
 /// Evaluate the DC Gummel-Poon equations.
@@ -331,8 +579,7 @@ pub fn bjt_eval(p: &BjtParams, vbe: f64, vbc: f64) -> BjtOperatingPoint {
     let (cbc, gbc) = (cbc + GMIN * vbc, gbc + GMIN);
 
     // Base charge: Early effect (q1) and high injection (q2).
-    let q1_den = 1.0 - vbc / p.vaf - vbe / p.var;
-    let q1 = 1.0 / q1_den;
+    let q1 = 1.0 / (1.0 - vbc / p.vaf - vbe / p.var);
     let dq1_dvbe = q1 * q1 / p.var;
     let dq1_dvbc = q1 * q1 / p.vaf;
     let q2 = cbe / p.ikf + cbc / p.ikr;
@@ -357,6 +604,10 @@ pub fn bjt_eval(p: &BjtParams, vbe: f64, vbc: f64) -> BjtOperatingPoint {
         dic_dvbc: dit_dvbc - gbc / p.br - gbcn,
         dib_dvbe: gbe / p.bf + gben,
         dib_dvbc: gbc / p.br + gbcn,
+        cbe,
+        gbe,
+        cbc,
+        gbc,
     }
 }
 
@@ -377,6 +628,8 @@ pub struct Bjt {
     /// Last (Vbe, Vbc) used, in the NPN frame.
     v_last: Cell<Option<(f64, f64)>>,
     limited: Cell<bool>,
+    charge_be: ChargeStore,
+    charge_bc: ChargeStore,
 }
 
 impl Bjt {
@@ -400,6 +653,8 @@ impl Bjt {
             p,
             v_last: Cell::new(None),
             limited: Cell::new(false),
+            charge_be: ChargeStore::default(),
+            charge_bc: ChargeStore::default(),
         }
     }
 
@@ -418,6 +673,23 @@ impl Bjt {
             self.sign * (vb - v(self.e_int)),
             self.sign * (vb - v(self.c_int)),
         )
+    }
+
+    /// Base-emitter and base-collector (charge, capacitance) pairs.
+    fn charges(&self, op: &BjtOperatingPoint, vbe: f64, vbc: f64) -> [(f64, f64); 2] {
+        let (qje, cje) = self.p.cje.eval(vbe);
+        let (qjc, cjc) = self.p.cjc.eval(vbc);
+        [
+            (self.p.tf * op.cbe + qje, self.p.tf * op.gbe + cje),
+            (self.p.tr * op.cbc + qjc, self.p.tr * op.gbc + cjc),
+        ]
+    }
+
+    fn charges_at(&self, sol: &SolutionView) -> [f64; 2] {
+        let (vbe, vbc) = self.junctions(|n| sol.voltage(n));
+        let op = bjt_eval(&self.p, vbe, vbc);
+        let [(qbe, _), (qbc, _)] = self.charges(&op, vbe, vbc);
+        [qbe, qbc]
     }
 }
 
@@ -463,7 +735,7 @@ impl Device for Bjt {
     fn reset_iteration(&self) {
         self.v_last.set(None);
     }
-    fn stamp(&self, s: &mut Stamper, _ctx: &StampContext) {
+    fn stamp(&self, s: &mut Stamper, ctx: &StampContext) {
         for (r, a, b) in self.resistors() {
             if r > 0.0 {
                 s.conductance(a, b, 1.0 / r);
@@ -494,6 +766,12 @@ impl Device for Bjt {
         s.current_row(b, &row(op.dib_dvbe, op.dib_dvbc), ib0);
         let (ge, gc) = (op.dic_dvbe + op.dib_dvbe, op.dic_dvbc + op.dib_dvbc);
         s.current_row(e, &row(-ge, -gc), -(ic0 + ib0));
+
+        if self.p.has_charge() {
+            let [(qbe, cbe), (qbc, cbc)] = self.charges(&op, vbe, vbc);
+            stamp_charge(s, &self.charge_be, (b, e), (qbe, cbe, vbe), t, ctx);
+            stamp_charge(s, &self.charge_bc, (b, c), (qbc, cbc, vbc), t, ctx);
+        }
     }
     fn dc_paths(&self) -> Vec<(NodeId, NodeId)> {
         vec![
@@ -502,18 +780,54 @@ impl Device for Bjt {
             (self.collector, self.emitter),
         ]
     }
-    /// Collector current (into the collector pin).
+    /// Collector current (into the collector pin), including the current
+    /// charging the base-collector junction.
     fn current(&self, sol: &SolutionView) -> f64 {
         let (vbe, vbc) = self.junctions(|n| sol.voltage(n));
-        self.sign * bjt_eval(&self.p, vbe, vbc).ic
+        self.sign * (bjt_eval(&self.p, vbe, vbc).ic - self.charge_bc.i_prev)
+    }
+    fn ringing(&self) -> bool {
+        self.charge_be.ringing || self.charge_bc.ringing
+    }
+    fn begin_transient(&mut self, sol: &SolutionView, time: f64) {
+        let [qbe, qbc] = self.charges_at(sol);
+        self.charge_be.begin(qbe, time);
+        self.charge_bc.begin(qbc, time);
+    }
+    fn accept_step(&mut self, sol: &SolutionView, ctx: &StampContext, restart: bool) {
+        if let Some((h, method)) = transient_step(ctx) {
+            let [qbe, qbc] = self.charges_at(sol);
+            self.charge_be.accept(qbe, ctx.time, h, method, restart);
+            self.charge_bc.accept(qbc, ctx.time, h, method, restart);
+        }
+    }
+    fn truncation_step(
+        &self,
+        sol: &SolutionView,
+        ctx: &StampContext,
+        tol: &Tolerances,
+    ) -> Option<f64> {
+        let (h, method) = transient_step(ctx)?;
+        if !self.p.has_charge() {
+            return None;
+        }
+        let [qbe, qbc] = self.charges_at(sol);
+        let be = self
+            .charge_be
+            .truncation_step(qbe, ctx.time, h, method, tol);
+        let bc = self
+            .charge_bc
+            .truncation_step(qbc, ctx.time, h, method, tol);
+        [be, bc].into_iter().flatten().reduce(f64::min)
     }
 }
 
 // --------------------------------------------------------------- MOSFET ---
 
 /// Level 1 (Shichman-Hodges) parameters. The source is tied to the body, so
-/// there is no body effect. `W/L` defaults to 1, so `KP` is the device's
-/// transconductance parameter β.
+/// there is no body effect. `W` and `L` default to 1, so `KP` is the
+/// device's transconductance parameter β and `CGSO`/`CGDO` are the overlap
+/// capacitances in farads.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MosfetParams {
     pub vto: f64,
@@ -522,18 +836,36 @@ pub struct MosfetParams {
     pub rd: f64,
     pub rs: f64,
     pub w_over_l: f64,
+    /// Gate-source and gate-drain overlap capacitance (F).
+    pub cgs: f64,
+    pub cgd: f64,
+    /// Bulk-drain junction (bulk is tied to the source).
+    pub cbd: Depletion,
 }
 
 impl MosfetParams {
     pub fn from_model(m: &DeviceModel) -> Self {
+        let w = m.get_or("W", 1.0);
         Self {
             vto: m.get_or("VTO", 0.0),
             kp: m.get_or("KP", 2e-5),
             lambda: m.get_or("LAMBDA", 0.0),
             rd: m.get_or("RD", 0.0),
             rs: m.get_or("RS", 0.0),
-            w_over_l: m.get_or("W", 1.0) / m.get_or("L", 1.0),
+            w_over_l: w / m.get_or("L", 1.0),
+            cgs: m.get_or("CGSO", 0.0) * w,
+            cgd: m.get_or("CGDO", 0.0) * w,
+            cbd: Depletion {
+                cj0: m.get_or("CBD", 0.0),
+                vj: m.get_or("PB", 0.8),
+                m: m.get_or("MJ", 0.5),
+                fc: m.get_or("FC", 0.5),
+            },
         }
+    }
+
+    fn has_charge(&self) -> bool {
+        self.cgs != 0.0 || self.cgd != 0.0 || !self.cbd.is_zero()
     }
 }
 
@@ -575,6 +907,10 @@ pub struct Mosfet {
     /// Last (Vgs, Vds) used, in the NMOS frame.
     v_last: Cell<Option<(f64, f64)>>,
     limited: Cell<bool>,
+    /// Gate-source, gate-drain and bulk-drain charges.
+    charge_gs: ChargeStore,
+    charge_gd: ChargeStore,
+    charge_bd: ChargeStore,
 }
 
 impl Mosfet {
@@ -595,6 +931,9 @@ impl Mosfet {
             p,
             v_last: Cell::new(None),
             limited: Cell::new(false),
+            charge_gs: ChargeStore::default(),
+            charge_gd: ChargeStore::default(),
+            charge_bd: ChargeStore::default(),
         }
     }
 
@@ -620,6 +959,28 @@ impl Mosfet {
             let (id, gm, gds) = mos1_eval(&self.p, self.vto(), vgs - vds, -vds);
             (-id, -gm, gm + gds)
         }
+    }
+
+    /// (charge, capacitance, voltage) for gate-source, gate-drain and
+    /// bulk-drain, in the NMOS frame.
+    fn charges(&self, vgs: f64, vds: f64) -> [(f64, f64, f64); 3] {
+        let vgd = vgs - vds;
+        let vbd = -vds;
+        let (qbd, cbd) = self.p.cbd.eval(vbd);
+        [
+            (self.p.cgs * vgs, self.p.cgs, vgs),
+            (self.p.cgd * vgd, self.p.cgd, vgd),
+            (qbd, cbd, vbd),
+        ]
+    }
+
+    fn stores(&self) -> [&ChargeStore; 3] {
+        [&self.charge_gs, &self.charge_gd, &self.charge_bd]
+    }
+
+    fn charge_values(&self, sol: &SolutionView) -> [f64; 3] {
+        let (vgs, vds) = self.terminal_voltages(|n| sol.voltage(n));
+        self.charges(vgs, vds).map(|(q, _, _)| q)
     }
 }
 
@@ -656,7 +1017,7 @@ impl Device for Mosfet {
     fn reset_iteration(&self) {
         self.v_last.set(None);
     }
-    fn stamp(&self, s: &mut Stamper, _ctx: &StampContext) {
+    fn stamp(&self, s: &mut Stamper, ctx: &StampContext) {
         if self.p.rd > 0.0 {
             s.conductance(self.drain, self.d_int, 1.0 / self.p.rd);
         }
@@ -689,15 +1050,76 @@ impl Device for Mosfet {
         s.current_row(d, &[(g, g_gs), (d, g_ds), (src, -g_gs - g_ds)], i0);
         s.current_row(src, &[(g, -g_gs), (d, -g_ds), (src, g_gs + g_ds)], -i0);
         s.conductance(d, src, GMIN);
+
+        if self.p.has_charge() {
+            let pairs = [(g, src), (g, d), (src, d)];
+            for ((store, nodes), qcv) in self
+                .stores()
+                .into_iter()
+                .zip(pairs)
+                .zip(self.charges(vgs, vds))
+            {
+                stamp_charge(s, store, nodes, qcv, self.sign, ctx);
+            }
+        }
     }
     fn dc_paths(&self) -> Vec<(NodeId, NodeId)> {
         vec![(self.drain, self.source)]
     }
-    /// Drain current (into the drain pin).
+    /// Drain current (into the drain pin), including currents charging the
+    /// gate-drain and bulk-drain capacitances.
     fn current(&self, sol: &SolutionView) -> f64 {
         let (vgs, vds) = self.terminal_voltages(|n| sol.voltage(n));
-        self.sign * self.eval(vgs, vds).0
+        let charging = self.charge_gd.i_prev + self.charge_bd.i_prev;
+        self.sign * (self.eval(vgs, vds).0 - charging)
             + GMIN * (sol.voltage(self.d_int) - sol.voltage(self.s_int))
+    }
+    fn ringing(&self) -> bool {
+        self.stores().iter().any(|s| s.ringing)
+    }
+    fn begin_transient(&mut self, sol: &SolutionView, time: f64) {
+        let qs = self.charge_values(sol);
+        for (store, q) in [
+            &mut self.charge_gs,
+            &mut self.charge_gd,
+            &mut self.charge_bd,
+        ]
+        .into_iter()
+        .zip(qs)
+        {
+            store.begin(q, time);
+        }
+    }
+    fn accept_step(&mut self, sol: &SolutionView, ctx: &StampContext, restart: bool) {
+        if let Some((h, method)) = transient_step(ctx) {
+            let qs = self.charge_values(sol);
+            for (store, q) in [
+                &mut self.charge_gs,
+                &mut self.charge_gd,
+                &mut self.charge_bd,
+            ]
+            .into_iter()
+            .zip(qs)
+            {
+                store.accept(q, ctx.time, h, method, restart);
+            }
+        }
+    }
+    fn truncation_step(
+        &self,
+        sol: &SolutionView,
+        ctx: &StampContext,
+        tol: &Tolerances,
+    ) -> Option<f64> {
+        let (h, method) = transient_step(ctx)?;
+        if !self.p.has_charge() {
+            return None;
+        }
+        self.stores()
+            .into_iter()
+            .zip(self.charge_values(sol))
+            .filter_map(|(store, q)| store.truncation_step(q, ctx.time, h, method, tol))
+            .reduce(f64::min)
     }
 }
 
@@ -709,6 +1131,15 @@ mod tests {
     fn finite_diff(f: impl Fn(f64) -> f64, x: f64) -> f64 {
         let h = 1e-7;
         (f(x + h) - f(x - h)) / (2.0 * h)
+    }
+
+    fn no_caps() -> Depletion {
+        Depletion {
+            cj0: 0.0,
+            vj: 0.75,
+            m: 0.33,
+            fc: 0.5,
+        }
     }
 
     #[test]
@@ -730,6 +1161,10 @@ mod tests {
             rb: 0.0,
             rc: 0.0,
             re: 0.0,
+            cje: no_caps(),
+            cjc: no_caps(),
+            tf: 0.0,
+            tr: 0.0,
         };
         for (vbe, vbc) in [(0.65, -5.0), (0.75, 0.3), (0.5, 0.6), (0.7, -0.1)] {
             let op = bjt_eval(&p, vbe, vbc);
@@ -750,6 +1185,9 @@ mod tests {
             rd: 0.0,
             rs: 0.0,
             w_over_l: 1.0,
+            cgs: 0.0,
+            cgd: 0.0,
+            cbd: no_caps(),
         };
         let m = Mosfet::new("M1".into(), [NodeId(1), NodeId(2), NodeId(0)], true, p);
         for (vgs, vds) in [(3.0, 0.5), (3.0, 5.0), (2.0, -0.3), (4.0, -2.0)] {
@@ -767,20 +1205,28 @@ mod tests {
         }
     }
 
-    #[test]
-    fn diode_conductance_matches_derivative() {
-        let d = Diode::new(
+    fn zener() -> Diode {
+        Diode::new(
             "D1".into(),
             NodeId(1),
             NodeId(0),
             DiodeParams {
-                is: 1e-14,
-                n: 1.5,
-                rs: 0.0,
                 bv: Some(5.1),
-                ibv: 1e-3,
+                tt: 5e-9,
+                depletion: Depletion {
+                    cj0: 4e-12,
+                    vj: 0.7,
+                    m: 0.4,
+                    fc: 0.5,
+                },
+                ..DiodeParams::simple(1e-14, 1.5)
             },
-        );
+        )
+    }
+
+    #[test]
+    fn diode_conductance_matches_derivative() {
+        let d = zener();
         for vd in [0.7, 0.1, -0.05, -1.0, -5.0, -5.2] {
             let (_, gd) = d.eval(vd);
             assert_relative_eq!(gd, finite_diff(|v| d.eval(v).0, vd), max_relative = 1e-4);
@@ -794,11 +1240,8 @@ mod tests {
             NodeId(1),
             NodeId(0),
             DiodeParams {
-                is: 1e-14,
-                n: 1.0,
-                rs: 0.0,
                 bv: Some(5.1),
-                ibv: 1e-3,
+                ..DiodeParams::simple(1e-14, 1.0)
             },
         );
         let (i, _) = d.eval(-5.1);
@@ -812,5 +1255,59 @@ mod tests {
         let limited = pnjlim(5.0, 0.6, nvt, vc);
         assert!(limited < 0.8 && limited > 0.6, "{limited}");
         assert_eq!(pnjlim(0.3, 0.29, nvt, vc), 0.3);
+    }
+
+    #[test]
+    fn depletion_capacitance_is_derivative_of_charge() {
+        for dep in [
+            Depletion {
+                cj0: 1e-12,
+                vj: 0.75,
+                m: 0.33,
+                fc: 0.5,
+            },
+            Depletion {
+                cj0: 2e-12,
+                vj: 1.0,
+                m: 0.5,
+                fc: 0.5,
+            },
+            Depletion {
+                cj0: 1e-12,
+                vj: 0.8,
+                m: 1.0,
+                fc: 0.5,
+            },
+        ] {
+            // Reverse bias, just below the knee, above it, and well forward.
+            for v in [-10.0, -1.0, 0.0, 0.3, 0.37, 0.45, 0.9] {
+                let (_, c) = dep.eval(v);
+                let dq = finite_diff(|x| dep.eval(x).0, v);
+                assert_relative_eq!(c, dq, max_relative = 1e-5);
+            }
+            // Charge and capacitance are continuous at the knee.
+            let knee = dep.fc * dep.vj;
+            let (below, above) = (dep.eval(knee - 1e-9), dep.eval(knee + 1e-9));
+            assert_relative_eq!(below.0, above.0, max_relative = 1e-6);
+            assert_relative_eq!(below.1, above.1, max_relative = 1e-6);
+        }
+        // Zero-bias value is CJ0, and capacitance falls with reverse bias.
+        let dep = Depletion {
+            cj0: 1e-12,
+            vj: 0.75,
+            m: 0.33,
+            fc: 0.5,
+        };
+        assert_relative_eq!(dep.eval(0.0).1, 1e-12);
+        assert!(dep.eval(-5.0).1 < dep.eval(-1.0).1);
+    }
+
+    #[test]
+    fn diode_capacitance_is_derivative_of_charge() {
+        let d = zener();
+        for vd in [-3.0, -0.5, 0.2, 0.6, 0.7] {
+            let (_, c) = d.charge(vd);
+            assert_relative_eq!(c, finite_diff(|v| d.charge(v).0, vd), max_relative = 1e-4);
+        }
     }
 }

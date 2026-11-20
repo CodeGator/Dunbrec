@@ -19,7 +19,7 @@ v1 targets analog circuits: discrete components, sources, diodes and transistors
 1. Foundations: data model, units, netlister, `.dbr` save/load ✅
 2. Linear DC solver (MNA) ✅
 3. Scheduler + transient analysis ✅
-4. Nonlinear devices: diode, BJT, MOSFET ✅ (ngspice cross-check and junction capacitances still to do)
+4. Nonlinear devices: diode, BJT, MOSFET, with junction capacitances and transit times ✅ (ngspice cross-check still to do)
 5. Schematic editor
 6. Live simulation + instruments
 7. SPICE / KiCad import, SPICE export

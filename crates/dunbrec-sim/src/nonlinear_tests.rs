@@ -504,3 +504,205 @@ fn convergence_aids_reach_the_same_answer() {
     }
     assert!(used.iter().any(|s| *s != DcStrategy::Newton), "{used:?}");
 }
+
+// ------------------------------------------------------ charge storage ---
+
+fn pulse(v1: f64, v2: f64, delay: f64, edge: f64) -> K {
+    K::VoltageSource {
+        waveform: Waveform::Pulse {
+            v1,
+            v2,
+            delay,
+            rise: edge,
+            fall: edge,
+            width: 1.0,
+            period: 0.0,
+        },
+    }
+}
+
+fn sine_source(amplitude: f64, frequency: f64) -> K {
+    K::VoltageSource {
+        waveform: Waveform::Sine {
+            offset: 0.0,
+            amplitude,
+            frequency,
+            delay: 0.0,
+            damping: 0.0,
+            phase: 0.0,
+        },
+    }
+}
+
+fn with_models(extra: &[DeviceModel]) -> ModelLibrary {
+    let mut lib = models();
+    for m in extra {
+        lib.insert(m.clone());
+    }
+    lib
+}
+
+fn tran_with(b: NetlistBuilder, lib: &ModelLibrary, opts: TransientOptions) -> TransientResult {
+    transient(Circuit::from_netlist(&b.build(), lib).unwrap(), opts).unwrap()
+}
+
+#[test]
+fn reverse_biased_junction_charges_like_a_capacitor() {
+    // With M = 0 the depletion capacitance is constant (CJO) in reverse
+    // bias, so R + reverse diode is an RC circuit: τ = 1 kΩ × 1 nF = 1 µs.
+    let lib = with_models(&[DeviceModel::new("DC", ModelKind::Diode)
+        .with("IS", 1e-14)
+        .with("CJO", 1e-9)
+        .with("M", 0.0)]);
+    let res = tran_with(
+        NetlistBuilder::new()
+            .element("V1", pulse(0.0, 5.0, 0.0, 1e-12), &["in", "0"])
+            .element("R1", r(1e3), &["in", "k"])
+            .element("D1", diode("DC"), &["0", "k"]),
+        &lib,
+        TransientOptions::new(5e-6),
+    );
+    let k = res.voltage("k").unwrap();
+    let tau = 1e-6;
+    let worst = res
+        .times
+        .iter()
+        .zip(k)
+        .map(|(t, v)| (v - 5.0 * (1.0 - (-t / tau).exp())).abs())
+        .fold(0.0, f64::max);
+    assert!(worst < 0.02, "max error {worst} V");
+}
+
+#[test]
+fn transit_time_causes_reverse_recovery() {
+    // A diode carrying 10 mA forward is suddenly reverse-biased. With
+    // TT = 1 µs the stored charge keeps it conducting backwards for about
+    // TT·ln(1 + IF/IR) ≈ 0.7 µs; without TT it turns off at once.
+    let lib = with_models(&[
+        DeviceModel::new("DSLOW", ModelKind::Diode)
+            .with("IS", 1e-14)
+            .with("TT", 1e-6),
+        DeviceModel::new("DFAST", ModelKind::Diode).with("IS", 1e-14),
+    ]);
+    let switch_at = 1e-6;
+    let reverse_current_at = |model: &str, t: f64| {
+        let res = tran_with(
+            NetlistBuilder::new()
+                .element("V1", pulse(10.0, -10.0, switch_at, 1e-9), &["in", "0"])
+                .element("R1", r(1e3), &["in", "a"])
+                .element("D1", diode(model), &["a", "0"]),
+            &lib,
+            TransientOptions::new(4e-6),
+        );
+        res.at(res.current("D1").unwrap(), t)
+    };
+    // 0.3 µs after the switch: the slow diode still conducts ~ -10 mA.
+    let slow = reverse_current_at("DSLOW", switch_at + 0.3e-6);
+    assert!(slow < -8e-3, "slow diode current {slow}");
+    let fast = reverse_current_at("DFAST", switch_at + 0.3e-6);
+    assert!(fast.abs() < 1e-6, "fast diode current {fast}");
+    // Well after recovery the slow diode is off too.
+    let later = reverse_current_at("DSLOW", switch_at + 2.5e-6);
+    assert!(later.abs() < 1e-4, "slow diode after recovery {later}");
+}
+
+/// Amplitude gain of a common-emitter stage (1 kΩ source resistance,
+/// bypassed emitter) at `frequency`, measured over the last few cycles.
+fn ce_gain(model: &str, lib: &ModelLibrary, frequency: f64) -> f64 {
+    let coupling = |c: f64| K::Capacitor {
+        capacitance: c,
+        initial_voltage: None,
+    };
+    let periods = 20.0;
+    let res = tran_with(
+        NetlistBuilder::new()
+            .element("VCC", v(12.0), &["vcc", "0"])
+            .element("VIN", sine_source(1e-3, frequency), &["src", "0"])
+            .element("RS", r(1e3), &["src", "sig"])
+            .element("CIN", coupling(10e-6), &["sig", "b"])
+            .element("R1", r(47e3), &["vcc", "b"])
+            .element("R2", r(10e3), &["b", "0"])
+            .element("RC", r(4.7e3), &["vcc", "c"])
+            .element("RE", r(1e3), &["e", "0"])
+            .element("CE", coupling(100e-6), &["e", "0"])
+            .element("Q1", npn(model), &["c", "b", "e"]),
+        lib,
+        TransientOptions::new(periods / frequency),
+    );
+    let c = res.voltage("c").unwrap();
+    let late: Vec<f64> = res
+        .times
+        .iter()
+        .zip(c)
+        .filter(|(t, _)| **t > (periods - 3.0) / frequency)
+        .map(|(_, v)| *v)
+        .collect();
+    let max = late.iter().copied().fold(f64::MIN, f64::max);
+    let min = late.iter().copied().fold(f64::MAX, f64::min);
+    (max - min) / 2e-3
+}
+
+#[test]
+fn junction_capacitance_rolls_off_amplifier_gain() {
+    // The same 2N3904-like transistor with and without its capacitances.
+    // The collector-base capacitance is multiplied by the stage gain
+    // (Miller effect), giving a pole of a few hundred kHz with this source.
+    let with_caps = DeviceModel::new("QGPC", ModelKind::Npn)
+        .with("IS", 6.734e-15)
+        .with("BF", 416.4)
+        .with("BR", 0.7371)
+        .with("VAF", 74.03)
+        .with("IKF", 0.06678)
+        .with("ISE", 6.734e-15)
+        .with("NE", 1.259)
+        .with("RB", 10.0)
+        .with("RC", 1.0)
+        .with("CJE", 4.493e-12)
+        .with("MJE", 0.2593)
+        .with("CJC", 3.638e-12)
+        .with("MJC", 0.3085)
+        .with("TF", 301.2e-12)
+        .with("TR", 239.5e-9);
+    let lib = with_models(&[with_caps]);
+
+    let low = ce_gain("QGPC", &lib, 1e3);
+    let high = ce_gain("QGPC", &lib, 3e6);
+    let high_no_caps = ce_gain("QGP", &lib, 3e6);
+    assert!(low > 80.0, "low-frequency gain {low}");
+    // Without capacitances the gain stays flat; with them it collapses.
+    assert!(
+        high_no_caps > 0.8 * low,
+        "no-cap gain {high_no_caps} vs {low}"
+    );
+    assert!(high < 0.25 * low, "gain at 3 MHz {high} vs {low} at 1 kHz");
+}
+
+#[test]
+fn mosfet_gate_charges_through_resistor() {
+    // Gate stepped to 1 V (below VTO, so the channel stays off) through
+    // 10 kΩ. The drain is held at a fixed voltage, so the gate sees
+    // CGS + CGD = 1 nF: τ = 10 µs.
+    let lib = with_models(&[DeviceModel::new("MG", ModelKind::Nmos)
+        .with("VTO", 2.0)
+        .with("KP", 1e-3)
+        .with("CGSO", 600e-12)
+        .with("CGDO", 400e-12)]);
+    let res = tran_with(
+        NetlistBuilder::new()
+            .element("VDD", v(10.0), &["vdd", "0"])
+            .element("VG", pulse(0.0, 1.0, 0.0, 1e-12), &["drive", "0"])
+            .element("RG", r(10e3), &["drive", "g"])
+            .element("M1", nmos("MG"), &["vdd", "g", "0"]),
+        &lib,
+        TransientOptions::new(50e-6),
+    );
+    let g = res.voltage("g").unwrap();
+    let tau = 10e-6;
+    let worst = res
+        .times
+        .iter()
+        .zip(g)
+        .map(|(t, v)| (v - (1.0 - (-t / tau).exp())).abs())
+        .fold(0.0, f64::max);
+    assert!(worst < 5e-3, "max error {worst} V");
+}

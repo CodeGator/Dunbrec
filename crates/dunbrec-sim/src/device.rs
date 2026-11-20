@@ -181,6 +181,48 @@ pub trait Device: Send + std::fmt::Debug {
     fn max_step(&self) -> Option<f64> {
         None
     }
+
+    /// True if the last accepted steps show trapezoidal ringing (see
+    /// [`RingDetector`]); the scheduler then takes one damped step.
+    fn ringing(&self) -> bool {
+        false
+    }
+}
+
+/// Detects trapezoidal "ringing": a reactive current (or inductor voltage)
+/// that flips sign at nearly the same magnitude on consecutive steps while
+/// the stored quantity barely changes. This is a numerical artefact of the
+/// trapezoidal rule after an abrupt change (e.g. a diode snapping off). A
+/// genuine oscillation crosses zero once per half cycle, never on
+/// consecutive steps, so it is not mistaken for ringing.
+#[derive(Debug, Clone, Default)]
+pub struct RingDetector {
+    last: Option<f64>,
+    flips: u8,
+}
+
+impl RingDetector {
+    /// Consecutive near-symmetric sign flips that count as ringing.
+    const FLIPS: u8 = 2;
+
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Record the latest value; true if it is ringing. Values smaller than
+    /// `floor` are ignored as noise.
+    pub fn push(&mut self, x: f64, floor: f64) -> bool {
+        let flip = self
+            .last
+            .is_some_and(|p| p * x < 0.0 && x.abs() > floor && (x + p).abs() < 0.1 * (x - p).abs());
+        self.flips = if flip {
+            self.flips.saturating_add(1)
+        } else {
+            0
+        };
+        self.last = Some(x);
+        self.flips >= Self::FLIPS
+    }
 }
 
 fn first_branch(b: Option<BranchId>, name: &str) -> BranchId {
@@ -322,6 +364,9 @@ impl Device for Potentiometer {
 
 /// Conductance used to hold an initial condition (a 1 nΩ Norton source).
 const IC_CONDUCTANCE: f64 = 1e9;
+/// Ring detection ignores currents / voltages smaller than these.
+pub const RING_CURRENT_FLOOR: f64 = 1e-9;
+pub const RING_VOLTAGE_FLOOR: f64 = 1e-6;
 
 /// Open in DC. In transient, replaced each step by a companion model: a
 /// conductance in parallel with a current source representing the charge
@@ -337,6 +382,8 @@ pub struct Capacitor {
     pub v_prev: f64,
     pub i_prev: f64,
     pub history: History,
+    ring: RingDetector,
+    ringing: bool,
 }
 
 impl Capacitor {
@@ -356,6 +403,8 @@ impl Capacitor {
             v_prev: 0.0,
             i_prev: 0.0,
             history: History::default(),
+            ring: RingDetector::default(),
+            ringing: false,
         }
     }
 
@@ -408,6 +457,8 @@ impl Device for Capacitor {
         self.i_prev = 0.0;
         self.history.clear();
         self.history.push(time, self.v_prev);
+        self.ring.reset();
+        self.ringing = false;
     }
     fn accept_step(&mut self, sol: &SolutionView, ctx: &StampContext, restart: bool) {
         let Mode::Transient { h, method } = ctx.mode else {
@@ -416,12 +467,16 @@ impl Device for Capacitor {
         let v = self.voltage(sol);
         let (g, i_eq) = self.companion(h, method);
         self.i_prev = g * v + i_eq;
+        self.ringing = self.ring.push(self.i_prev, RING_CURRENT_FLOOR);
         if restart {
             self.history.clear();
             self.history.push(ctx.time - h, self.v_prev);
         }
         self.v_prev = v;
         self.history.push(ctx.time, v);
+    }
+    fn ringing(&self) -> bool {
+        self.ringing
     }
     fn truncation_step(
         &self,
@@ -451,6 +506,8 @@ pub struct Inductor {
     pub i_prev: f64,
     pub v_prev: f64,
     pub history: History,
+    ring: RingDetector,
+    ringing: bool,
 }
 
 impl Inductor {
@@ -471,6 +528,8 @@ impl Inductor {
             i_prev: 0.0,
             v_prev: 0.0,
             history: History::default(),
+            ring: RingDetector::default(),
+            ringing: false,
         }
     }
 
@@ -535,6 +594,8 @@ impl Device for Inductor {
         self.v_prev = sol.voltage(self.p) - sol.voltage(self.n);
         self.history.clear();
         self.history.push(time, self.i_prev);
+        self.ring.reset();
+        self.ringing = false;
     }
     fn accept_step(&mut self, sol: &SolutionView, ctx: &StampContext, restart: bool) {
         let Mode::Transient { h, .. } = ctx.mode else {
@@ -547,6 +608,10 @@ impl Device for Inductor {
         self.i_prev = sol.branch_current(self.k());
         self.v_prev = sol.voltage(self.p) - sol.voltage(self.n);
         self.history.push(ctx.time, self.i_prev);
+        self.ringing = self.ring.push(self.v_prev, RING_VOLTAGE_FLOOR);
+    }
+    fn ringing(&self) -> bool {
+        self.ringing
     }
     fn truncation_step(
         &self,
@@ -825,6 +890,32 @@ mod tests {
         // x = t^2: second derivative 2.
         let pts: Vec<(f64, f64)> = [1.0, 1.5, 2.5].iter().map(|&t| (t, t * t)).collect();
         assert_relative_eq!(2.0 * divided_difference(&pts), 2.0, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn ring_detector_flags_alternation_but_not_oscillation() {
+        // Trapezoidal ringing: same magnitude, flipping sign every step.
+        let mut d = RingDetector::default();
+        let flags: Vec<bool> = [5e-3, -5e-3, 5e-3, -5e-3]
+            .iter()
+            .map(|&x| d.push(x, 1e-9))
+            .collect();
+        assert_eq!(flags, vec![false, false, true, true]);
+
+        // A sampled sine (50 points per period) crosses zero cleanly.
+        let mut d = RingDetector::default();
+        let any = (0..500)
+            .map(|k| (std::f64::consts::TAU * k as f64 / 50.0 + 0.01).sin())
+            .any(|x| d.push(x, 1e-9));
+        assert!(!any);
+
+        // Noise below the floor is ignored.
+        let mut d = RingDetector::default();
+        assert!(
+            ![1e-12, -1e-12, 1e-12, -1e-12]
+                .iter()
+                .any(|&x| d.push(x, 1e-9))
+        );
     }
 
     #[test]

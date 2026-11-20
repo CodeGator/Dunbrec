@@ -123,6 +123,9 @@ pub struct Transient {
     h_min: f64,
     /// True when the next step starts at a breakpoint.
     restart: bool,
+    /// True when a device reported trapezoidal ringing: the next step uses
+    /// Backward Euler, whose damping removes the artefact.
+    damp: bool,
     watches: Vec<Watch>,
     finished: bool,
 }
@@ -178,6 +181,7 @@ impl Transient {
             h_max,
             h_min,
             restart: true,
+            damp: false,
             watches: Vec::new(),
             finished: false,
             options,
@@ -251,7 +255,7 @@ impl Transient {
         if self.time + h * 1.25 >= target {
             h = target - self.time;
         }
-        let method = if self.restart {
+        let method = if self.restart || self.damp {
             Integration::BackwardEuler
         } else {
             Integration::Trapezoidal
@@ -372,6 +376,7 @@ impl Transient {
         self.time = if hit_target { target } else { start + h };
         self.h_next = (h * MAX_GROWTH).min(h_error).min(self.h_max);
         self.restart = false;
+        self.damp = self.circuit.devices.iter().any(|d| d.ringing());
         if hit_target {
             if target >= self.options.stop_time {
                 self.finished = true;
