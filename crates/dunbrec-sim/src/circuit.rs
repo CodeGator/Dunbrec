@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 
-use dunbrec_core::{ComponentKind, Element, ModelLibrary, Netlist, NodeId, Severity};
+use dunbrec_core::{ComponentKind, Element, ModelLibrary, Netlist, NodeId, Polarity, Severity};
 
 use crate::device::StampContext;
 use crate::device::{
@@ -11,6 +11,7 @@ use crate::device::{
 };
 use crate::error::{SimError, SimWarning};
 use crate::linalg::{DenseMatrix, LinearSolver};
+use crate::semiconductor::{Bjt, BjtParams, Diode, DiodeParams, Mosfet, MosfetParams};
 use crate::stamp::{BranchId, Stamper, node_rows};
 
 /// Conductance used to tie DC-floating nodes to ground (1 TΩ).
@@ -31,7 +32,7 @@ impl Circuit {
     /// Prepare a netlist for simulation. Fails if the netlist has errors,
     /// uses unsupported devices, has invalid values, or is topologically
     /// unsolvable (voltage-source loops, current sources with no return path).
-    pub fn from_netlist(netlist: &Netlist, _models: &ModelLibrary) -> Result<Self, SimError> {
+    pub fn from_netlist(netlist: &Netlist, models: &ModelLibrary) -> Result<Self, SimError> {
         let errors: Vec<_> = netlist
             .diagnostics
             .iter()
@@ -44,19 +45,30 @@ impl Circuit {
 
         let mut devices = Vec::with_capacity(netlist.elements.len());
         let mut branch_owners = Vec::new();
+        let mut node_names: Vec<String> = netlist.nodes.iter().map(|n| n.name.clone()).collect();
         for element in &netlist.elements {
-            let mut device = make_device(element)?;
+            let mut device = make_device(element, models)?;
             let count = device.branch_count();
             if count > 0 {
                 device.assign_branches(BranchId(branch_owners.len()));
                 branch_owners.extend(std::iter::repeat_n(element.designator.clone(), count));
+            }
+            // Internal nodes are named "<designator>#<suffix>", e.g. "Q1#b".
+            let internal = device.internal_nodes();
+            if !internal.is_empty() {
+                device.assign_internal_nodes(NodeId(node_names.len()));
+                node_names.extend(
+                    internal
+                        .iter()
+                        .map(|suffix| format!("{}#{suffix}", element.designator)),
+                );
             }
             devices.push(device);
         }
 
         let mut circuit = Circuit {
             devices,
-            node_names: netlist.nodes.iter().map(|n| n.name.clone()).collect(),
+            node_names,
             branch_owners,
             shunted: Vec::new(),
             warnings: Vec::new(),
@@ -77,15 +89,22 @@ impl Circuit {
         &self.warnings
     }
 
+    /// True if any device needs Newton-Raphson iteration.
+    pub fn is_nonlinear(&self) -> bool {
+        self.devices.iter().any(|d| d.is_nonlinear())
+    }
+
     pub(crate) fn unknown_count(&self) -> usize {
         node_rows(self.node_count()) + self.branch_owners.len()
     }
 
-    /// Build the MNA system for `ctx` and solve it. On success `x` holds the
-    /// solution. `matrix` and `x` must be sized to [`unknown_count`](Self::unknown_count).
-    pub(crate) fn solve(
+    /// Build the MNA system for `ctx`, linearised around `iterate`, and
+    /// solve it into `x`. All slices and `matrix` must be sized to
+    /// [`unknown_count`](Self::unknown_count).
+    pub(crate) fn solve_linearised(
         &self,
         ctx: &StampContext,
+        iterate: &[f64],
         matrix: &mut DenseMatrix,
         x: &mut [f64],
         solver: &mut dyn LinearSolver,
@@ -93,12 +112,18 @@ impl Circuit {
         matrix.clear();
         x.fill(0.0);
         {
-            let mut s = Stamper::new(matrix, x, node_rows(self.node_count()));
+            let rows = node_rows(self.node_count());
+            let mut s = Stamper::new(matrix, x, rows, iterate);
             for d in &self.devices {
                 d.stamp(&mut s, ctx);
             }
             for &node in &self.shunted {
                 s.conductance(node, NodeId::GROUND, FLOATING_SHUNT);
+            }
+            if ctx.gmin > 0.0 {
+                for n in 1..self.node_count() {
+                    s.conductance(NodeId(n), NodeId::GROUND, ctx.gmin);
+                }
             }
         }
         solver.solve(matrix, x).map_err(|e| SimError::Singular {
@@ -207,7 +232,7 @@ fn controlled_pins(e: &Element) -> ControlledPins {
     }
 }
 
-fn make_device(e: &Element) -> Result<Box<dyn Device>, SimError> {
+fn make_device(e: &Element, models: &ModelLibrary) -> Result<Box<dyn Device>, SimError> {
     let name = e.designator.clone();
     let node = |i: usize| e.nodes[i];
     Ok(match &e.kind {
@@ -325,17 +350,57 @@ fn make_device(e: &Element) -> Result<Box<dyn Device>, SimError> {
             gain: check_finite(e, "gain", *gain)?,
             branch: None,
         }),
-        ComponentKind::Diode { .. } => return Err(unsupported(e, "diode")),
-        ComponentKind::Bjt { .. } => return Err(unsupported(e, "BJT")),
-        ComponentKind::Mosfet { .. } => return Err(unsupported(e, "MOSFET")),
+        ComponentKind::Diode { model } => {
+            let p = DiodeParams::from_model(lookup(e, models, model)?);
+            if !(p.is > 0.0 && p.n > 0.0 && p.rs >= 0.0) {
+                return Err(invalid(e, "diode model needs IS > 0, N > 0 and RS >= 0"));
+            }
+            Box::new(Diode::new(name, node(0), node(1), p))
+        }
+        ComponentKind::Bjt { polarity, model } => {
+            let p = BjtParams::from_model(lookup(e, models, model)?);
+            let positive = [p.is, p.bf, p.br, p.nf, p.nr, p.ne, p.nc];
+            let not_positive = |v: &f64| v.is_nan() || *v <= 0.0;
+            let negative = |r: &f64| r.is_nan() || *r < 0.0;
+            if positive.iter().any(not_positive) || [p.rb, p.rc, p.re].iter().any(negative) {
+                return Err(invalid(
+                    e,
+                    "BJT model needs IS, BF, BR, NF, NR, NE, NC > 0 and RB, RC, RE >= 0",
+                ));
+            }
+            Box::new(Bjt::new(
+                name,
+                [node(0), node(1), node(2)],
+                *polarity == Polarity::N,
+                p,
+            ))
+        }
+        ComponentKind::Mosfet { polarity, model } => {
+            let p = MosfetParams::from_model(lookup(e, models, model)?);
+            if !(p.kp > 0.0 && p.w_over_l > 0.0 && p.rd >= 0.0 && p.rs >= 0.0) {
+                return Err(invalid(
+                    e,
+                    "MOSFET model needs KP > 0, W/L > 0 and RD, RS >= 0",
+                ));
+            }
+            Box::new(Mosfet::new(
+                name,
+                [node(0), node(1), node(2)],
+                *polarity == Polarity::N,
+                p,
+            ))
+        }
     })
 }
 
-fn unsupported(e: &Element, kind: &'static str) -> SimError {
-    SimError::Unsupported {
-        designator: e.designator.clone(),
-        kind,
-    }
+fn lookup<'m>(
+    e: &Element,
+    models: &'m ModelLibrary,
+    name: &str,
+) -> Result<&'m dunbrec_core::DeviceModel, SimError> {
+    models
+        .get(name)
+        .ok_or_else(|| invalid(e, format!("model '{name}' not found")))
 }
 
 struct Dsu(Vec<usize>);

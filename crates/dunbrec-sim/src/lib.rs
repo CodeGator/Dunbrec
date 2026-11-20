@@ -19,14 +19,16 @@
 //! ```
 //!
 //! Analyses: DC operating point ([`operating_point`]) and transient
-//! ([`transient`], or step by step with [`Transient`]). Nonlinear devices
-//! follow.
+//! ([`transient`], or step by step with [`Transient`]). Diodes, BJTs and
+//! MOSFETs are solved with Newton-Raphson iteration.
 
 pub mod circuit;
 pub mod dc;
 pub mod device;
 pub mod error;
 pub mod linalg;
+mod newton;
+pub mod semiconductor;
 pub mod stamp;
 pub mod transient;
 pub mod waveform;
@@ -39,6 +41,8 @@ pub use transient::{
     WatchId, transient,
 };
 
+#[cfg(test)]
+mod nonlinear_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

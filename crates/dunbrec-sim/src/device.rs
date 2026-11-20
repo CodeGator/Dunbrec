@@ -39,15 +39,32 @@ pub struct StampContext {
     pub mode: Mode,
     /// Time of the solution being computed (0 for DC).
     pub time: f64,
+    /// Extra conductance from every node to ground (gmin stepping).
+    pub gmin: f64,
+    /// Scale factor on all independent sources (source stepping).
+    pub source_scale: f64,
 }
 
 impl StampContext {
-    pub const DC: StampContext = StampContext {
-        mode: Mode::Dc {
-            initial_conditions: false,
-        },
-        time: 0.0,
-    };
+    pub const DC: StampContext = StampContext::dc(false);
+
+    pub const fn dc(initial_conditions: bool) -> Self {
+        Self {
+            mode: Mode::Dc { initial_conditions },
+            time: 0.0,
+            gmin: 0.0,
+            source_scale: 1.0,
+        }
+    }
+
+    pub const fn transient(h: f64, method: Integration, time: f64) -> Self {
+        Self {
+            mode: Mode::Transient { h, method },
+            time,
+            gmin: 0.0,
+            source_scale: 1.0,
+        }
+    }
 }
 
 /// Error tolerances for timestep control (SPICE names and defaults).
@@ -87,6 +104,32 @@ pub trait Device: Send + std::fmt::Debug {
 
     /// Receives the id of the first of this device's branches.
     fn assign_branches(&mut self, _first: BranchId) {}
+
+    /// Names of internal nodes this device needs (e.g. the point between a
+    /// diode's junction and its series resistance).
+    fn internal_nodes(&self) -> Vec<&'static str> {
+        Vec::new()
+    }
+
+    /// Receives the id of the first of this device's internal nodes; the
+    /// rest follow consecutively.
+    fn assign_internal_nodes(&mut self, _first: NodeId) {}
+
+    /// True if the device's equations depend on the solution, requiring
+    /// Newton-Raphson iteration.
+    fn is_nonlinear(&self) -> bool {
+        false
+    }
+
+    /// True if the last [`stamp`](Self::stamp) had to limit a junction
+    /// voltage, meaning the iteration has not converged yet.
+    fn limited(&self) -> bool {
+        false
+    }
+
+    /// Forget per-iteration state (e.g. before retrying a solve from
+    /// scratch).
+    fn reset_iteration(&self) {}
 
     /// Write this device's equations for the given analysis.
     fn stamp(&self, s: &mut Stamper, ctx: &StampContext);
@@ -541,7 +584,8 @@ impl Device for VoltageSource {
     }
     fn stamp(&self, s: &mut Stamper, ctx: &StampContext) {
         let k = first_branch(self.branch, &self.name);
-        s.voltage_source(self.p, self.n, k, self.waveform.value_at(ctx.time));
+        let v = self.waveform.value_at(ctx.time) * ctx.source_scale;
+        s.voltage_source(self.p, self.n, k, v);
     }
     fn dc_paths(&self) -> Vec<(NodeId, NodeId)> {
         vec![(self.p, self.n)]
@@ -579,7 +623,8 @@ impl Device for CurrentSource {
         &self.name
     }
     fn stamp(&self, s: &mut Stamper, ctx: &StampContext) {
-        s.current(self.input, self.output, self.waveform.value_at(ctx.time));
+        let i = self.waveform.value_at(ctx.time) * ctx.source_scale;
+        s.current(self.input, self.output, i);
     }
     fn dc_paths(&self) -> Vec<(NodeId, NodeId)> {
         Vec::new()

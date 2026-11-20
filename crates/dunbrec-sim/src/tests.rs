@@ -317,14 +317,14 @@ fn parallel_voltage_sources_are_a_loop() {
 }
 
 #[test]
-fn invalid_and_unsupported_devices() {
+fn invalid_values_and_missing_models() {
     let err = solve(NetlistBuilder::new().element("R1", r(0.0), &["a", "0"])).unwrap_err();
     assert!(matches!(err, SimError::InvalidParameter { designator, .. } if designator == "R1"));
 
     let err =
         solve(NetlistBuilder::new().element("D1", K::Diode { model: "D".into() }, &["a", "0"]))
             .unwrap_err();
-    assert!(matches!(err, SimError::Unsupported { kind: "diode", .. }));
+    assert!(matches!(err, SimError::InvalidParameter { designator, .. } if designator == "D1"));
 }
 
 #[test]

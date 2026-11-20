@@ -3,9 +3,9 @@
 use dunbrec_core::NodeId;
 
 use crate::circuit::Circuit;
-use crate::device::StampContext;
+use crate::device::Tolerances;
 use crate::error::{SimError, SimWarning};
-use crate::linalg::{DenseLu, DenseMatrix};
+use crate::newton::{Workspace, dc_solve};
 use crate::stamp::{SolutionView, node_rows};
 
 /// Result of a DC operating point analysis.
@@ -52,17 +52,11 @@ impl OperatingPoint {
 }
 
 /// Solve for the DC operating point: capacitors open, inductors shorted,
-/// sources at their t = 0 value.
+/// sources at their t = 0 value. Nonlinear circuits are solved by
+/// Newton-Raphson iteration with gmin and source stepping as fallbacks.
 pub fn operating_point(circuit: &Circuit) -> Result<OperatingPoint, SimError> {
-    let size = circuit.unknown_count();
-    let mut matrix = DenseMatrix::zeros(size);
-    let mut x = vec![0.0; size];
-    circuit.solve(
-        &StampContext::DC,
-        &mut matrix,
-        &mut x,
-        &mut DenseLu::default(),
-    )?;
+    let mut ws = Workspace::new(circuit.unknown_count());
+    let x = dc_solve(circuit, false, &mut ws, &Tolerances::default())?;
     Ok(OperatingPoint::from_solution(circuit, &x))
 }
 

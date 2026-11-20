@@ -6,12 +6,6 @@ pub enum SimError {
     #[error("the schematic has errors that must be fixed before simulating")]
     Netlist(Vec<Diagnostic>),
 
-    #[error("{designator}: {kind} devices are not supported yet")]
-    Unsupported {
-        designator: String,
-        kind: &'static str,
-    },
-
     #[error("{designator}: {message}")]
     InvalidParameter { designator: String, message: String },
 
@@ -31,6 +25,12 @@ pub enum SimError {
 
     #[error("the circuit equations cannot be solved (problem at {unknown})")]
     Singular { unknown: String },
+
+    #[error(
+        "the simulation did not converge (last unsettled value: {unknown}); \
+         check for unrealistic component values or missing bias paths"
+    )]
+    NoConvergence { unknown: String },
 
     #[error("invalid analysis settings: {0}")]
     InvalidOptions(String),

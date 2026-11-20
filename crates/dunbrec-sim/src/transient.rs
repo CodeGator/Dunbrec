@@ -24,9 +24,9 @@ use dunbrec_core::NodeId;
 
 use crate::circuit::Circuit;
 use crate::dc::OperatingPoint;
-use crate::device::{Integration, Mode, StampContext, Tolerances};
+use crate::device::{Integration, StampContext, Tolerances};
 use crate::error::SimError;
-use crate::linalg::{DenseLu, DenseMatrix};
+use crate::newton::{TRANSIENT_MAX_ITERATIONS, Workspace, dc_solve, newton};
 use crate::stamp::{SolutionView, node_rows};
 
 /// Default number of steps the maximum step size divides the run into.
@@ -117,8 +117,7 @@ pub struct Transient {
     /// Latest accepted solution.
     x: Vec<f64>,
     trial: Vec<f64>,
-    matrix: DenseMatrix,
-    solver: DenseLu,
+    workspace: Workspace,
     h_next: f64,
     h_max: f64,
     h_min: f64,
@@ -146,16 +145,8 @@ impl Transient {
         }
 
         let size = circuit.unknown_count();
-        let mut matrix = DenseMatrix::zeros(size);
-        let mut solver = DenseLu::default();
-        let mut x = vec![0.0; size];
-        let ctx = StampContext {
-            mode: Mode::Dc {
-                initial_conditions: true,
-            },
-            time: 0.0,
-        };
-        circuit.solve(&ctx, &mut matrix, &mut x, &mut solver)?;
+        let mut workspace = Workspace::new(size);
+        let x = dc_solve(&circuit, true, &mut workspace, &options.tolerances)?;
         let initial = OperatingPoint::from_solution(&circuit, &x);
 
         let rows = node_rows(circuit.node_count());
@@ -182,8 +173,7 @@ impl Transient {
             time: 0.0,
             trial: vec![0.0; size],
             x,
-            matrix,
-            solver,
+            workspace,
             h_next: h_max * 1e-3,
             h_max,
             h_min,
@@ -273,16 +263,25 @@ impl Transient {
                 break;
             }
             let t_new = self.time + h;
-            let ctx = StampContext {
-                mode: Mode::Transient { h, method },
-                time: t_new,
-            };
-            let mut trial = std::mem::take(&mut self.trial);
-            let solved = self
-                .circuit
-                .solve(&ctx, &mut self.matrix, &mut trial, &mut self.solver);
-            self.trial = trial;
-            solved?;
+            let ctx = StampContext::transient(h, method, t_new);
+            // Start Newton from the last accepted solution.
+            self.trial.copy_from_slice(&self.x);
+            match newton(
+                &self.circuit,
+                &ctx,
+                &mut self.trial,
+                &mut self.workspace,
+                TRANSIENT_MAX_ITERATIONS,
+                &self.options.tolerances,
+            ) {
+                Ok(_) => {}
+                Err(SimError::NoConvergence { .. }) => {
+                    // Too big a jump for the nonlinear devices: retry smaller.
+                    h /= 8.0;
+                    continue;
+                }
+                Err(other) => return Err(other),
+            }
 
             // Truncation error. Skipped on the first step after a
             // breakpoint, where history spans the discontinuity.

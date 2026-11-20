@@ -25,15 +25,45 @@ pub struct Stamper<'a> {
     matrix: &'a mut DenseMatrix,
     rhs: &'a mut [f64],
     node_rows: usize,
+    /// The solution guess the system is being linearised around (Newton
+    /// iterate). Linear devices ignore it.
+    iterate: &'a [f64],
 }
 
 impl<'a> Stamper<'a> {
-    pub(crate) fn new(matrix: &'a mut DenseMatrix, rhs: &'a mut [f64], node_rows: usize) -> Self {
+    pub(crate) fn new(
+        matrix: &'a mut DenseMatrix,
+        rhs: &'a mut [f64],
+        node_rows: usize,
+        iterate: &'a [f64],
+    ) -> Self {
         Self {
             matrix,
             rhs,
             node_rows,
+            iterate,
         }
+    }
+
+    /// Voltage of `n` in the current Newton iterate.
+    pub fn iterate_voltage(&self, n: NodeId) -> f64 {
+        if n.is_ground() {
+            0.0
+        } else {
+            self.iterate[n.0 - 1]
+        }
+    }
+
+    /// A current leaving `node` into the device equal to
+    /// `sum(coeff * V(other)) + constant`. Used for linearised nonlinear
+    /// devices, where a terminal current depends on several voltages.
+    pub fn current_row(&mut self, node: NodeId, coeffs: &[(NodeId, f64)], constant: f64) {
+        let r = self.node(node);
+        for &(other, g) in coeffs {
+            let c = self.node(other);
+            self.add(r, c, g);
+        }
+        self.add_rhs(r, -constant);
     }
 
     #[inline]
