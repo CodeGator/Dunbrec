@@ -431,9 +431,16 @@ impl Device for Diode {
             s.conductance(self.anode, self.anode_int, 1.0 / self.p.rs);
         }
         let raw = s.iterate_voltage(self.anode_int) - s.iterate_voltage(self.cathode);
-        let vd = match self.v_last.get() {
-            None => self.vcrit,
-            Some(old) => pnjlim(raw, old, self.nvt, self.vcrit),
+        let vd = match (self.v_last.get(), self.bv_eff) {
+            (None, _) => self.vcrit,
+            // Deep in reverse breakdown the current grows exponentially the
+            // other way: limit the step mirrored about the breakdown voltage
+            // (as SPICE does), or the exponential overflows.
+            (Some(old), Some(bv)) if raw < (-bv + 10.0 * self.nvt).min(0.0) => {
+                let mirrored = pnjlim(-(raw + bv), -(old + bv), self.nvt, self.vcrit);
+                -(mirrored + bv)
+            }
+            (Some(old), _) => pnjlim(raw, old, self.nvt, self.vcrit),
         };
         self.limited.set((vd - raw).abs() > LIMIT_EPS);
         self.v_last.set(Some(vd));

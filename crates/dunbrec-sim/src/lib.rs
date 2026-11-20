@@ -51,6 +51,8 @@ mod ac_tests;
 #[cfg(test)]
 mod nonlinear_tests;
 #[cfg(test)]
+mod parts_tests;
+#[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod transient_tests;

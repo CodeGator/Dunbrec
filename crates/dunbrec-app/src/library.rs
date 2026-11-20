@@ -155,6 +155,36 @@ pub fn palette() -> &'static [PaletteEntry] {
             },
         },
         PaletteEntry {
+            name: "2N3904 NPN",
+            group: "Real parts",
+            make: || ComponentKind::Bjt {
+                polarity: Polarity::N,
+                model: "2N3904".into(),
+            },
+        },
+        PaletteEntry {
+            name: "2N3906 PNP",
+            group: "Real parts",
+            make: || ComponentKind::Bjt {
+                polarity: Polarity::P,
+                model: "2N3906".into(),
+            },
+        },
+        PaletteEntry {
+            name: "1N4148 diode",
+            group: "Real parts",
+            make: || ComponentKind::Diode {
+                model: "1N4148".into(),
+            },
+        },
+        PaletteEntry {
+            name: "1N750 4.7 V zener",
+            group: "Real parts",
+            make: || ComponentKind::Diode {
+                model: "1N750".into(),
+            },
+        },
+        PaletteEntry {
             name: "VCVS (E)",
             group: "Controlled sources",
             make: || ComponentKind::Vcvs { gain: 10.0 },
@@ -232,10 +262,13 @@ fn generic_model(name: &str) -> Option<DeviceModel> {
 
 /// Make sure the model a component refers to exists, adding the generic
 /// model if it is one of ours and missing.
+/// Make sure the model a component refers to exists, adding it from the
+/// generic models or the library of real parts if it is missing.
 pub fn ensure_model(schematic: &mut Schematic, kind: &ComponentKind) {
     if let Some(name) = kind.model_name()
         && schematic.models.get(name).is_none()
-        && let Some(model) = generic_model(name)
+        && let Some(model) =
+            generic_model(name).or_else(|| dunbrec_core::parts::standard_model(name))
     {
         schematic.models.insert(model);
     }

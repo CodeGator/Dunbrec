@@ -90,7 +90,22 @@ fn arrow_head(from: (f32, f32), tip: (f32, f32), size: f32) -> Prim {
     filled(&[tip, (back.0 + px, back.1 + py), (back.0 - px, back.1 - py)])
 }
 
+/// Symbol for a part; zener diodes are recognised by name (`Z…`) or as
+/// library parts with a breakdown voltage. Use [`symbol_styled`] when the
+/// schematic's own model is known.
 pub fn symbol(kind: &ComponentKind) -> Symbol {
+    let zener = match kind {
+        ComponentKind::Diode { model } => {
+            model.to_ascii_uppercase().starts_with('Z')
+                || dunbrec_core::parts::standard_model(model)
+                    .is_some_and(|m| m.params.contains_key("BV"))
+        }
+        _ => false,
+    };
+    symbol_styled(kind, zener)
+}
+
+pub fn symbol_styled(kind: &ComponentKind, zener: bool) -> Symbol {
     let mut p = Vec::new();
     let mut label = pos2(0.0, -1.3);
     match kind {
@@ -166,11 +181,11 @@ pub fn symbol(kind: &ComponentKind) -> Symbol {
             p.push(arrow_head((0.0, 0.7), (0.0, -0.75), 0.5));
             label = pos2(1.5, 0.0);
         }
-        ComponentKind::Diode { model } => {
+        ComponentKind::Diode { .. } => {
             p.push(line(&[(-2.0, 0.0), (-0.6, 0.0)]));
             p.push(line(&[(0.6, 0.0), (2.0, 0.0)]));
             p.push(filled(&[(-0.6, -0.6), (-0.6, 0.6), (0.6, 0.0)]));
-            if model.to_ascii_uppercase().starts_with('Z') {
+            if zener {
                 p.push(line(&[
                     (0.35, -0.75),
                     (0.6, -0.6),

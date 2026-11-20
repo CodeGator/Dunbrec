@@ -1,0 +1,64 @@
+﻿<!--
+  Dunbrec Windows installer (WiX Toolset v4/v5).
+  Built by tools/build-installer.ps1, which passes Version, BinDir,
+  AssetsDir, RootDir and Manufacturer.
+
+  UpgradeCode must never change: it is how Windows recognises a newer
+  Dunbrec as an upgrade of an installed one.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="Dunbrec"
+           Manufacturer="$(var.Manufacturer)"
+           Version="$(var.Version)"
+           UpgradeCode="C2E91D03-8C5A-4F68-B851-6A572EC1F787"
+           Scope="perMachine"
+           Compressed="yes">
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Dunbrec is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Icon Id="dunbrec.ico" SourceFile="$(var.AssetsDir)\dunbrec.ico" />
+    <Property Id="ARPPRODUCTICON" Value="dunbrec.ico" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="Dunbrec">
+        <Component Id="MainExecutable" Guid="C945FEC3-1D22-4944-A2EB-0BD54BD94FC4">
+          <File Id="DunbrecExe" Source="$(var.BinDir)\dunbrec.exe" KeyPath="yes" />
+          <!-- The file association's icon must be an installed file in the
+               same component. -->
+          <File Id="DunbrecIconFile" Source="$(var.AssetsDir)\dunbrec.ico" />
+          <!-- Double-clicking a .dbr file opens it in Dunbrec. -->
+          <ProgId Id="Dunbrec.Schematic" Description="Dunbrec schematic" Icon="DunbrecIconFile">
+            <Extension Id="dbr" ContentType="application/x-dunbrec">
+              <Verb Id="open" Command="Open" TargetFile="DunbrecExe" Argument="&quot;%1&quot;" />
+            </Extension>
+          </ProgId>
+        </Component>
+        <Component Id="Readme">
+          <File Id="ReadmeFile" Source="$(var.RootDir)\README.md" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+
+    <!-- Start-menu shortcut in its own component, tracked by a per-user
+         registry value (the pattern Windows Installer validation expects). -->
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Component Id="StartMenuShortcut">
+        <Shortcut Id="StartMenuShortcut"
+                  Name="Dunbrec"
+                  Description="Circuit design and simulation"
+                  Target="[INSTALLFOLDER]dunbrec.exe"
+                  WorkingDirectory="INSTALLFOLDER"
+                  Icon="dunbrec.ico" />
+        <RegistryValue Root="HKCU" Key="Software\Dunbrec" Name="StartMenuShortcut"
+                       Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </StandardDirectory>
+
+    <Feature Id="Main" Title="Dunbrec">
+      <ComponentRef Id="MainExecutable" />
+      <ComponentRef Id="Readme" />
+      <ComponentRef Id="StartMenuShortcut" />
+    </Feature>
+  </Package>
+</Wix>

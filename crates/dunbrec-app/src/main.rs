@@ -17,6 +17,7 @@ mod library;
 mod live;
 mod plot;
 mod properties;
+mod settings;
 mod symbols;
 
 use std::path::PathBuf;
@@ -67,7 +68,11 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_title("Dunbrec")
             .with_inner_size([1280.0, 800.0])
-            .with_min_inner_size([800.0, 500.0]),
+            .with_min_inner_size([800.0, 500.0])
+            .with_icon(std::sync::Arc::new(
+                eframe::icon_data::from_png_bytes(include_bytes!("../../../assets/dunbrec.png"))
+                    .unwrap_or_default(),
+            )),
         ..Default::default()
     };
     eframe::run_native(

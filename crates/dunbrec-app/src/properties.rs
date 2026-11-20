@@ -83,6 +83,8 @@ impl Properties {
         let mut edit: Option<Edit> = None;
         let set_kind = |kind: ComponentKind| -> Option<Edit> {
             Some(Box::new(move |s: &mut Schematic| {
+                // A model picked from the library is copied into the schematic.
+                crate::library::ensure_model(s, &kind);
                 if let Some(c) = s.component_mut(id) {
                     c.kind = kind;
                 }
@@ -404,6 +406,21 @@ impl Properties {
             .show_ui(ui, |ui| {
                 for m in schematic.models.iter().filter(|m| m.kind == kind) {
                     ui.selectable_value(model, m.name.clone(), &m.name);
+                }
+                // Real parts not yet used in this schematic.
+                let library: Vec<_> = dunbrec_core::parts::standard_parts()
+                    .into_iter()
+                    .filter(|p| {
+                        p.model.kind == kind && schematic.models.get(&p.model.name).is_none()
+                    })
+                    .collect();
+                if !library.is_empty() {
+                    ui.separator();
+                    ui.label(RichText::new("From the parts library").weak().small());
+                    for p in library {
+                        ui.selectable_value(model, p.model.name.clone(), &p.model.name)
+                            .on_hover_text(p.description);
+                    }
                 }
             });
         ui.end_row();

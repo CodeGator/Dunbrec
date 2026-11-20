@@ -15,6 +15,10 @@ dunbrec-core.workspace = true
 dunbrec-io.workspace = true
 dunbrec-sim.workspace = true
 dunbrec-instruments.workspace = true
-eframe = "0.33"
+eframe = { version = "0.33", features = ["persistence"] }
 egui = "0.33"
 rfd = "0.17"
+serde.workspace = true
+
+[dev-dependencies]
+ron.workspace = true

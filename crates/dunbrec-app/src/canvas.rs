@@ -243,6 +243,10 @@ pub struct Canvas {
     /// Point where the user clicked with the label tool; the app asks for a
     /// name and then calls [`Canvas::take_label_request`].
     label_request: Option<Point>,
+    /// Internal clipboard, and how many times it has been pasted (each
+    /// paste lands a little further along so copies do not stack).
+    pub clipboard: Option<Clipboard>,
+    pub paste_count: i32,
     /// Probe tool click: the grid point and the part under it, if any.
     probe_request: Option<(Point, Option<ComponentId>)>,
 }
@@ -257,6 +261,8 @@ impl Default for Canvas {
             drag: None,
             label_request: None,
             probe_request: None,
+            clipboard: None,
+            paste_count: 0,
         }
     }
 }
@@ -468,6 +474,88 @@ pub fn move_items(s: &mut Schematic, items: &BTreeSet<Item>, d: Point) {
     }
 }
 
+/// Copied parts, wires and labels, with the models the parts use.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Clipboard {
+    components: Vec<dunbrec_core::Component>,
+    wires: Vec<dunbrec_core::Wire>,
+    labels: Vec<dunbrec_core::NetLabel>,
+    models: Vec<dunbrec_core::DeviceModel>,
+}
+
+/// Copy the selected items, or `None` if nothing is selected.
+pub fn copy_items(s: &Schematic, items: &BTreeSet<Item>) -> Option<Clipboard> {
+    let components: Vec<_> = s
+        .components
+        .iter()
+        .filter(|c| items.contains(&Item::Component(c.id)))
+        .cloned()
+        .collect();
+    let wires: Vec<_> = s
+        .wires
+        .iter()
+        .filter(|w| items.contains(&Item::Wire(w.id)))
+        .cloned()
+        .collect();
+    let labels: Vec<_> = s
+        .labels
+        .iter()
+        .filter(|l| items.contains(&Item::Label(l.id)))
+        .cloned()
+        .collect();
+    if components.is_empty() && wires.is_empty() && labels.is_empty() {
+        return None;
+    }
+    let models = components
+        .iter()
+        .filter_map(|c| c.kind.model_name())
+        .filter_map(|m| s.models.get(m).cloned())
+        .collect();
+    Some(Clipboard {
+        components,
+        wires,
+        labels,
+        models,
+    })
+}
+
+/// Paste `clip` moved by `offset`; returns the new items. Clashing
+/// designators are renumbered; models missing here are added.
+pub fn paste(s: &mut Schematic, clip: &Clipboard, offset: Point) -> BTreeSet<Item> {
+    let mut pasted = BTreeSet::new();
+    for m in &clip.models {
+        if s.models.get(&m.name).is_none() {
+            s.models.insert(m.clone());
+        }
+    }
+    for c in &clip.components {
+        let prefix = c.kind.designator_prefix();
+        let taken = s
+            .components
+            .iter()
+            .any(|o| !o.designator.is_empty() && o.designator == c.designator);
+        let designator = if taken {
+            s.next_designator(prefix)
+        } else {
+            c.designator.clone()
+        };
+        let id = s.add_component_named(c.kind.clone(), designator, c.position + offset);
+        let new = s.component_mut(id).expect("just added");
+        new.rotation = c.rotation;
+        new.mirrored = c.mirrored;
+        pasted.insert(Item::Component(id));
+    }
+    for w in &clip.wires {
+        pasted.insert(Item::Wire(s.add_wire(w.a + offset, w.b + offset)));
+    }
+    for l in &clip.labels {
+        pasted.insert(Item::Label(
+            s.add_label(l.name.clone(), l.position + offset),
+        ));
+    }
+    pasted
+}
+
 /// Flip a switch between open and closed.
 pub fn toggle_switch(s: &mut Schematic, id: ComponentId) {
     if let Some(c) = s.component_mut(id)
@@ -555,8 +643,21 @@ impl Painter<'_> {
         (self.camera.scale * 0.12).clamp(1.0, 3.0)
     }
 
-    fn component(&self, c: &dunbrec_core::Component, color: Color32, text_color: Option<Color32>) {
-        let sym = symbols::symbol(&c.kind);
+    fn component(
+        &self,
+        c: &dunbrec_core::Component,
+        models: &dunbrec_core::ModelLibrary,
+        color: Color32,
+        text_color: Option<Color32>,
+    ) {
+        // A diode whose model has a breakdown voltage is drawn as a zener.
+        let sym = match &c.kind {
+            ComponentKind::Diode { model } => match models.get(model) {
+                Some(m) => symbols::symbol_styled(&c.kind, m.params.contains_key("BV")),
+                None => symbols::symbol(&c.kind),
+            },
+            _ => symbols::symbol(&c.kind),
+        };
         let stroke = Stroke::new(self.stroke_width(), color);
         let map = |p: Pos2| self.screen(symbols::to_schematic(c, p));
         for prim in &sym.prims {
@@ -766,6 +867,7 @@ impl Canvas {
             };
             p.component(
                 c,
+                &s.models,
                 color,
                 Some(if selected {
                     colors.selected
@@ -836,7 +938,7 @@ impl Canvas {
                         rotation: *rotation,
                         mirrored: *mirrored,
                     };
-                    p.component(&ghost, colors.ghost, None);
+                    p.component(&ghost, &doc.schematic().models, colors.ghost, None);
                 }
             }
             Tool::Wire => {
@@ -1193,6 +1295,25 @@ mod tests {
             Some(NodeId::GROUND)
         );
         assert_eq!(map.node_at(&s, &netlist, Point::new(30, 30)), None);
+    }
+
+    #[test]
+    fn copy_and_paste_renumbers_and_keeps_wiring() {
+        let mut s = voltage_divider();
+        let all: BTreeSet<Item> =
+            items_in_rect(&s, Rect::from_min_max(pos2(-5.0, -10.0), pos2(20.0, 10.0)))
+                .into_iter()
+                .collect();
+        let clip = copy_items(&s, &all).unwrap();
+        let pasted = paste(&mut s, &clip, Point::new(0, 20));
+        assert_eq!(pasted.len(), all.len());
+        let n = dunbrec_core::build_netlist(&s);
+        assert!(n.diagnostics.is_empty(), "{:?}", n.diagnostics);
+        assert_eq!(n.elements.len(), 6);
+        let mut names: Vec<&str> = n.elements.iter().map(|e| e.designator.as_str()).collect();
+        names.sort();
+        assert_eq!(names, vec!["R1", "R2", "R3", "R4", "V1", "V2"]);
+        assert!(copy_items(&s, &BTreeSet::new()).is_none());
     }
 
     #[test]

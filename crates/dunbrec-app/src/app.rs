@@ -19,12 +19,34 @@ use crate::instruments_ui::{Bench, MeterSignal, Signals};
 use crate::library::palette;
 use crate::live::{Command, Event, LiveSim};
 use crate::properties::Properties;
+use crate::settings::{STORAGE_KEY, Settings, Theme};
+
+/// Keyboard shortcuts shown under Help.
+const SHORTCUTS: &[(&str, &str)] = &[
+    ("Ctrl+N / Ctrl+O / Ctrl+S", "New, open, save"),
+    ("Ctrl+Shift+S", "Save as"),
+    ("Ctrl+Z / Ctrl+Y", "Undo, redo"),
+    ("Ctrl+C / Ctrl+X / Ctrl+V", "Copy, cut, paste"),
+    ("Ctrl+D", "Duplicate the selection"),
+    ("Ctrl+A", "Select everything"),
+    ("Del", "Delete the selection"),
+    ("R / X", "Rotate / mirror (selection or part being placed)"),
+    ("S", "Select tool"),
+    ("W", "Wire tool"),
+    ("L", "Net label tool"),
+    ("P", "Probe tool"),
+    ("Esc", "Stop the current tool / clear the selection"),
+    ("Space", "Run, pause or resume the simulation"),
+    ("Double-click a switch", "Flip it (also while simulating)"),
+    ("Mouse wheel / middle drag", "Zoom / pan"),
+];
 
 /// Something that would discard unsaved changes, waiting for confirmation.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 enum Pending {
     New,
     Open,
+    OpenPath(PathBuf),
     Example(usize),
     ImportSpice,
     ImportKicad,
@@ -58,6 +80,8 @@ pub struct DunbrecApp {
     message: Option<String>,
     title: String,
     show_about: bool,
+    show_shortcuts: bool,
+    settings: Settings,
 
     // ---- live simulation and instruments ----
     bench: Bench,
@@ -108,9 +132,14 @@ fn feed(bench: &mut Bench, signals: &Signals, s: &Sample) {
 
 impl DunbrecApp {
     pub fn new(
-        _cc: &eframe::CreationContext<'_>,
+        cc: &eframe::CreationContext<'_>,
         initial: Option<(Schematic, Option<PathBuf>)>,
     ) -> Self {
+        let settings: Settings = cc
+            .storage
+            .and_then(|s| eframe::get_value(s, STORAGE_KEY))
+            .unwrap_or_default();
+        cc.egui_ctx.set_theme(settings.theme.preference());
         let doc = match initial {
             Some((s, path)) => {
                 let mut d = Document::new(s, None);
@@ -149,6 +178,8 @@ impl DunbrecApp {
             message: None,
             title: String::new(),
             show_about: false,
+            show_shortcuts: false,
+            settings,
         }
     }
 
@@ -170,18 +201,10 @@ impl DunbrecApp {
                     .add_filter("Dunbrec schematic", &["dbr"])
                     .pick_file();
                 if let Some(path) = picked {
-                    match dunbrec_io::dbr::load(&path) {
-                        Ok(s) => {
-                            let mut d = Document::new(s, None);
-                            d.mark_saved(path);
-                            self.replace(d);
-                        }
-                        Err(e) => {
-                            self.message = Some(format!("Could not open {}:\n{e}", path.display()))
-                        }
-                    }
+                    self.open_path(path);
                 }
             }
+            Pending::OpenPath(path) => self.open_path(path),
             Pending::Example(i) => {
                 if let Some(ex) = examples().get(i) {
                     self.replace(Document::new((ex.build)(), None));
@@ -283,6 +306,21 @@ impl DunbrecApp {
         }
     }
 
+    fn open_path(&mut self, path: PathBuf) {
+        match dunbrec_io::dbr::load(&path) {
+            Ok(s) => {
+                self.settings.remember(&path);
+                let mut d = Document::new(s, None);
+                d.mark_saved(path);
+                self.replace(d);
+            }
+            Err(e) => {
+                self.settings.forget(&path);
+                self.message = Some(format!("Could not open {}:\n{e}", path.display()));
+            }
+        }
+    }
+
     fn replace(&mut self, doc: Document) {
         self.stop_sim();
         self.bench = Bench::default();
@@ -309,6 +347,7 @@ impl DunbrecApp {
         }
         match dunbrec_io::dbr::save(self.doc.schematic(), &path) {
             Ok(()) => {
+                self.settings.remember(&path);
                 self.doc.mark_saved(path);
                 true
             }
@@ -448,6 +487,21 @@ impl DunbrecApp {
         if pressed(cmd(Key::N)) {
             self.request(Pending::New);
         }
+        if pressed(cmd(Key::C)) {
+            self.copy();
+        }
+        if pressed(cmd(Key::X)) {
+            self.copy();
+            let items = std::mem::take(&mut self.canvas.selection);
+            self.doc.edit(|s| delete_items(s, &items));
+        }
+        if pressed(cmd(Key::V)) {
+            self.paste();
+        }
+        if pressed(cmd(Key::D)) {
+            self.copy();
+            self.paste();
+        }
         if pressed(cmd(Key::A)) {
             let s = self.doc.schematic();
             self.canvas.selection = s
@@ -474,6 +528,27 @@ impl DunbrecApp {
         if plain(Key::S) {
             self.canvas.cancel();
         }
+    }
+
+    // --------------------------------------------------- clipboard ---
+
+    fn copy(&mut self) {
+        if let Some(clip) = crate::canvas::copy_items(self.doc.schematic(), &self.canvas.selection)
+        {
+            self.canvas.clipboard = Some(clip);
+            self.canvas.paste_count = 0;
+        }
+    }
+
+    fn paste(&mut self) {
+        let Some(clip) = self.canvas.clipboard.clone() else {
+            return;
+        };
+        self.canvas.paste_count += 1;
+        let step = 2 * self.canvas.paste_count;
+        let offset = dunbrec_core::Point::new(step, step);
+        let pasted = self.doc.edit(|s| crate::canvas::paste(s, &clip, offset));
+        self.canvas.selection = pasted;
     }
 
     // ------------------------------------------------ live simulation ---
@@ -717,6 +792,24 @@ impl DunbrecApp {
                         self.request(Pending::Open);
                         ui.close();
                     }
+                    ui.add_enabled_ui(!self.settings.recent.is_empty(), |ui| {
+                        ui.menu_button("Open recent", |ui| {
+                            for path in self.settings.recent.clone() {
+                                let name = path.file_name().map_or_else(
+                                    || path.display().to_string(),
+                                    |n| n.to_string_lossy().into_owned(),
+                                );
+                                if ui
+                                    .button(name)
+                                    .on_hover_text(path.display().to_string())
+                                    .clicked()
+                                {
+                                    self.request(Pending::OpenPath(path));
+                                    ui.close();
+                                }
+                            }
+                        });
+                    });
                     ui.menu_button("Open example", |ui| {
                         for (i, ex) in examples().iter().enumerate() {
                             if ui.button(ex.name).clicked() {
@@ -794,6 +887,32 @@ impl DunbrecApp {
                         self.doc.edit(|s| delete_items(s, &items));
                         ui.close();
                     }
+                    ui.separator();
+                    if ui
+                        .add_enabled(has_selection, egui::Button::new("Copy        Ctrl+C"))
+                        .clicked()
+                    {
+                        self.copy();
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(
+                            self.canvas.clipboard.is_some(),
+                            egui::Button::new("Paste       Ctrl+V"),
+                        )
+                        .clicked()
+                    {
+                        self.paste();
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(has_selection, egui::Button::new("Duplicate   Ctrl+D"))
+                        .clicked()
+                    {
+                        self.copy();
+                        self.paste();
+                        ui.close();
+                    }
                 });
                 ui.menu_button("Simulate", |ui| {
                     ui.checkbox(&mut self.live_dc, "Live DC operating point");
@@ -817,7 +936,28 @@ impl DunbrecApp {
                     ui.checkbox(&mut self.analyses.show_transfer, "↗ DC transfer (DC sweep)");
                     ui.checkbox(&mut self.analyses.show_tracer, "〽 Curve tracer");
                 });
+                ui.menu_button("View", |ui| {
+                    ui.label(RichText::new("Theme").weak());
+                    for (theme, name) in [
+                        (Theme::System, "Follow Windows"),
+                        (Theme::Light, "Light"),
+                        (Theme::Dark, "Dark"),
+                    ] {
+                        if ui
+                            .radio_value(&mut self.settings.theme, theme, name)
+                            .clicked()
+                        {
+                            ctx.set_theme(theme.preference());
+                        }
+                    }
+                    ui.separator();
+                    ui.checkbox(&mut self.show_voltages, "Node voltages on the schematic");
+                });
                 ui.menu_button("Help", |ui| {
+                    if ui.button("Keyboard shortcuts").clicked() {
+                        self.show_shortcuts = true;
+                        ui.close();
+                    }
                     if ui.button("About Dunbrec").clicked() {
                         self.show_about = true;
                         ui.close();
@@ -974,7 +1114,7 @@ impl DunbrecApp {
     }
 
     fn dialogs(&mut self, ctx: &egui::Context) {
-        if let Some(action) = self.pending {
+        if let Some(action) = self.pending.clone() {
             egui::Modal::new(egui::Id::new("confirm")).show(ctx, |ui| {
                 ui.heading("Unsaved changes");
                 ui.label(format!(
@@ -985,11 +1125,11 @@ impl DunbrecApp {
                 ui.horizontal(|ui| {
                     if ui.button("Save").clicked() && self.save(false) {
                         self.pending = None;
-                        self.perform(action);
+                        self.perform(action.clone());
                     }
                     if ui.button("Discard").clicked() {
                         self.pending = None;
-                        self.perform(action);
+                        self.perform(action.clone());
                     }
                     if ui.button("Cancel").clicked() {
                         self.pending = None;
@@ -1037,11 +1177,36 @@ impl DunbrecApp {
             egui::Modal::new(egui::Id::new("about")).show(ctx, |ui| {
                 ui.heading("Dunbrec");
                 ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
-                ui.label("Schematic capture and circuit simulation.");
+                ui.label("Schematic capture and circuit simulation with virtual instruments.");
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(
+                        "Analyses: DC operating point, DC sweep, AC small-signal, transient.",
+                    )
+                    .weak(),
+                );
                 if ui.button("Close").clicked() {
                     self.show_about = false;
                 }
             });
+        }
+
+        if self.show_shortcuts {
+            let mut open = true;
+            egui::Window::new("Keyboard shortcuts")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    egui::Grid::new("shortcuts").striped(true).show(ui, |ui| {
+                        for (keys, what) in SHORTCUTS {
+                            ui.monospace(*keys);
+                            ui.label(*what);
+                            ui.end_row();
+                        }
+                    });
+                });
+            self.show_shortcuts = open;
         }
     }
 
@@ -1066,6 +1231,10 @@ impl DunbrecApp {
 }
 
 impl eframe::App for DunbrecApp {
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        eframe::set_value(storage, STORAGE_KEY, &self.settings);
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Closing with unsaved changes asks first.
         if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close && self.doc.is_dirty()

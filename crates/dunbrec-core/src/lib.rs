@@ -3,11 +3,13 @@
 //! * [`units`]: engineering value parsing/formatting (`4k7`, `10uF`).
 //! * [`schematic`]: the graphical schematic (components, wires, labels).
 //! * [`models`]: device model parameter sets (`.model` cards).
+//! * [`parts`]: models of real parts (2N3904, 1N4148, ...).
 //! * [`netlist`]: converts a schematic into the node/element form the
 //!   simulator consumes, with diagnostics for the editor to display.
 
 pub mod models;
 pub mod netlist;
+pub mod parts;
 pub mod schematic;
 pub mod units;
 
