@@ -13,7 +13,7 @@ circuit.
 Build the Windows installer (needs the WiX Toolset: `dotnet tool install --global wix`):
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File tools\build-installer.ps1 -Manufacturer "Your name"
+powershell -ExecutionPolicy Bypass -File tools\build-installer.ps1
 ```
 
 This produces `target\installer\Dunbrec-<version>-x64.msi`, which installs Dunbrec to Program
@@ -103,3 +103,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 python tools/make_icon.py   # regenerate assets/dunbrec.png and .ico
 ```
+
+## License
+
+MIT © 2026 CodeGator. See [LICENSE](LICENSE).

@@ -9,7 +9,7 @@
 .PARAMETER Manufacturer
   Publisher name shown in Windows' installed-apps list.
 #>
-param([string]$Manufacturer = "Dunbrec")
+param([string]$Manufacturer = "CodeGator")
 
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
