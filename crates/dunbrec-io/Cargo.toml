@@ -1,0 +1,13 @@
+[package]
+name = "dunbrec-io"
+description = "Dunbrec file formats: .dbr native format, SPICE and KiCad import/export"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+dunbrec-core.workspace = true
+serde.workspace = true
+ron.workspace = true
+thiserror.workspace = true
