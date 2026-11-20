@@ -18,8 +18,9 @@
 //! assert!((op.voltage_by_name("out").unwrap() - 5.0).abs() < 1e-9);
 //! ```
 //!
-//! Current status: linear devices and DC operating point. Transient analysis,
-//! the time scheduler and nonlinear devices follow.
+//! Analyses: DC operating point ([`operating_point`]) and transient
+//! ([`transient`], or step by step with [`Transient`]). Nonlinear devices
+//! follow.
 
 pub mod circuit;
 pub mod dc;
@@ -27,10 +28,18 @@ pub mod device;
 pub mod error;
 pub mod linalg;
 pub mod stamp;
+pub mod transient;
+pub mod waveform;
 
 pub use circuit::Circuit;
 pub use dc::{OperatingPoint, operating_point};
 pub use error::{SimError, SimWarning};
+pub use transient::{
+    Crossing, Edge, Sample, StepResult, Transient, TransientOptions, TransientResult, Watch,
+    WatchId, transient,
+};
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod transient_tests;

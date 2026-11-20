@@ -2,10 +2,11 @@
 
 use dunbrec_core::NodeId;
 
-use crate::circuit::{Circuit, FLOATING_SHUNT};
+use crate::circuit::Circuit;
+use crate::device::StampContext;
 use crate::error::{SimError, SimWarning};
-use crate::linalg::{DenseLu, DenseMatrix, LinearSolver};
-use crate::stamp::{SolutionView, Stamper, node_rows};
+use crate::linalg::{DenseLu, DenseMatrix};
+use crate::stamp::{SolutionView, node_rows};
 
 /// Result of a DC operating point analysis.
 #[derive(Debug, Clone, PartialEq)]
@@ -54,43 +55,34 @@ impl OperatingPoint {
 /// sources at their t = 0 value.
 pub fn operating_point(circuit: &Circuit) -> Result<OperatingPoint, SimError> {
     let size = circuit.unknown_count();
-    let rows = node_rows(circuit.node_count());
     let mut matrix = DenseMatrix::zeros(size);
     let mut x = vec![0.0; size];
+    circuit.solve(
+        &StampContext::DC,
+        &mut matrix,
+        &mut x,
+        &mut DenseLu::default(),
+    )?;
+    Ok(OperatingPoint::from_solution(circuit, &x))
+}
 
-    {
-        let mut s = Stamper::new(&mut matrix, &mut x, rows);
-        for d in &circuit.devices {
-            d.stamp_dc(&mut s);
-        }
-        for &node in &circuit.shunted {
-            s.conductance(node, NodeId::GROUND, FLOATING_SHUNT);
+impl OperatingPoint {
+    pub(crate) fn from_solution(circuit: &Circuit, x: &[f64]) -> Self {
+        let rows = node_rows(circuit.node_count());
+        let sol = SolutionView { x, node_rows: rows };
+        let voltages = (0..circuit.node_count())
+            .map(|i| sol.voltage(NodeId(i)))
+            .collect();
+        let currents = circuit
+            .devices
+            .iter()
+            .map(|d| (d.designator().to_string(), d.current(&sol)))
+            .collect();
+        OperatingPoint {
+            node_names: circuit.node_names.clone(),
+            voltages,
+            currents,
+            warnings: circuit.warnings.clone(),
         }
     }
-
-    DenseLu::default()
-        .solve(&mut matrix, &mut x)
-        .map_err(|e| SimError::Singular {
-            unknown: circuit.describe_unknown(e.index),
-        })?;
-
-    let sol = SolutionView {
-        x: &x,
-        node_rows: rows,
-    };
-    let voltages = (0..circuit.node_count())
-        .map(|i| sol.voltage(NodeId(i)))
-        .collect();
-    let currents = circuit
-        .devices
-        .iter()
-        .map(|d| (d.designator().to_string(), d.current(&sol)))
-        .collect();
-
-    Ok(OperatingPoint {
-        node_names: circuit.node_names.clone(),
-        voltages,
-        currents,
-        warnings: circuit.warnings.clone(),
-    })
 }

@@ -10,7 +10,7 @@ v1 targets analog circuits: discrete components, sources, diodes and transistors
 |---|---|---|
 | `dunbrec-core` | Schematic data model, units, device models, netlister | Phase 1 ✅ |
 | `dunbrec-io` | `.dbr` native format; SPICE/KiCad import later | `.dbr` ✅ |
-| `dunbrec-sim` | Own MNA simulation engine with a mixed-signal-ready scheduler | Linear DC ✅ |
+| `dunbrec-sim` | Own MNA simulation engine with a mixed-signal-ready scheduler | DC + transient ✅ |
 | `dunbrec-instruments` | Virtual instruments | Phase 6 |
 | `dunbrec-app` | egui/eframe desktop application | Phase 5 |
 
@@ -18,7 +18,7 @@ v1 targets analog circuits: discrete components, sources, diodes and transistors
 
 1. Foundations: data model, units, netlister, `.dbr` save/load ✅
 2. Linear DC solver (MNA) ✅
-3. Scheduler + transient analysis
+3. Scheduler + transient analysis ✅
 4. Nonlinear devices: diode, BJT, MOSFET (checked against ngspice)
 5. Schematic editor
 6. Live simulation + instruments

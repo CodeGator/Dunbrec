@@ -92,11 +92,19 @@ impl<'a> Stamper<'a> {
     /// `V(p) - V(n)`. The caller completes the equation with
     /// [`branch_rhs`](Self::branch_rhs) and the `branch_*` coefficient methods.
     pub fn branch_incidence(&mut self, p: NodeId, n: NodeId, k: BranchId) {
+        self.branch_kcl(p, n, k);
+        let (rp, rn, rk) = (self.node(p), self.node(n), Some(self.branch(k)));
+        self.add(rk, rp, 1.0);
+        self.add(rk, rn, -1.0);
+    }
+
+    /// Only the KCL part of [`branch_incidence`](Self::branch_incidence):
+    /// branch `k`'s current leaves `p` and enters `n`. The caller writes the
+    /// whole branch equation itself.
+    pub fn branch_kcl(&mut self, p: NodeId, n: NodeId, k: BranchId) {
         let (rp, rn, rk) = (self.node(p), self.node(n), Some(self.branch(k)));
         self.add(rp, rk, 1.0);
         self.add(rn, rk, -1.0);
-        self.add(rk, rp, 1.0);
-        self.add(rk, rn, -1.0);
     }
 
     /// Ideal voltage branch: `V(p) - V(n) = v`, with current through `k`.

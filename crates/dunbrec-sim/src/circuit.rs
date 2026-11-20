@@ -4,12 +4,14 @@ use std::collections::BTreeSet;
 
 use dunbrec_core::{ComponentKind, Element, ModelLibrary, Netlist, NodeId, Severity};
 
+use crate::device::StampContext;
 use crate::device::{
     Capacitor, Cccs, Ccvs, ControlledPins, CurrentSource, Device, Inductor, Potentiometer,
     Resistor, Vccs, Vcvs, VoltageSource,
 };
 use crate::error::{SimError, SimWarning};
-use crate::stamp::{BranchId, node_rows};
+use crate::linalg::{DenseMatrix, LinearSolver};
+use crate::stamp::{BranchId, Stamper, node_rows};
 
 /// Conductance used to tie DC-floating nodes to ground (1 TΩ).
 pub const FLOATING_SHUNT: f64 = 1e-12;
@@ -77,6 +79,31 @@ impl Circuit {
 
     pub(crate) fn unknown_count(&self) -> usize {
         node_rows(self.node_count()) + self.branch_owners.len()
+    }
+
+    /// Build the MNA system for `ctx` and solve it. On success `x` holds the
+    /// solution. `matrix` and `x` must be sized to [`unknown_count`](Self::unknown_count).
+    pub(crate) fn solve(
+        &self,
+        ctx: &StampContext,
+        matrix: &mut DenseMatrix,
+        x: &mut [f64],
+        solver: &mut dyn LinearSolver,
+    ) -> Result<(), SimError> {
+        matrix.clear();
+        x.fill(0.0);
+        {
+            let mut s = Stamper::new(matrix, x, node_rows(self.node_count()));
+            for d in &self.devices {
+                d.stamp(&mut s, ctx);
+            }
+            for &node in &self.shunted {
+                s.conductance(node, NodeId::GROUND, FLOATING_SHUNT);
+            }
+        }
+        solver.solve(matrix, x).map_err(|e| SimError::Singular {
+            unknown: self.describe_unknown(e.index),
+        })
     }
 
     /// Human-readable name of an unknown (matrix row/column).
@@ -225,19 +252,36 @@ fn make_device(e: &Element) -> Result<Box<dyn Device>, SimError> {
                 wiper: *wiper,
             })
         }
-        ComponentKind::Capacitor { capacitance, .. } => Box::new(Capacitor {
-            name,
-            p: node(0),
-            n: node(1),
-            capacitance: check_positive(e, "capacitance", *capacitance)?,
-        }),
-        ComponentKind::Inductor { inductance, .. } => Box::new(Inductor {
-            name,
-            p: node(0),
-            n: node(1),
-            inductance: check_positive(e, "inductance", *inductance)?,
-            branch: None,
-        }),
+        ComponentKind::Capacitor {
+            capacitance,
+            initial_voltage,
+        } => {
+            let ic = initial_voltage
+                .map(|v| check_finite(e, "initial voltage", v))
+                .transpose()?;
+            Box::new(Capacitor::new(
+                name,
+                node(0),
+                node(1),
+                check_positive(e, "capacitance", *capacitance)?,
+                ic,
+            ))
+        }
+        ComponentKind::Inductor {
+            inductance,
+            initial_current,
+        } => {
+            let ic = initial_current
+                .map(|i| check_finite(e, "initial current", i))
+                .transpose()?;
+            Box::new(Inductor::new(
+                name,
+                node(0),
+                node(1),
+                check_positive(e, "inductance", *inductance)?,
+                ic,
+            ))
+        }
         ComponentKind::VoltageSource { waveform } => {
             check_finite(e, "source value", waveform.dc_value())?;
             Box::new(VoltageSource {
@@ -255,6 +299,7 @@ fn make_device(e: &Element) -> Result<Box<dyn Device>, SimError> {
                 input: node(0),
                 output: node(1),
                 waveform: waveform.clone(),
+                time: 0.0,
             })
         }
         ComponentKind::Vcvs { gain } => Box::new(Vcvs {

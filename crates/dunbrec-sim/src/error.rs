@@ -31,6 +31,14 @@ pub enum SimError {
 
     #[error("the circuit equations cannot be solved (problem at {unknown})")]
     Singular { unknown: String },
+
+    #[error("invalid analysis settings: {0}")]
+    InvalidOptions(String),
+
+    #[error(
+        "the time step became too small at t = {time} s; the circuit may be changing too abruptly"
+    )]
+    TimestepTooSmall { time: f64 },
 }
 
 /// Non-fatal issues found while preparing or running a simulation.
