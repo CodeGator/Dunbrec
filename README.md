@@ -23,7 +23,7 @@ v1 targets analog circuits: discrete components, sources, diodes and transistors
 5. Schematic editor ✅ (with live DC operating point)
 6. Live simulation + instruments ✅
 7. SPICE / KiCad import, SPICE export ✅
-8. DC sweep, AC analysis, Bode plotter, curve tracer
+8. DC sweep, AC analysis, Bode plotter, curve tracer, function generator ✅
 9. Polish + v1 release
 10. Digital logic (post-v1)
 11. Microcontrollers (post-v1)
@@ -54,6 +54,11 @@ the Speed box sets how much simulated time passes per second. Open the oscillosc
 multimeter from the toolbar, click an input's 🔌 Probe button, then click a wire or pin
 (or a part, for current). Edits while running take effect immediately: double-click a switch
 to flip it, drag a potentiometer's wiper, change a value. Changing the wiring restarts the run.
+
+The Instruments menu also has a function generator (drives a voltage source live: sine,
+square, triangle, DC), a Bode plotter (AC small-signal gain and phase from a source to a probed
+node, with peak and −3 dB read-outs), a DC transfer plot (sweep a source, plot a node), and a
+curve tracer (characteristic curves of a diode, BJT or MOSFET from the schematic).
 
 ## Development
 

@@ -18,6 +18,7 @@ use std::cell::Cell;
 
 use dunbrec_core::{DeviceModel, NodeId};
 
+use crate::ac::{AcContext, AcStamper, C64};
 use crate::device::{
     Device, History, Integration, Mode, RING_CURRENT_FLOOR, RingDetector, StampContext, Tolerances,
 };
@@ -397,6 +398,15 @@ impl Device for Diode {
     fn designator(&self) -> &str {
         &self.name
     }
+    fn stamp_ac(&self, s: &mut AcStamper, ctx: &AcContext) {
+        if self.p.rs > 0.0 {
+            s.conductance(self.anode, self.anode_int, 1.0 / self.p.rs);
+        }
+        let vd = self.junction(&ctx.op);
+        let (_, gd) = self.eval(vd);
+        let (_, c) = self.charge(vd);
+        s.admittance(self.anode_int, self.cathode, C64::new(gd, ctx.omega * c));
+    }
     fn internal_nodes(&self) -> Vec<&'static str> {
         if self.p.rs > 0.0 {
             vec!["a"]
@@ -697,6 +707,24 @@ impl Device for Bjt {
     fn designator(&self) -> &str {
         &self.name
     }
+    fn stamp_ac(&self, s: &mut AcStamper, ctx: &AcContext) {
+        for (r, a, b) in self.resistors() {
+            if r > 0.0 {
+                s.conductance(a, b, 1.0 / r);
+            }
+        }
+        let (vbe, vbc) = self.junctions(|n| ctx.op.voltage(n));
+        let op = bjt_eval(&self.p, vbe, vbc);
+        let (c, b, e) = (self.c_int, self.b_int, self.e_int);
+        let row = |g_be: f64, g_bc: f64| [(b, g_be + g_bc), (e, -g_be), (c, -g_bc)];
+        s.current_row(c, &row(op.dic_dvbe, op.dic_dvbc));
+        s.current_row(b, &row(op.dib_dvbe, op.dib_dvbc));
+        let (ge, gc) = (op.dic_dvbe + op.dib_dvbe, op.dic_dvbc + op.dib_dvbc);
+        s.current_row(e, &row(-ge, -gc));
+        let [(_, cbe), (_, cbc)] = self.charges(&op, vbe, vbc);
+        s.capacitance(b, e, cbe, ctx.omega);
+        s.capacitance(b, c, cbc, ctx.omega);
+    }
     fn internal_nodes(&self) -> Vec<&'static str> {
         let mut names = Vec::new();
         if self.p.rc > 0.0 {
@@ -987,6 +1015,24 @@ impl Mosfet {
 impl Device for Mosfet {
     fn designator(&self) -> &str {
         &self.name
+    }
+    fn stamp_ac(&self, s: &mut AcStamper, ctx: &AcContext) {
+        if self.p.rd > 0.0 {
+            s.conductance(self.drain, self.d_int, 1.0 / self.p.rd);
+        }
+        if self.p.rs > 0.0 {
+            s.conductance(self.source, self.s_int, 1.0 / self.p.rs);
+        }
+        let (vgs, vds) = self.terminal_voltages(|n| ctx.op.voltage(n));
+        let (_, g_gs, g_ds) = self.eval(vgs, vds);
+        let (d, g, src) = (self.d_int, self.gate, self.s_int);
+        s.current_row(d, &[(g, g_gs), (d, g_ds), (src, -g_gs - g_ds)]);
+        s.current_row(src, &[(g, -g_gs), (d, -g_ds), (src, g_gs + g_ds)]);
+        s.conductance(d, src, GMIN);
+        let [(_, cgs, _), (_, cgd, _), (_, cbd, _)] = self.charges(vgs, vds);
+        s.capacitance(g, src, cgs, ctx.omega);
+        s.capacitance(g, d, cgd, ctx.omega);
+        s.capacitance(src, d, cbd, ctx.omega);
     }
     fn internal_nodes(&self) -> Vec<&'static str> {
         let mut names = Vec::new();

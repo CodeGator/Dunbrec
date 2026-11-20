@@ -44,6 +44,10 @@ pub enum ProbeSlot {
     Scope(usize),
     MeterPlus,
     MeterCom,
+    /// Output node of the Bode plotter.
+    BodeOut,
+    /// Output node of the DC transfer plot.
+    SweepOut,
 }
 
 /// What a probe is connected to.
@@ -103,6 +107,8 @@ pub struct Bench {
     pub meter_plus: Option<ProbeTarget>,
     /// `None` means the common lead is on ground.
     pub meter_com: Option<Point>,
+    pub bode_out: Option<Point>,
+    pub sweep_out: Option<Point>,
     pub active: ProbeSlot,
     pub show_scope: bool,
     pub show_meter: bool,
@@ -123,6 +129,8 @@ impl Default for Bench {
             scope_probes: [None; CHANNELS],
             meter_plus: None,
             meter_com: None,
+            bode_out: None,
+            sweep_out: None,
             active: ProbeSlot::Scope(0),
             show_scope: false,
             show_meter: false,
@@ -179,6 +187,18 @@ impl Bench {
                     return Err("Click on a wire or pin for the meter's common lead.".into());
                 }
                 self.meter_com = Some(at);
+            }
+            ProbeSlot::BodeOut | ProbeSlot::SweepOut => {
+                if !on_net {
+                    return Err("Click on a wire or pin for the output to plot.".into());
+                }
+                if self.active == ProbeSlot::BodeOut {
+                    self.bode_out = Some(at);
+                } else {
+                    self.sweep_out = Some(at);
+                }
+                self.probe_revision += 1;
+                return Ok(());
             }
         }
         self.probe_revision += 1;
@@ -244,10 +264,19 @@ impl Bench {
                 color: METER_COM,
             });
         }
+        for (p, text) in [(self.bode_out, "BODE"), (self.sweep_out, "SWEEP")] {
+            if let Some(at) = p {
+                out.push(Marker {
+                    at,
+                    text: text.into(),
+                    color: Color32::from_rgb(180, 140, 255),
+                });
+            }
+        }
         out
     }
 
-    fn describe(
+    pub(crate) fn describe(
         &self,
         target: Option<ProbeTarget>,
         s: &Schematic,
@@ -267,7 +296,12 @@ impl Bench {
         }
     }
 
-    fn probe_button(&mut self, ui: &mut Ui, slot: ProbeSlot, probe_tool_active: bool) -> bool {
+    pub(crate) fn probe_button(
+        &mut self,
+        ui: &mut Ui,
+        slot: ProbeSlot,
+        probe_tool_active: bool,
+    ) -> bool {
         let selected = self.active == slot && probe_tool_active;
         let clicked = ui
             .selectable_label(selected, "🔌 Probe")

@@ -8,6 +8,7 @@ use dunbrec_core::{
 use dunbrec_sim::{Circuit, Sample, SimWarning, operating_point};
 use egui::{Color32, Key, KeyboardShortcut, Modifiers, RichText, ViewportCommand};
 
+use crate::analyses_ui::{Analyses, Inputs};
 use crate::canvas::{
     Annotation, Canvas, Item, NodeMap, TagPlace, Tool, delete_items, node_tag_positions,
     transform_components,
@@ -74,6 +75,8 @@ pub struct DunbrecApp {
     signals: ((u64, u64), Signals),
     /// Node lookup and voltage-tag positions, keyed by generation.
     node_map: (u64, NodeMap, Vec<TagPlace>),
+    /// Bode plotter, curve tracer, DC transfer, function generator.
+    analyses: Analyses,
 }
 
 /// True if two netlists have the same nodes and connections, so a running
@@ -123,6 +126,7 @@ impl DunbrecApp {
         let tags = node_tag_positions(doc.schematic(), &netlist);
         Self {
             node_map: (doc.generation(), node_map, tags),
+            analyses: Analyses::default(),
             signals: ((u64::MAX, 0), Signals::default()),
             bench: Bench::default(),
             live: None,
@@ -653,6 +657,7 @@ impl DunbrecApp {
                 }
                 ui.toggle_value(&mut self.bench.show_scope, "📈 Oscilloscope");
                 ui.toggle_value(&mut self.bench.show_meter, "🔢 Multimeter");
+                ui.toggle_value(&mut self.analyses.show_fgen, "∿ Function gen");
                 if let Some(e) = &self.live_error {
                     ui.separator();
                     ui.label(RichText::new(e).color(Color32::from_rgb(225, 70, 70)));
@@ -685,6 +690,14 @@ impl DunbrecApp {
                 .bench
                 .meter_window(ctx, s, netlist, map, probing, running);
         }
+        let inputs = Inputs {
+            doc: &mut self.doc,
+            netlist: &self.netlist.1,
+            map: &self.node_map.1,
+            bench: &mut self.bench,
+            probing,
+        };
+        probe_clicked |= self.analyses.show(ctx, inputs);
         if probe_clicked {
             self.canvas.tool = Tool::Probe;
         }
@@ -791,6 +804,18 @@ impl DunbrecApp {
                     }
                     ui.separator();
                     ui.label(RichText::new("Transient & instruments: coming in phase 6").weak());
+                });
+                ui.menu_button("Instruments", |ui| {
+                    ui.checkbox(&mut self.bench.show_scope, "📈 Oscilloscope");
+                    ui.checkbox(&mut self.bench.show_meter, "🔢 Multimeter");
+                    ui.checkbox(&mut self.analyses.show_fgen, "∿ Function generator");
+                    ui.separator();
+                    ui.checkbox(
+                        &mut self.analyses.show_bode,
+                        "📉 Bode plotter (AC analysis)",
+                    );
+                    ui.checkbox(&mut self.analyses.show_transfer, "↗ DC transfer (DC sweep)");
+                    ui.checkbox(&mut self.analyses.show_tracer, "〽 Curve tracer");
                 });
                 ui.menu_button("Help", |ui| {
                     if ui.button("About Dunbrec").clicked() {

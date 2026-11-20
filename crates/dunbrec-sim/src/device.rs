@@ -12,6 +12,7 @@
 
 use dunbrec_core::{NodeId, Waveform};
 
+use crate::ac::{AcContext, AcStamper, C64};
 use crate::stamp::{BranchId, SolutionView, Stamper};
 use crate::waveform;
 
@@ -133,6 +134,10 @@ pub trait Device: Send + std::fmt::Debug {
 
     /// Write this device's equations for the given analysis.
     fn stamp(&self, s: &mut Stamper, ctx: &StampContext);
+
+    /// Write the small-signal (AC) equations, linearised at the DC
+    /// operating point `ctx.op`.
+    fn stamp_ac(&self, s: &mut AcStamper, ctx: &AcContext);
 
     /// Node pairs joined by a DC-conducting path through this device.
     fn dc_paths(&self) -> Vec<(NodeId, NodeId)>;
@@ -309,6 +314,9 @@ impl Device for Resistor {
     fn designator(&self) -> &str {
         &self.name
     }
+    fn stamp_ac(&self, s: &mut AcStamper, _ctx: &AcContext) {
+        s.conductance(self.p, self.n, 1.0 / self.resistance);
+    }
     fn stamp(&self, s: &mut Stamper, _ctx: &StampContext) {
         s.conductance(self.p, self.n, 1.0 / self.resistance);
     }
@@ -347,6 +355,11 @@ impl Potentiometer {
 impl Device for Potentiometer {
     fn designator(&self) -> &str {
         &self.name
+    }
+    fn stamp_ac(&self, s: &mut AcStamper, _ctx: &AcContext) {
+        let (r_aw, r_wb) = self.segments();
+        s.conductance(self.a, self.w, 1.0 / r_aw);
+        s.conductance(self.w, self.b, 1.0 / r_wb);
     }
     fn stamp(&self, s: &mut Stamper, _ctx: &StampContext) {
         let (r_aw, r_wb) = self.segments();
@@ -430,6 +443,9 @@ impl Capacitor {
 impl Device for Capacitor {
     fn designator(&self) -> &str {
         &self.name
+    }
+    fn stamp_ac(&self, s: &mut AcStamper, ctx: &AcContext) {
+        s.capacitance(self.p, self.n, self.capacitance, ctx.omega);
     }
     fn stamp(&self, s: &mut Stamper, ctx: &StampContext) {
         match ctx.mode {
@@ -542,6 +558,12 @@ impl Device for Inductor {
     fn designator(&self) -> &str {
         &self.name
     }
+    fn stamp_ac(&self, s: &mut AcStamper, ctx: &AcContext) {
+        // V(p) - V(n) - jωL·I = 0
+        let k = self.k();
+        s.branch_incidence(self.p, self.n, k);
+        s.branch_current_coeff(k, k, C64::new(0.0, -ctx.omega * self.inductance));
+    }
     fn branch_count(&self) -> usize {
         1
     }
@@ -641,6 +663,11 @@ impl Device for VoltageSource {
     fn designator(&self) -> &str {
         &self.name
     }
+    fn stamp_ac(&self, s: &mut AcStamper, ctx: &AcContext) {
+        let k = first_branch(self.branch, &self.name);
+        let v = if ctx.excited { 1.0 } else { 0.0 };
+        s.voltage_source(self.p, self.n, k, C64::new(v, 0.0));
+    }
     fn branch_count(&self) -> usize {
         1
     }
@@ -686,6 +713,11 @@ pub struct CurrentSource {
 impl Device for CurrentSource {
     fn designator(&self) -> &str {
         &self.name
+    }
+    fn stamp_ac(&self, s: &mut AcStamper, ctx: &AcContext) {
+        if ctx.excited {
+            s.current(self.input, self.output, C64::new(1.0, 0.0));
+        }
     }
     fn stamp(&self, s: &mut Stamper, ctx: &StampContext) {
         let i = self.waveform.value_at(ctx.time) * ctx.source_scale;
@@ -736,6 +768,13 @@ impl Device for Vcvs {
     fn designator(&self) -> &str {
         &self.name
     }
+    fn stamp_ac(&self, s: &mut AcStamper, _ctx: &AcContext) {
+        let k = first_branch(self.branch, &self.name);
+        let p = self.pins;
+        s.branch_incidence(p.out_p, p.out_n, k);
+        s.branch_voltage_coeff(k, p.ctrl_p, C64::new(-self.gain, 0.0));
+        s.branch_voltage_coeff(k, p.ctrl_n, C64::new(self.gain, 0.0));
+    }
     fn branch_count(&self) -> usize {
         1
     }
@@ -772,6 +811,10 @@ impl Device for Vccs {
     fn designator(&self) -> &str {
         &self.name
     }
+    fn stamp_ac(&self, s: &mut AcStamper, _ctx: &AcContext) {
+        let p = self.pins;
+        s.transconductance(p.out_p, p.out_n, p.ctrl_p, p.ctrl_n, self.transconductance);
+    }
     fn stamp(&self, s: &mut Stamper, _ctx: &StampContext) {
         let p = self.pins;
         s.transconductance(p.out_p, p.out_n, p.ctrl_p, p.ctrl_n, self.transconductance);
@@ -801,6 +844,14 @@ pub struct Ccvs {
 impl Device for Ccvs {
     fn designator(&self) -> &str {
         &self.name
+    }
+    fn stamp_ac(&self, s: &mut AcStamper, _ctx: &AcContext) {
+        let sense = first_branch(self.branch, &self.name);
+        let out = BranchId(sense.0 + 1);
+        let p = self.pins;
+        s.voltage_source(p.ctrl_p, p.ctrl_n, sense, C64::new(0.0, 0.0));
+        s.branch_incidence(p.out_p, p.out_n, out);
+        s.branch_current_coeff(out, sense, C64::new(-self.transresistance, 0.0));
     }
     fn branch_count(&self) -> usize {
         2
@@ -845,6 +896,12 @@ pub struct Cccs {
 impl Device for Cccs {
     fn designator(&self) -> &str {
         &self.name
+    }
+    fn stamp_ac(&self, s: &mut AcStamper, _ctx: &AcContext) {
+        let sense = first_branch(self.branch, &self.name);
+        let p = self.pins;
+        s.voltage_source(p.ctrl_p, p.ctrl_n, sense, C64::new(0.0, 0.0));
+        s.current_controlled_current(p.out_p, p.out_n, sense, self.gain);
     }
     fn branch_count(&self) -> usize {
         1

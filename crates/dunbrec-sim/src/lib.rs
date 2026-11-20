@@ -18,10 +18,12 @@
 //! assert!((op.voltage_by_name("out").unwrap() - 5.0).abs() < 1e-9);
 //! ```
 //!
-//! Analyses: DC operating point ([`operating_point`]) and transient
-//! ([`transient`], or step by step with [`Transient`]). Diodes, BJTs and
-//! MOSFETs are solved with Newton-Raphson iteration.
+//! Analyses: DC operating point ([`operating_point`]), DC sweep
+//! ([`dc_sweep`], [`DcSweeper`]), AC small-signal ([`ac_analysis`]) and
+//! transient ([`transient`], or step by step with [`Transient`]). Diodes,
+//! BJTs and MOSFETs are solved with Newton-Raphson iteration.
 
+pub mod ac;
 pub mod circuit;
 pub mod dc;
 pub mod device;
@@ -30,17 +32,22 @@ pub mod linalg;
 mod newton;
 pub mod semiconductor;
 pub mod stamp;
+pub mod sweep;
 pub mod transient;
 pub mod waveform;
 
+pub use ac::{AcResult, ac_analysis, log_frequencies};
 pub use circuit::Circuit;
 pub use dc::{OperatingPoint, operating_point};
 pub use error::{SimError, SimWarning};
+pub use sweep::{DcSweeper, dc_sweep, linear_steps};
 pub use transient::{
     Crossing, Edge, Sample, StepResult, Transient, TransientOptions, TransientResult, Watch,
     WatchId, transient,
 };
 
+#[cfg(test)]
+mod ac_tests;
 #[cfg(test)]
 mod nonlinear_tests;
 #[cfg(test)]

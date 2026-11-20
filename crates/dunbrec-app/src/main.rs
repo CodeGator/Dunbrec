@@ -7,6 +7,7 @@
 // No console window in release builds on Windows.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod analyses_ui;
 mod app;
 mod canvas;
 mod document;
@@ -14,6 +15,7 @@ mod examples;
 mod instruments_ui;
 mod library;
 mod live;
+mod plot;
 mod properties;
 mod symbols;
 
