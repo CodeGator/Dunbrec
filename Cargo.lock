@@ -824,6 +824,7 @@ name = "dunbrec-io"
 version = "0.1.0"
 dependencies = [
  "dunbrec-core",
+ "dunbrec-sim",
  "ron",
  "serde",
  "thiserror 2.0.21",

@@ -1,6 +1,7 @@
 //! Dunbrec desktop application.
 //!
-//! Usage: `dunbrec [FILE.dbr]` or `dunbrec --example <N>` (1-based index into
+//! Usage: `dunbrec [FILE]` (`.dbr`, a SPICE netlist, or `.kicad_sch`) or
+//! `dunbrec --example <N>` (1-based index into
 //! File → Open example).
 
 // No console window in release builds on Windows.
@@ -28,8 +29,26 @@ fn initial_document() -> Option<(dunbrec_core::Schematic, Option<PathBuf>)> {
         }
         [path] => {
             let path = PathBuf::from(path);
-            match dunbrec_io::dbr::load(&path) {
-                Ok(s) => Some((s, Some(path))),
+            let ext = path
+                .extension()
+                .map(|e| e.to_string_lossy().to_ascii_lowercase())
+                .unwrap_or_default();
+            // SPICE and KiCad files are imported as new, unsaved documents.
+            let result = match ext.as_str() {
+                "dbr" => dunbrec_io::dbr::load(&path)
+                    .map(|s| (s, Some(path.clone())))
+                    .map_err(|e| e.to_string()),
+                "kicad_sch" => std::fs::read_to_string(&path)
+                    .map_err(|e| e.to_string())
+                    .and_then(|t| dunbrec_io::kicad::import(&t).map_err(|e| e.to_string()))
+                    .map(|imp| (imp.to_schematic(), None)),
+                _ => std::fs::read_to_string(&path)
+                    .map_err(|e| e.to_string())
+                    .and_then(|t| dunbrec_io::spice::import(&t).map_err(|e| e.to_string()))
+                    .map(|imp| (imp.to_schematic(), None)),
+            };
+            match result {
+                Ok(doc) => Some(doc),
                 Err(e) => {
                     eprintln!("Could not open {}: {e}", path.display());
                     None

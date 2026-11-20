@@ -11,3 +11,6 @@ dunbrec-core.workspace = true
 serde.workspace = true
 ron.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+dunbrec-sim.workspace = true

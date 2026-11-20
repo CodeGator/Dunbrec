@@ -9,7 +9,7 @@ v1 targets analog circuits: discrete components, sources, diodes and transistors
 | Crate | Purpose | Status |
 |---|---|---|
 | `dunbrec-core` | Schematic data model, units, device models, netlister | Phase 1 ✅ |
-| `dunbrec-io` | `.dbr` native format; SPICE/KiCad import later | `.dbr` ✅ |
+| `dunbrec-io` | `.dbr` native format, SPICE import/export, KiCad import | ✅ |
 | `dunbrec-sim` | Own MNA simulation engine with a mixed-signal-ready scheduler | DC + transient, diode/BJT/MOSFET ✅ |
 | `dunbrec-instruments` | Oscilloscope and multimeter signal processing | ✅ |
 | `dunbrec-app` | egui/eframe desktop application | Editor + live simulation ✅ |
@@ -22,7 +22,7 @@ v1 targets analog circuits: discrete components, sources, diodes and transistors
 4. Nonlinear devices: diode, BJT, MOSFET, with junction capacitances and transit times ✅ (ngspice cross-check still to do)
 5. Schematic editor ✅ (with live DC operating point)
 6. Live simulation + instruments ✅
-7. SPICE / KiCad import, SPICE export
+7. SPICE / KiCad import, SPICE export ✅
 8. DC sweep, AC analysis, Bode plotter, curve tracer
 9. Polish + v1 release
 10. Digital logic (post-v1)
@@ -34,7 +34,15 @@ v1 targets analog circuits: discrete components, sources, diodes and transistors
 cargo run --release -p dunbrec-app                  # empty schematic
 cargo run --release -p dunbrec-app -- --example 2   # common-emitter amplifier
 cargo run --release -p dunbrec-app -- my.dbr        # open a file
+cargo run --release -p dunbrec-app -- amp.cir       # import a SPICE netlist
+cargo run --release -p dunbrec-app -- board.kicad_sch  # import a KiCad schematic
 ```
+
+Imports (also under File) place parts on a grid (SPICE) or at their KiCad positions and
+connect them with net labels; anything that could not be imported is listed afterwards.
+SPICE import supports R, C, L, V/I (DC, SIN, PULSE, PWL), D, Q, M, E/F/G/H, `.model` and
+`.subckt`. KiCad import reads KiCad 6+ files (top sheet only) and recognises the `Device`,
+`Simulation_SPICE`, `Switch` and `power` libraries plus `Sim.*` fields.
 
 Editing: pick a part from the palette and click to place it (R rotates, X mirrors, Esc stops).
 W draws wires (click to bend, ends on a pin or wire), L adds net labels. Drag to move, drag

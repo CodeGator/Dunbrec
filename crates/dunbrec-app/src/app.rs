@@ -25,6 +25,8 @@ enum Pending {
     New,
     Open,
     Example(usize),
+    ImportSpice,
+    ImportKicad,
     Quit,
 }
 
@@ -181,9 +183,99 @@ impl DunbrecApp {
                     self.replace(Document::new((ex.build)(), None));
                 }
             }
+            Pending::ImportSpice | Pending::ImportKicad => self.import(action),
             Pending::Quit => {
                 self.allow_close = true;
             }
+        }
+    }
+
+    /// Import a SPICE netlist or KiCad schematic as a new, unsaved document.
+    fn import(&mut self, action: Pending) {
+        let (filter, extensions): (&str, &[&str]) = match action {
+            Pending::ImportKicad => ("KiCad schematic", &["kicad_sch"]),
+            _ => (
+                "SPICE netlist",
+                &["cir", "sp", "spi", "spice", "net", "ckt", "txt"],
+            ),
+        };
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter(filter, extensions)
+            .pick_file()
+        else {
+            return;
+        };
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) => {
+                self.message = Some(format!("Could not read {}:\n{e}", path.display()));
+                return;
+            }
+        };
+        let result = match action {
+            Pending::ImportKicad => dunbrec_io::kicad::import(&text)
+                .map(|imp| (imp.to_schematic(), imp.warnings))
+                .map_err(|e| e.to_string()),
+            _ => dunbrec_io::spice::import(&text)
+                .map(|imp| {
+                    let mut notes = imp.warnings.clone();
+                    if !imp.directives.is_empty() {
+                        notes.push(format!(
+                            "Analysis commands in the file (not run automatically): {}",
+                            imp.directives.join("; ")
+                        ));
+                    }
+                    (imp.to_schematic(), notes)
+                })
+                .map_err(|e| e.to_string()),
+        };
+        match result {
+            Ok((schematic, notes)) => {
+                let mut doc = Document::new(schematic, None);
+                // A fresh import is unsaved work.
+                doc.checkpoint();
+                self.replace(doc);
+                let name = path
+                    .file_name()
+                    .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+                let mut msg = format!(
+                    "Imported {name}. Parts are connected by net labels; rearrange them as you like."
+                );
+                if !notes.is_empty() {
+                    msg.push_str("\n\nNotes:\n");
+                    for n in notes.iter().take(30) {
+                        msg.push_str(&format!("• {n}\n"));
+                    }
+                    if notes.len() > 30 {
+                        msg.push_str(&format!("… and {} more\n", notes.len() - 30));
+                    }
+                }
+                self.message = Some(msg);
+            }
+            Err(e) => self.message = Some(format!("Could not import {}:\n{e}", path.display())),
+        }
+    }
+
+    fn export_spice(&mut self) {
+        let Some(mut path) = rfd::FileDialog::new()
+            .add_filter("SPICE netlist", &["cir"])
+            .set_file_name(format!(
+                "{}.cir",
+                self.doc.display_name().trim_end_matches(".dbr")
+            ))
+            .save_file()
+        else {
+            return;
+        };
+        if path.extension().is_none() {
+            path.set_extension("cir");
+        }
+        let title = self.doc.display_name();
+        let result = dunbrec_io::spice_export::export(self.doc.schematic(), &title, &[])
+            .map_err(|_| "Fix the problems listed under Checks first.".to_string())
+            .and_then(|text| std::fs::write(&path, text).map_err(|e| e.to_string()));
+        if let Err(e) = result {
+            self.message = Some(format!("Could not export {}:\n{e}", path.display()));
         }
     }
 
@@ -620,6 +712,19 @@ impl DunbrecApp {
                             }
                         }
                     });
+                    ui.separator();
+                    if ui.button("Import SPICE netlist…").clicked() {
+                        self.request(Pending::ImportSpice);
+                        ui.close();
+                    }
+                    if ui.button("Import KiCad schematic…").clicked() {
+                        self.request(Pending::ImportKicad);
+                        ui.close();
+                    }
+                    if ui.button("Export SPICE netlist…").clicked() {
+                        self.export_spice();
+                        ui.close();
+                    }
                     ui.separator();
                     if ui.button("Save       Ctrl+S").clicked() {
                         self.save(false);

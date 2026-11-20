@@ -54,21 +54,44 @@ pub fn parse(input: &str, dialect: Dialect) -> Result<f64, UnitError> {
 
     let (scale, consumed) = match_prefix(rest, dialect);
     let mut rest = &rest[consumed..];
-    value *= scale;
 
     // RKM notation: "4k7" -> digits directly after the prefix are fractional.
     // Only valid when the leading number had no decimal point or exponent.
+    let mut fraction = "";
     if consumed > 0
         && number
             .bytes()
             .all(|b| b.is_ascii_digit() || b == b'-' || b == b'+')
     {
         let frac_len = rest.bytes().take_while(u8::is_ascii_digit).count();
-        if frac_len > 0 {
-            let frac: f64 = format!("0.{}", &rest[..frac_len]).parse().unwrap_or(0.0);
-            let sign = if number.starts_with('-') { -1.0 } else { 1.0 };
-            value += sign * frac * scale;
-            rest = &rest[frac_len..];
+        fraction = &rest[..frac_len];
+        rest = &rest[frac_len..];
+    }
+
+    match scale {
+        // Build the decimal text and let the standard parser round it, so
+        // "10u" is exactly the double nearest 1e-5 (multiplying by 1e-6,
+        // which is not exact in binary, would be off in the last bit).
+        Scale::Pow10(exp) => {
+            let (mantissa, own_exp) = match number.find(['e', 'E']) {
+                Some(i) => (&number[..i], number[i + 1..].parse::<i32>().unwrap_or(0)),
+                None => (number, 0),
+            };
+            let text = if fraction.is_empty() {
+                format!("{mantissa}e{}", own_exp + exp)
+            } else {
+                format!("{mantissa}.{fraction}e{}", own_exp + exp)
+            };
+            value = text
+                .parse()
+                .map_err(|_| UnitError::NoNumber(s.to_string()))?;
+        }
+        Scale::Factor(f) => {
+            if !fraction.is_empty() {
+                let frac: f64 = format!("0.{fraction}").parse().unwrap_or(0.0);
+                value += if number.starts_with('-') { -frac } else { frac };
+            }
+            value *= f;
         }
     }
 
@@ -126,59 +149,69 @@ fn split_number(s: &str) -> Option<(&str, &str)> {
     Some((&s[..i], &s[i..]))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Scale {
+    /// Multiply by 10^n (all SI prefixes).
+    Pow10(i32),
+    /// Multiply by an arbitrary factor (`mil`).
+    Factor(f64),
+}
+
 /// Returns (scale, bytes consumed) for a scale prefix at the start of `rest`.
-fn match_prefix(rest: &str, dialect: Dialect) -> (f64, usize) {
+fn match_prefix(rest: &str, dialect: Dialect) -> (Scale, usize) {
     match dialect {
         Dialect::Spice => {
             let lower = rest.to_ascii_lowercase();
-            const TABLE: &[(&str, f64)] = &[
-                ("meg", 1e6),
-                ("mil", 25.4e-6),
-                ("t", 1e12),
-                ("g", 1e9),
-                ("k", 1e3),
-                ("m", 1e-3),
-                ("u", 1e-6),
-                ("µ", 1e-6),
-                ("μ", 1e-6),
-                ("n", 1e-9),
-                ("p", 1e-12),
-                ("f", 1e-15),
-                ("r", 1.0), // RKM "2R2"
+            if lower.starts_with("mil") {
+                return (Scale::Factor(25.4e-6), 3);
+            }
+            const TABLE: &[(&str, i32)] = &[
+                ("meg", 6),
+                ("t", 12),
+                ("g", 9),
+                ("k", 3),
+                ("m", -3),
+                ("u", -6),
+                ("µ", -6),
+                ("μ", -6),
+                ("n", -9),
+                ("p", -12),
+                ("f", -15),
+                ("r", 0), // RKM "2R2"
             ];
-            for (p, scale) in TABLE {
+            for (p, exp) in TABLE {
                 if lower.starts_with(p) {
-                    return (*scale, p.len());
+                    return (Scale::Pow10(*exp), p.len());
                 }
             }
-            (1.0, 0)
+            (Scale::Pow10(0), 0)
         }
         Dialect::Engineering => {
-            const TABLE: &[(&str, f64)] = &[
-                ("T", 1e12),
-                ("G", 1e9),
-                ("M", 1e6),
-                ("k", 1e3),
-                ("K", 1e3),
-                ("m", 1e-3),
-                ("u", 1e-6),
-                ("µ", 1e-6),
-                ("μ", 1e-6),
-                ("n", 1e-9),
-                ("p", 1e-12),
-                ("f", 1e-15),
+            const TABLE: &[(&str, i32)] = &[
+                ("T", 12),
+                ("G", 9),
+                ("M", 6),
+                ("k", 3),
+                ("K", 3),
+                ("m", -3),
+                ("u", -6),
+                ("µ", -6),
+                ("μ", -6),
+                ("n", -9),
+                ("p", -12),
+                ("f", -15),
             ];
-            for (p, scale) in TABLE {
+            for (p, exp) in TABLE {
                 if rest.starts_with(p) {
-                    return (*scale, p.len());
+                    return (Scale::Pow10(*exp), p.len());
                 }
             }
             // RKM "2R2": an R immediately followed by a digit.
             let b = rest.as_bytes();
             if b.len() >= 2 && (b[0] == b'R' || b[0] == b'r') && b[1].is_ascii_digit() {
-                return (1.0, 1);
+                return (Scale::Pow10(0), 1);
             }
-            (1.0, 0)
+            (Scale::Pow10(0), 0)
         }
     }
 }
@@ -269,6 +302,19 @@ mod tests {
         assert_relative_eq!(parse_eng("4.7kΩ").unwrap(), 4700.0);
         assert_relative_eq!(parse_eng("100µH").unwrap(), 100e-6);
         assert_relative_eq!(parse_eng("1 k").unwrap(), 1e3);
+    }
+
+    #[test]
+    fn prefixes_are_exact() {
+        // Bit-for-bit equal to the literal, not just close.
+        assert_eq!(parse_spice("10u").unwrap(), 1e-5);
+        assert_eq!(parse_spice("4k7").unwrap(), 4.7e3);
+        assert_eq!(parse_spice("2.2n").unwrap(), 2.2e-9);
+        assert_eq!(parse_spice("-4k7").unwrap(), -4.7e3);
+        assert_eq!(parse_spice("1e3k").unwrap(), 1e6);
+        assert_eq!(parse_eng("0.1u").unwrap(), 1e-7);
+        assert_eq!(parse_eng("4n7").unwrap(), 4.7e-9);
+        assert_eq!(parse_eng("100").unwrap(), 100.0);
     }
 
     #[test]
