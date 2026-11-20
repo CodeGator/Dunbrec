@@ -113,7 +113,10 @@ const fn pin(name: &'static str, x: i32, y: i32) -> PinDef {
 }
 
 const TWO_TERMINAL: &[PinDef] = &[pin("p", -2, 0), pin("n", 2, 0)];
-const SOURCE: &[PinDef] = &[pin("+", 0, -2), pin("-", 0, 2)];
+const VOLTAGE_SOURCE: &[PinDef] = &[pin("+", 0, -2), pin("-", 0, 2)];
+/// Current flows into the source at `in` and out of it at `out` (arrow points
+/// from `in` to `out`). Matches SPICE `I<name> in out <value>`.
+const CURRENT_SOURCE: &[PinDef] = &[pin("in", 0, 2), pin("out", 0, -2)];
 const DIODE: &[PinDef] = &[pin("A", -2, 0), pin("K", 2, 0)];
 const BJT: &[PinDef] = &[pin("C", 2, -2), pin("B", -2, 0), pin("E", 2, 2)];
 const MOSFET: &[PinDef] = &[pin("D", 2, -2), pin("G", -2, 0), pin("S", 2, 2)];
@@ -260,9 +263,12 @@ pub enum ComponentKind {
         #[serde(default)]
         initial_current: Option<f64>,
     },
+    /// Holds V(+) - V(-) at the waveform value.
     VoltageSource {
         waveform: Waveform,
     },
+    /// Drives the waveform value as a current from `in` through the source to
+    /// `out`, i.e. out of the `out` pin into the circuit.
     CurrentSource {
         waveform: Waveform,
     },
@@ -287,11 +293,12 @@ pub enum ComponentKind {
         resistance: f64,
         wiper: f64,
     },
-    /// Voltage-controlled voltage source: V(out) = gain * V(ctrl).
+    /// Voltage-controlled voltage source: V(out+, out-) = gain * V(ctrl+, ctrl-).
     Vcvs {
         gain: f64,
     },
-    /// Voltage-controlled current source: I(out) = gm * V(ctrl).
+    /// Voltage-controlled current source: a current gm * V(ctrl+, ctrl-) flows
+    /// from out+ through the source to out- (SPICE `G` convention).
     Vccs {
         transconductance: f64,
     },
@@ -300,7 +307,9 @@ pub enum ComponentKind {
     Ccvs {
         transresistance: f64,
     },
-    /// Current-controlled current source: I(out) = gain * I(ctrl+ -> ctrl-).
+    /// Current-controlled current source: a current gain * I(ctrl+ -> ctrl-)
+    /// flows from out+ through the source to out- (SPICE `F` convention).
+    /// The control port is a zero-volt current sensor.
     Cccs {
         gain: f64,
     },
@@ -314,7 +323,8 @@ impl ComponentKind {
             | ComponentKind::Capacitor { .. }
             | ComponentKind::Inductor { .. }
             | ComponentKind::Switch { .. } => TWO_TERMINAL,
-            ComponentKind::VoltageSource { .. } | ComponentKind::CurrentSource { .. } => SOURCE,
+            ComponentKind::VoltageSource { .. } => VOLTAGE_SOURCE,
+            ComponentKind::CurrentSource { .. } => CURRENT_SOURCE,
             ComponentKind::Diode { .. } => DIODE,
             ComponentKind::Bjt { .. } => BJT,
             ComponentKind::Mosfet { .. } => MOSFET,

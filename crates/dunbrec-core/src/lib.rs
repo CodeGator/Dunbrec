@@ -12,7 +12,9 @@ pub mod schematic;
 pub mod units;
 
 pub use models::{DeviceModel, ModelKind, ModelLibrary};
-pub use netlist::{Diagnostic, Element, Netlist, NodeId, Severity, build_netlist};
+pub use netlist::{
+    Diagnostic, Element, Netlist, NetlistBuilder, Node, NodeId, Severity, build_netlist,
+};
 pub use schematic::{
     Component, ComponentId, ComponentKind, NetLabel, Point, Polarity, Rotation, Schematic,
     Waveform, Wire, WireId,

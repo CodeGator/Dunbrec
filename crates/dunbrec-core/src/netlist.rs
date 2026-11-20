@@ -117,6 +117,88 @@ impl Netlist {
     }
 }
 
+/// Builds a [`Netlist`] directly from named nodes, without a drawing. Used by
+/// tests and by netlist importers (SPICE). The node names `"0"` and `"gnd"`
+/// (any case) are ground.
+///
+/// ```
+/// use dunbrec_core::{ComponentKind, NetlistBuilder, Waveform};
+/// let netlist = NetlistBuilder::new()
+///     .element("V1", ComponentKind::VoltageSource { waveform: Waveform::Dc(5.0) }, &["in", "0"])
+///     .element("R1", ComponentKind::Resistor { resistance: 1e3 }, &["in", "0"])
+///     .build();
+/// assert_eq!(netlist.nodes.len(), 2);
+/// ```
+#[derive(Debug, Default)]
+pub struct NetlistBuilder {
+    netlist: Netlist,
+    next_component: u32,
+}
+
+impl NetlistBuilder {
+    pub fn new() -> Self {
+        Self {
+            netlist: Netlist {
+                nodes: vec![Node {
+                    name: "0".into(),
+                    labelled: false,
+                }],
+                ..Netlist::default()
+            },
+            next_component: 0,
+        }
+    }
+
+    /// Node id for `name`, creating the node if needed.
+    pub fn node(&mut self, name: &str) -> NodeId {
+        if name == "0" || name.eq_ignore_ascii_case("gnd") {
+            return NodeId::GROUND;
+        }
+        if let Some(id) = self.netlist.node_by_name(name) {
+            return id;
+        }
+        self.netlist.nodes.push(Node {
+            name: name.to_string(),
+            labelled: true,
+        });
+        NodeId(self.netlist.nodes.len() - 1)
+    }
+
+    /// Add an element whose pins (in [`ComponentKind::pins`] order) connect to
+    /// the named nodes.
+    ///
+    /// # Panics
+    /// If the number of node names does not match the number of pins.
+    pub fn element(mut self, designator: &str, kind: ComponentKind, nodes: &[&str]) -> Self {
+        self.push(designator, kind, nodes);
+        self
+    }
+
+    /// Non-consuming form of [`element`](Self::element).
+    pub fn push(&mut self, designator: &str, kind: ComponentKind, nodes: &[&str]) -> ComponentId {
+        assert_eq!(
+            nodes.len(),
+            kind.pins().len(),
+            "{designator}: expected {} nodes",
+            kind.pins().len()
+        );
+        let nodes = nodes.iter().map(|n| self.node(n)).collect();
+        let component = ComponentId(self.next_component);
+        self.next_component += 1;
+        self.netlist.elements.push(Element {
+            component,
+            designator: designator.to_string(),
+            kind,
+            nodes,
+        });
+        component
+    }
+
+    pub fn build(self) -> Netlist {
+        self.netlist
+    }
+}
+
 /// Union-find over connection points.
 struct Dsu {
     parent: Vec<usize>,
