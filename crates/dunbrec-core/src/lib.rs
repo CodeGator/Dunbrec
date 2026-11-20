@@ -16,6 +16,6 @@ pub use netlist::{
     Diagnostic, Element, Netlist, NetlistBuilder, Node, NodeId, Severity, build_netlist,
 };
 pub use schematic::{
-    Component, ComponentId, ComponentKind, NetLabel, Point, Polarity, Rotation, Schematic,
+    Component, ComponentId, ComponentKind, LabelId, NetLabel, Point, Polarity, Rotation, Schematic,
     Waveform, Wire, WireId,
 };

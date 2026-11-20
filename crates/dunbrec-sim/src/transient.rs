@@ -139,12 +139,12 @@ impl Transient {
                 "stop time must be greater than zero".into(),
             ));
         }
-        if let Some(m) = options.max_step {
-            if !(m.is_finite() && m > 0.0) {
-                return Err(SimError::InvalidOptions(
-                    "maximum step must be greater than zero".into(),
-                ));
-            }
+        if let Some(m) = options.max_step
+            && !(m.is_finite() && m > 0.0)
+        {
+            return Err(SimError::InvalidOptions(
+                "maximum step must be greater than zero".into(),
+            ));
         }
 
         let size = circuit.unknown_count();

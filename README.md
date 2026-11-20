@@ -12,7 +12,7 @@ v1 targets analog circuits: discrete components, sources, diodes and transistors
 | `dunbrec-io` | `.dbr` native format; SPICE/KiCad import later | `.dbr` ✅ |
 | `dunbrec-sim` | Own MNA simulation engine with a mixed-signal-ready scheduler | DC + transient, diode/BJT/MOSFET ✅ |
 | `dunbrec-instruments` | Virtual instruments | Phase 6 |
-| `dunbrec-app` | egui/eframe desktop application | Phase 5 |
+| `dunbrec-app` | egui/eframe desktop application | Schematic editor ✅ |
 
 ## Roadmap
 
@@ -20,13 +20,26 @@ v1 targets analog circuits: discrete components, sources, diodes and transistors
 2. Linear DC solver (MNA) ✅
 3. Scheduler + transient analysis ✅
 4. Nonlinear devices: diode, BJT, MOSFET, with junction capacitances and transit times ✅ (ngspice cross-check still to do)
-5. Schematic editor
+5. Schematic editor ✅ (with live DC operating point)
 6. Live simulation + instruments
 7. SPICE / KiCad import, SPICE export
 8. DC sweep, AC analysis, Bode plotter, curve tracer
 9. Polish + v1 release
 10. Digital logic (post-v1)
 11. Microcontrollers (post-v1)
+
+## Running
+
+```sh
+cargo run --release -p dunbrec-app                  # empty schematic
+cargo run --release -p dunbrec-app -- --example 2   # common-emitter amplifier
+cargo run --release -p dunbrec-app -- my.dbr        # open a file
+```
+
+Editing: pick a part from the palette and click to place it (R rotates, X mirrors, Esc stops).
+W draws wires (click to bend, ends on a pin or wire), L adds net labels. Drag to move, drag
+empty space to box-select, Del deletes, Ctrl+Z / Ctrl+Y undo and redo. Wheel zooms, middle-drag pans.
+Values accept engineering notation: `4k7`, `10u`, `2.2M`.
 
 ## Development
 

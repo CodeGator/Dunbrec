@@ -1,0 +1,19 @@
+[package]
+name = "dunbrec-app"
+description = "Dunbrec desktop application: schematic editor and simulator front end"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "dunbrec"
+path = "src/main.rs"
+
+[dependencies]
+dunbrec-core.workspace = true
+dunbrec-io.workspace = true
+dunbrec-sim.workspace = true
+eframe = "0.33"
+egui = "0.33"
+rfd = "0.17"

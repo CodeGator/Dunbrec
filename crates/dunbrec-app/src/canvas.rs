@@ -1,0 +1,1081 @@
+//! The schematic canvas: drawing, hit testing, and the editing tools.
+
+use std::collections::{BTreeSet, HashMap};
+
+use dunbrec_core::{
+    ComponentId, ComponentKind, Diagnostic, LabelId, Netlist, NodeId, Point, Rotation, Schematic,
+    Waveform, WireId, units::format_value,
+};
+use egui::{
+    Align2, Color32, FontId, Key, PointerButton, Pos2, Rect, Sense, Shape, Stroke, StrokeKind, Ui,
+    Vec2, pos2, vec2,
+};
+
+use crate::document::Document;
+use crate::library::ensure_model;
+use crate::symbols::{self, Prim};
+
+/// Something on the schematic that can be selected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Item {
+    Component(ComponentId),
+    Wire(WireId),
+    Label(LabelId),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Tool {
+    Select,
+    Place {
+        kind: ComponentKind,
+        rotation: Rotation,
+        mirrored: bool,
+    },
+    Wire,
+    Label,
+}
+
+/// Maps schematic grid coordinates to screen pixels.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Camera {
+    /// Screen position of the grid origin, relative to the canvas corner.
+    pub offset: Vec2,
+    /// Pixels per grid unit.
+    pub scale: f32,
+}
+
+impl Default for Camera {
+    fn default() -> Self {
+        Self {
+            offset: vec2(300.0, 250.0),
+            scale: 14.0,
+        }
+    }
+}
+
+impl Camera {
+    pub const MIN_SCALE: f32 = 3.0;
+    pub const MAX_SCALE: f32 = 80.0;
+
+    pub fn to_screen(self, origin: Pos2, p: Pos2) -> Pos2 {
+        origin + self.offset + p.to_vec2() * self.scale
+    }
+
+    pub fn to_grid(self, origin: Pos2, screen: Pos2) -> Pos2 {
+        ((screen - origin - self.offset) / self.scale).to_pos2()
+    }
+
+    /// Zoom by `factor`, keeping the grid point under `anchor` fixed.
+    pub fn zoom_at(&mut self, origin: Pos2, anchor: Pos2, factor: f32) {
+        let before = self.to_grid(origin, anchor);
+        self.scale = (self.scale * factor).clamp(Self::MIN_SCALE, Self::MAX_SCALE);
+        let after = self.to_screen(origin, before);
+        self.offset += anchor - after;
+    }
+}
+
+pub fn snap(p: Pos2) -> Point {
+    Point::new(p.x.round() as i32, p.y.round() as i32)
+}
+
+fn to_pos(p: Point) -> Pos2 {
+    pos2(p.x as f32, p.y as f32)
+}
+
+enum Drag {
+    /// Moving the selection; `last` is the grid point of the previous frame.
+    Move { last: Point, started: bool },
+    /// Rubber-band selection from a screen position.
+    Rubber { start: Pos2 },
+}
+
+/// Text placed on the canvas by an analysis, e.g. node voltages.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Annotation {
+    pub place: TagPlace,
+    pub text: String,
+}
+
+/// Where a node's value tag goes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TagPlace {
+    pub node: NodeId,
+    /// Grid position (may fall between grid points, e.g. a wire midpoint).
+    pub at: Pos2,
+    /// On a vertical wire the tag goes beside it rather than above it.
+    pub vertical: bool,
+    /// Use the other side (left / below), because a net label already
+    /// occupies the usual side.
+    pub flip: bool,
+}
+
+/// Where to show each node's value: the midpoint of the node's longest
+/// wire, or failing that (a pin connected straight to a pin) a pin.
+pub fn node_tag_positions(s: &Schematic, netlist: &Netlist) -> Vec<TagPlace> {
+    // Seed with pin positions, then spread node numbers along wires.
+    let mut node_at: HashMap<Point, NodeId> = HashMap::new();
+    for e in &netlist.elements {
+        if let Some(c) = s.component(e.component) {
+            for ((_, at), n) in c.pin_positions().zip(&e.nodes) {
+                node_at.insert(at, *n);
+            }
+        }
+    }
+    let mut wire_node: Vec<Option<NodeId>> = vec![None; s.wires.len()];
+    loop {
+        let mut changed = false;
+        for (i, w) in s.wires.iter().enumerate() {
+            if wire_node[i].is_some() {
+                continue;
+            }
+            let found = node_at
+                .iter()
+                .find(|(p, _)| **p == w.a || **p == w.b || w.contains_interior(**p))
+                .map(|(_, n)| *n);
+            if let Some(n) = found {
+                wire_node[i] = Some(n);
+                node_at.entry(w.a).or_insert(n);
+                node_at.entry(w.b).or_insert(n);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    // Longest wire per node, remembering whether a label sits on it.
+    let mut best: HashMap<NodeId, (f32, TagPlace)> = HashMap::new();
+    for (w, n) in s.wires.iter().zip(&wire_node) {
+        let Some(node) = *n else { continue };
+        let (a, b) = (to_pos(w.a), to_pos(w.b));
+        let len = a.distance(b);
+        if best.get(&node).is_some_and(|(l, _)| *l >= len) {
+            continue;
+        }
+        let labelled = s
+            .labels
+            .iter()
+            .any(|l| l.position == w.a || l.position == w.b || w.contains_interior(l.position));
+        let place = TagPlace {
+            node,
+            at: a.lerp(b, 0.5),
+            vertical: (b.x - a.x).abs() < (b.y - a.y).abs(),
+            flip: labelled,
+        };
+        best.insert(node, (len, place));
+    }
+    for (p, n) in &node_at {
+        best.entry(*n).or_insert((
+            0.0,
+            TagPlace {
+                node: *n,
+                at: to_pos(*p),
+                vertical: false,
+                flip: false,
+            },
+        ));
+    }
+    let mut out: Vec<TagPlace> = best
+        .into_values()
+        .map(|(_, place)| place)
+        .filter(|place| !place.node.is_ground())
+        .collect();
+    out.sort_by_key(|place| place.node);
+    out
+}
+
+pub struct Canvas {
+    pub camera: Camera,
+    pub tool: Tool,
+    pub selection: BTreeSet<Item>,
+    wire_start: Option<Point>,
+    drag: Option<Drag>,
+    /// Point where the user clicked with the label tool; the app asks for a
+    /// name and then calls [`Canvas::take_label_request`].
+    label_request: Option<Point>,
+}
+
+impl Default for Canvas {
+    fn default() -> Self {
+        Self {
+            camera: Camera::default(),
+            tool: Tool::Select,
+            selection: BTreeSet::new(),
+            wire_start: None,
+            drag: None,
+            label_request: None,
+        }
+    }
+}
+
+// ------------------------------------------------------------ colours ---
+
+struct Palette {
+    background: Color32,
+    grid: Color32,
+    wire: Color32,
+    symbol: Color32,
+    selected: Color32,
+    ghost: Color32,
+    text: Color32,
+    label: Color32,
+    error: Color32,
+    annotation_bg: Color32,
+    annotation_fg: Color32,
+}
+
+impl Palette {
+    fn for_ui(ui: &Ui) -> Self {
+        if ui.visuals().dark_mode {
+            Self {
+                background: Color32::from_rgb(24, 26, 30),
+                grid: Color32::from_rgb(60, 64, 72),
+                wire: Color32::from_rgb(90, 200, 120),
+                symbol: Color32::from_rgb(220, 220, 225),
+                selected: Color32::from_rgb(255, 190, 60),
+                ghost: Color32::from_rgba_unmultiplied(220, 220, 225, 110),
+                text: Color32::from_rgb(170, 175, 185),
+                label: Color32::from_rgb(120, 180, 255),
+                error: Color32::from_rgb(240, 80, 80),
+                annotation_bg: Color32::from_rgba_unmultiplied(40, 60, 110, 220),
+                annotation_fg: Color32::WHITE,
+            }
+        } else {
+            Self {
+                background: Color32::from_rgb(250, 250, 247),
+                grid: Color32::from_rgb(205, 205, 200),
+                wire: Color32::from_rgb(20, 120, 50),
+                symbol: Color32::from_rgb(30, 30, 35),
+                selected: Color32::from_rgb(220, 120, 0),
+                ghost: Color32::from_rgba_unmultiplied(30, 30, 35, 90),
+                text: Color32::from_rgb(80, 80, 90),
+                label: Color32::from_rgb(20, 80, 200),
+                error: Color32::from_rgb(210, 30, 30),
+                annotation_bg: Color32::from_rgba_unmultiplied(225, 235, 255, 235),
+                annotation_fg: Color32::from_rgb(20, 40, 100),
+            }
+        }
+    }
+}
+
+// --------------------------------------------------------- geometry ---
+
+/// Distance from `p` to the segment `a`–`b`.
+pub fn segment_distance(p: Pos2, a: Pos2, b: Pos2) -> f32 {
+    let ab = b - a;
+    let len2 = ab.length_sq();
+    if len2 == 0.0 {
+        return p.distance(a);
+    }
+    let t = ((p - a).dot(ab) / len2).clamp(0.0, 1.0);
+    p.distance(a + ab * t)
+}
+
+/// Approximate extent of a net label (in grid units).
+fn label_rect(position: Point, name: &str) -> Rect {
+    let p = to_pos(position);
+    Rect::from_min_max(
+        pos2(p.x, p.y - 1.1),
+        pos2(p.x + 0.5 + 0.55 * name.chars().count() as f32, p.y + 0.1),
+    )
+}
+
+/// Topmost item at grid position `p`.
+pub fn hit_test(s: &Schematic, p: Pos2) -> Option<Item> {
+    // Labels and wires are thin, so test them before component boxes.
+    for l in s.labels.iter().rev() {
+        if label_rect(l.position, &l.name).contains(p) {
+            return Some(Item::Label(l.id));
+        }
+    }
+    for w in s.wires.iter().rev() {
+        if segment_distance(p, to_pos(w.a), to_pos(w.b)) < 0.35 {
+            return Some(Item::Wire(w.id));
+        }
+    }
+    for c in s.components.iter().rev() {
+        if symbols::bounds(c).expand(0.2).contains(p) {
+            return Some(Item::Component(c.id));
+        }
+    }
+    None
+}
+
+/// Items lying entirely inside `rect` (grid units).
+pub fn items_in_rect(s: &Schematic, rect: Rect) -> Vec<Item> {
+    let mut items = Vec::new();
+    for c in &s.components {
+        if rect.contains_rect(symbols::bounds(c)) {
+            items.push(Item::Component(c.id));
+        }
+    }
+    for w in &s.wires {
+        if rect.contains(to_pos(w.a)) && rect.contains(to_pos(w.b)) {
+            items.push(Item::Wire(w.id));
+        }
+    }
+    for l in &s.labels {
+        if rect.contains(to_pos(l.position)) {
+            items.push(Item::Label(l.id));
+        }
+    }
+    items
+}
+
+/// Points where three or more connections meet (drawn as dots).
+pub fn junctions(s: &Schematic) -> Vec<Point> {
+    let mut count: HashMap<Point, usize> = HashMap::new();
+    for w in &s.wires {
+        *count.entry(w.a).or_default() += 1;
+        *count.entry(w.b).or_default() += 1;
+    }
+    for c in &s.components {
+        for (_, p) in c.pin_positions() {
+            *count.entry(p).or_default() += 1;
+        }
+    }
+    let points: Vec<Point> = count.keys().copied().collect();
+    for p in points {
+        let through = s.wires.iter().filter(|w| w.contains_interior(p)).count();
+        *count.get_mut(&p).expect("present") += 2 * through;
+    }
+    let mut dots: Vec<Point> = count
+        .into_iter()
+        .filter(|&(_, n)| n >= 3)
+        .map(|(p, _)| p)
+        .collect();
+    dots.sort();
+    dots
+}
+
+/// True if `p` is a connection point: a pin, a wire end, or on a wire.
+fn is_connection_point(s: &Schematic, p: Point) -> bool {
+    s.wires
+        .iter()
+        .any(|w| w.a == p || w.b == p || w.contains_interior(p))
+        || s.components
+            .iter()
+            .any(|c| c.pin_positions().any(|(_, q)| q == p))
+}
+
+/// Orthogonal route from `a` to `b`: horizontal first, then vertical.
+pub fn route(a: Point, b: Point) -> Vec<(Point, Point)> {
+    let corner = Point::new(b.x, a.y);
+    [(a, corner), (corner, b)]
+        .into_iter()
+        .filter(|(p, q)| p != q)
+        .collect()
+}
+
+/// Move the selected items by `d`. Unselected wire ends attached to moved
+/// pins, wire ends or labels follow, so connections are kept.
+pub fn move_items(s: &mut Schematic, items: &BTreeSet<Item>, d: Point) {
+    let mut moving: Vec<Point> = Vec::new();
+    for item in items {
+        match *item {
+            Item::Component(id) => {
+                if let Some(c) = s.component(id) {
+                    moving.extend(c.pin_positions().map(|(_, p)| p));
+                }
+            }
+            Item::Wire(id) => {
+                if let Some(w) = s.wires.iter().find(|w| w.id == id) {
+                    moving.extend([w.a, w.b]);
+                }
+            }
+            Item::Label(id) => {
+                if let Some(l) = s.labels.iter().find(|l| l.id == id) {
+                    moving.push(l.position);
+                }
+            }
+        }
+    }
+    for c in &mut s.components {
+        if items.contains(&Item::Component(c.id)) {
+            c.position = c.position + d;
+        }
+    }
+    for l in &mut s.labels {
+        if items.contains(&Item::Label(l.id)) {
+            l.position = l.position + d;
+        }
+    }
+    for w in &mut s.wires {
+        if items.contains(&Item::Wire(w.id)) {
+            w.a = w.a + d;
+            w.b = w.b + d;
+        } else {
+            if moving.contains(&w.a) {
+                w.a = w.a + d;
+            }
+            if moving.contains(&w.b) {
+                w.b = w.b + d;
+            }
+        }
+    }
+}
+
+pub fn delete_items(s: &mut Schematic, items: &BTreeSet<Item>) {
+    s.components
+        .retain(|c| !items.contains(&Item::Component(c.id)));
+    s.wires.retain(|w| !items.contains(&Item::Wire(w.id)));
+    s.labels.retain(|l| !items.contains(&Item::Label(l.id)));
+}
+
+/// Rotate (or mirror) selected components in place.
+pub fn transform_components(s: &mut Schematic, items: &BTreeSet<Item>, mirror: bool) {
+    for c in &mut s.components {
+        if items.contains(&Item::Component(c.id)) {
+            if mirror {
+                c.mirrored = !c.mirrored;
+            } else {
+                c.rotation = c.rotation.rotated_ccw();
+            }
+        }
+    }
+}
+
+/// Short description of a component's value for the canvas.
+pub fn value_text(kind: &ComponentKind) -> String {
+    let wave = |w: &Waveform, unit: &str| match w {
+        Waveform::Dc(v) => format_value(*v, unit),
+        Waveform::Sine {
+            amplitude,
+            frequency,
+            ..
+        } => format!(
+            "SIN {} {}",
+            format_value(*amplitude, unit),
+            format_value(*frequency, "Hz")
+        ),
+        Waveform::Pulse { v1, v2, period, .. } => format!(
+            "PULSE {}…{} {}",
+            format_value(*v1, ""),
+            format_value(*v2, unit),
+            format_value(*period, "s")
+        ),
+        Waveform::Pwl(points) => format!("PWL ({} points)", points.len()),
+    };
+    match kind {
+        ComponentKind::Ground => String::new(),
+        ComponentKind::Resistor { resistance } => format_value(*resistance, "Ω"),
+        ComponentKind::Capacitor { capacitance, .. } => format_value(*capacitance, "F"),
+        ComponentKind::Inductor { inductance, .. } => format_value(*inductance, "H"),
+        ComponentKind::VoltageSource { waveform } => wave(waveform, "V"),
+        ComponentKind::CurrentSource { waveform } => wave(waveform, "A"),
+        ComponentKind::Diode { model }
+        | ComponentKind::Bjt { model, .. }
+        | ComponentKind::Mosfet { model, .. } => model.clone(),
+        ComponentKind::Switch { closed, .. } => (if *closed { "closed" } else { "open" }).into(),
+        ComponentKind::Potentiometer { resistance, wiper } => {
+            format!("{} @{:.0}%", format_value(*resistance, "Ω"), wiper * 100.0)
+        }
+        ComponentKind::Vcvs { gain } | ComponentKind::Cccs { gain } => format!("×{gain}"),
+        ComponentKind::Vccs { transconductance } => format_value(*transconductance, "S"),
+        ComponentKind::Ccvs { transresistance } => format_value(*transresistance, "Ω"),
+    }
+}
+
+// ----------------------------------------------------------- drawing ---
+
+struct Painter<'a> {
+    painter: &'a egui::Painter,
+    camera: Camera,
+    origin: Pos2,
+}
+
+impl Painter<'_> {
+    fn screen(&self, p: Pos2) -> Pos2 {
+        self.camera.to_screen(self.origin, p)
+    }
+
+    fn stroke_width(&self) -> f32 {
+        (self.camera.scale * 0.12).clamp(1.0, 3.0)
+    }
+
+    fn component(&self, c: &dunbrec_core::Component, color: Color32, text_color: Option<Color32>) {
+        let sym = symbols::symbol(&c.kind);
+        let stroke = Stroke::new(self.stroke_width(), color);
+        let map = |p: Pos2| self.screen(symbols::to_schematic(c, p));
+        for prim in &sym.prims {
+            match prim {
+                Prim::Line(pts) => {
+                    self.painter
+                        .add(Shape::line(pts.iter().map(|p| map(*p)).collect(), stroke));
+                }
+                Prim::Filled(pts) => {
+                    self.painter.add(Shape::convex_polygon(
+                        pts.iter().map(|p| map(*p)).collect(),
+                        color,
+                        Stroke::NONE,
+                    ));
+                }
+                Prim::Circle { center, radius } => {
+                    self.painter
+                        .circle_stroke(map(*center), radius * self.camera.scale, stroke);
+                }
+                Prim::Text { pos, text, size } => {
+                    self.painter.text(
+                        map(*pos),
+                        Align2::CENTER_CENTER,
+                        *text,
+                        FontId::proportional(size * self.camera.scale),
+                        color,
+                    );
+                }
+            }
+        }
+        if let Some(text_color) = text_color
+            && self.camera.scale >= 6.0
+        {
+            let anchor = map(sym.label_anchor);
+            // Align the text away from the symbol, whatever the rotation.
+            let away = anchor - map(symbols::local_bounds(&c.kind).center());
+            let align = if away.x.abs() >= away.y.abs() {
+                if away.x >= 0.0 {
+                    Align2::LEFT_CENTER
+                } else {
+                    Align2::RIGHT_CENTER
+                }
+            } else if away.y >= 0.0 {
+                Align2::CENTER_TOP
+            } else {
+                Align2::CENTER_BOTTOM
+            };
+            let mut lines = Vec::new();
+            if !c.designator.is_empty() {
+                lines.push(c.designator.clone());
+            }
+            let value = value_text(&c.kind);
+            if !value.is_empty() {
+                lines.push(value);
+            }
+            self.painter.text(
+                anchor,
+                align,
+                lines.join("\n"),
+                FontId::proportional((self.camera.scale * 0.75).clamp(9.0, 16.0)),
+                text_color,
+            );
+        }
+    }
+}
+
+// ------------------------------------------------------- interaction ---
+
+impl Canvas {
+    pub fn cancel(&mut self) {
+        self.wire_start = None;
+        self.drag = None;
+        self.tool = Tool::Select;
+    }
+
+    pub fn take_label_request(&mut self) -> Option<Point> {
+        self.label_request.take()
+    }
+
+    pub fn has_label_request(&self) -> bool {
+        self.label_request.is_some()
+    }
+
+    /// Show the canvas, handle input, and edit `doc`.
+    pub fn show(
+        &mut self,
+        ui: &mut Ui,
+        doc: &mut Document,
+        netlist: &Netlist,
+        annotations: &[Annotation],
+    ) {
+        let (response, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
+        let rect = response.rect;
+        let origin = rect.min;
+        let colors = Palette::for_ui(ui);
+        let pointer = response.hover_pos().or(response.interact_pointer_pos());
+        let grid_pointer = pointer.map(|p| self.camera.to_grid(origin, p));
+        let snapped = grid_pointer.map(snap);
+
+        // ---- navigation: zoom with the wheel, pan with middle drag ----
+        if response.hovered() {
+            let (scroll, zoom) = ui.input(|i| (i.smooth_scroll_delta, i.zoom_delta()));
+            if let Some(p) = pointer {
+                let factor = zoom * (scroll.y * 0.0025).exp();
+                if (factor - 1.0).abs() > 1e-4 {
+                    self.camera.zoom_at(origin, p, factor);
+                }
+            }
+        }
+        if response.dragged_by(PointerButton::Middle) {
+            self.camera.offset += response.drag_delta();
+        }
+
+        // ---- keyboard ----
+        if !ui.ctx().wants_keyboard_input() {
+            self.keyboard(ui, doc);
+        }
+
+        // ---- tools ----
+        match self.tool.clone() {
+            Tool::Select => self.select_tool(&response, doc, origin, grid_pointer, snapped),
+            Tool::Place {
+                kind,
+                rotation,
+                mirrored,
+            } => {
+                if response.clicked()
+                    && let Some(at) = snapped
+                {
+                    doc.edit(|s| {
+                        ensure_model(s, &kind);
+                        let id = s.add_component(kind.clone(), at);
+                        let c = s.component_mut(id).expect("just added");
+                        c.rotation = rotation;
+                        c.mirrored = mirrored;
+                    });
+                }
+                if response.clicked_by(PointerButton::Secondary) {
+                    self.cancel();
+                }
+            }
+            Tool::Wire => self.wire_tool(&response, doc, snapped),
+            Tool::Label => {
+                if response.clicked() {
+                    self.label_request = snapped;
+                }
+                if response.clicked_by(PointerButton::Secondary) {
+                    self.cancel();
+                }
+            }
+        }
+
+        // ---- drawing ----
+        let p = Painter {
+            painter: &painter,
+            camera: self.camera,
+            origin,
+        };
+        painter.rect_filled(rect, 0.0, colors.background);
+        self.draw_grid(&painter, rect, &colors);
+        let s = doc.schematic();
+        let width = p.stroke_width();
+
+        for w in &s.wires {
+            let color = if self.selection.contains(&Item::Wire(w.id)) {
+                colors.selected
+            } else {
+                colors.wire
+            };
+            painter.line_segment(
+                [p.screen(to_pos(w.a)), p.screen(to_pos(w.b))],
+                Stroke::new(width, color),
+            );
+        }
+        for j in junctions(s) {
+            painter.circle_filled(
+                p.screen(to_pos(j)),
+                (self.camera.scale * 0.25).max(2.5),
+                colors.wire,
+            );
+        }
+        for c in &s.components {
+            let selected = self.selection.contains(&Item::Component(c.id));
+            let color = if selected {
+                colors.selected
+            } else {
+                colors.symbol
+            };
+            p.component(
+                c,
+                color,
+                Some(if selected {
+                    colors.selected
+                } else {
+                    colors.text
+                }),
+            );
+        }
+        for l in &s.labels {
+            let selected = self.selection.contains(&Item::Label(l.id));
+            let color = if selected {
+                colors.selected
+            } else {
+                colors.label
+            };
+            let at = p.screen(to_pos(l.position));
+            painter.circle_filled(at, (self.camera.scale * 0.15).max(2.0), color);
+            painter.text(
+                at + vec2(self.camera.scale * 0.3, -self.camera.scale * 0.2),
+                Align2::LEFT_BOTTOM,
+                &l.name,
+                FontId::monospace((self.camera.scale * 0.85).clamp(9.0, 18.0)),
+                color,
+            );
+        }
+        // Unconnected pins.
+        for d in &netlist.diagnostics {
+            if let Diagnostic::UnconnectedPin { component, pin } = d
+                && let Some(c) = s.component(*component)
+                && let Some((_, at)) = c.pin_positions().find(|(def, _)| def.name == pin)
+            {
+                painter.circle_stroke(
+                    p.screen(to_pos(at)),
+                    (self.camera.scale * 0.3).max(3.0),
+                    Stroke::new(1.5_f32, colors.error),
+                );
+            }
+        }
+        for a in annotations {
+            let font = FontId::monospace(12.0);
+            let galley = painter.layout_no_wrap(a.text.clone(), font, colors.annotation_fg);
+            let size = galley.size();
+            let point = p.screen(a.place.at);
+            let at = match (a.place.vertical, a.place.flip) {
+                (true, false) => point + vec2(6.0, -size.y / 2.0),
+                (true, true) => point + vec2(-6.0 - size.x, -size.y / 2.0),
+                (false, false) => point + vec2(-size.x / 2.0, -6.0 - size.y),
+                (false, true) => point + vec2(-size.x / 2.0, 6.0),
+            };
+            let box_rect = Rect::from_min_size(at, galley.size()).expand(3.0);
+            painter.rect_filled(box_rect, 3.0, colors.annotation_bg);
+            painter.galley(at, galley, colors.annotation_fg);
+        }
+
+        // ---- tool previews ----
+        match &self.tool {
+            Tool::Place {
+                kind,
+                rotation,
+                mirrored,
+            } => {
+                if let Some(at) = snapped {
+                    let ghost = dunbrec_core::Component {
+                        id: ComponentId(u32::MAX),
+                        designator: String::new(),
+                        kind: kind.clone(),
+                        position: at,
+                        rotation: *rotation,
+                        mirrored: *mirrored,
+                    };
+                    p.component(&ghost, colors.ghost, None);
+                }
+            }
+            Tool::Wire => {
+                if let Some(at) = snapped {
+                    let cursor = p.screen(to_pos(at));
+                    painter.circle_stroke(cursor, 4.0, Stroke::new(1.0_f32, colors.wire));
+                    if let Some(start) = self.wire_start {
+                        for (a, b) in route(start, at) {
+                            painter.line_segment(
+                                [p.screen(to_pos(a)), p.screen(to_pos(b))],
+                                Stroke::new(width, colors.ghost),
+                            );
+                        }
+                    }
+                }
+            }
+            Tool::Label => {
+                if let Some(at) = snapped {
+                    painter.circle_stroke(
+                        p.screen(to_pos(at)),
+                        4.0,
+                        Stroke::new(1.0_f32, colors.label),
+                    );
+                }
+            }
+            Tool::Select => {}
+        }
+        if let (Some(Drag::Rubber { start }), Some(now)) = (&self.drag, pointer) {
+            let r = Rect::from_two_pos(*start, now);
+            painter.rect_filled(r, 0.0, colors.selected.gamma_multiply(0.12));
+            painter.rect_stroke(
+                r,
+                0.0,
+                Stroke::new(1.0_f32, colors.selected),
+                StrokeKind::Inside,
+            );
+        }
+    }
+
+    fn draw_grid(&self, painter: &egui::Painter, rect: Rect, colors: &Palette) {
+        let step = if self.camera.scale >= 8.0 { 1 } else { 5 };
+        let spacing = self.camera.scale * step as f32;
+        if spacing < 6.0 {
+            return;
+        }
+        let top_left = snap(self.camera.to_grid(rect.min, rect.min));
+        let bottom_right = snap(self.camera.to_grid(rect.min, rect.max));
+        let radius = if self.camera.scale >= 20.0 { 1.3 } else { 1.0 };
+        let first = |v: i32| v - v.rem_euclid(step);
+        let mut y = first(top_left.y);
+        while y <= bottom_right.y {
+            let mut x = first(top_left.x);
+            while x <= bottom_right.x {
+                let major = x.rem_euclid(5) == 0 && y.rem_euclid(5) == 0;
+                let r = if major { radius + 0.4 } else { radius };
+                painter.circle_filled(
+                    self.camera.to_screen(rect.min, pos2(x as f32, y as f32)),
+                    r,
+                    colors.grid,
+                );
+                x += step;
+            }
+            y += step;
+        }
+    }
+
+    fn keyboard(&mut self, ui: &Ui, doc: &mut Document) {
+        let (escape, rotate, mirror, delete) = ui.input(|i| {
+            (
+                i.key_pressed(Key::Escape),
+                i.key_pressed(Key::R) && !i.modifiers.command,
+                i.key_pressed(Key::X) && !i.modifiers.command,
+                i.key_pressed(Key::Delete) || i.key_pressed(Key::Backspace),
+            )
+        });
+        if escape {
+            if self.wire_start.is_some() {
+                self.wire_start = None;
+            } else if self.tool != Tool::Select {
+                self.cancel();
+            } else {
+                self.selection.clear();
+            }
+        }
+        if let Tool::Place {
+            rotation, mirrored, ..
+        } = &mut self.tool
+        {
+            if rotate {
+                *rotation = rotation.rotated_ccw();
+            }
+            if mirror {
+                *mirrored = !*mirrored;
+            }
+            return;
+        }
+        if self.selection.is_empty() {
+            return;
+        }
+        if rotate || mirror {
+            let items = self.selection.clone();
+            doc.edit(|s| transform_components(s, &items, mirror));
+        }
+        if delete {
+            let items = std::mem::take(&mut self.selection);
+            doc.edit(|s| delete_items(s, &items));
+        }
+    }
+
+    fn select_tool(
+        &mut self,
+        response: &egui::Response,
+        doc: &mut Document,
+        origin: Pos2,
+        grid_pointer: Option<Pos2>,
+        snapped: Option<Point>,
+    ) {
+        let shift = response.ctx.input(|i| i.modifiers.shift);
+        if response.drag_started_by(PointerButton::Primary) {
+            let press = response
+                .ctx
+                .input(|i| i.pointer.press_origin())
+                .map(|p| self.camera.to_grid(origin, p));
+            let hit = press.and_then(|p| hit_test(doc.schematic(), p));
+            match hit {
+                Some(item) => {
+                    if !self.selection.contains(&item) {
+                        if !shift {
+                            self.selection.clear();
+                        }
+                        self.selection.insert(item);
+                    }
+                    self.drag = press.map(|p| Drag::Move {
+                        last: snap(p),
+                        started: false,
+                    });
+                }
+                None => {
+                    if !shift {
+                        self.selection.clear();
+                    }
+                    let start = response.ctx.input(|i| i.pointer.press_origin());
+                    self.drag = start.map(|start| Drag::Rubber { start });
+                }
+            }
+        }
+        if response.dragged_by(PointerButton::Primary)
+            && let (Some(Drag::Move { last, started }), Some(now)) = (&mut self.drag, snapped)
+        {
+            let d = now - *last;
+            if d != Point::default() {
+                if !*started {
+                    doc.checkpoint();
+                    *started = true;
+                }
+                move_items(doc.schematic_mut(), &self.selection, d);
+                *last = now;
+            }
+        }
+        if response.drag_stopped() {
+            if let Some(Drag::Rubber { start }) = self.drag.take()
+                && let Some(end) = response.interact_pointer_pos().or(response.hover_pos())
+            {
+                let r = Rect::from_two_pos(
+                    self.camera.to_grid(origin, start),
+                    self.camera.to_grid(origin, end),
+                );
+                self.selection.extend(items_in_rect(doc.schematic(), r));
+            }
+            self.drag = None;
+        }
+        if response.clicked() {
+            match grid_pointer.and_then(|p| hit_test(doc.schematic(), p)) {
+                Some(item) => {
+                    if shift {
+                        if !self.selection.remove(&item) {
+                            self.selection.insert(item);
+                        }
+                    } else {
+                        self.selection.clear();
+                        self.selection.insert(item);
+                    }
+                }
+                None if !shift => self.selection.clear(),
+                None => {}
+            }
+        }
+    }
+
+    fn wire_tool(&mut self, response: &egui::Response, doc: &mut Document, snapped: Option<Point>) {
+        if response.clicked_by(PointerButton::Secondary) {
+            if self.wire_start.is_some() {
+                self.wire_start = None;
+            } else {
+                self.cancel();
+            }
+            return;
+        }
+        if !(response.clicked() || response.double_clicked()) {
+            return;
+        }
+        let Some(at) = snapped else { return };
+        match self.wire_start {
+            None => self.wire_start = Some(at),
+            Some(start) if start == at => {
+                // Clicking twice on the same point finishes the wire.
+                self.wire_start = None;
+            }
+            Some(start) => {
+                let ends_on_connection = is_connection_point(doc.schematic(), at);
+                doc.edit(|s| {
+                    for (a, b) in route(start, at) {
+                        s.add_wire(a, b);
+                    }
+                });
+                self.wire_start = if ends_on_connection || response.double_clicked() {
+                    None
+                } else {
+                    Some(at)
+                };
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::examples::voltage_divider;
+
+    #[test]
+    fn camera_round_trip_and_zoom_anchor() {
+        let mut cam = Camera::default();
+        let origin = pos2(10.0, 20.0);
+        let g = pos2(3.5, -2.0);
+        let s = cam.to_screen(origin, g);
+        assert!(cam.to_grid(origin, s).distance(g) < 1e-4);
+        cam.zoom_at(origin, s, 2.0);
+        assert!(
+            cam.to_grid(origin, s).distance(g) < 1e-3,
+            "anchor must stay put"
+        );
+        cam.zoom_at(origin, s, 1e6);
+        assert_eq!(cam.scale, Camera::MAX_SCALE);
+    }
+
+    #[test]
+    fn routes_are_orthogonal() {
+        let r = route(Point::new(0, 0), Point::new(3, 4));
+        assert_eq!(
+            r,
+            vec![
+                (Point::new(0, 0), Point::new(3, 0)),
+                (Point::new(3, 0), Point::new(3, 4))
+            ]
+        );
+        assert_eq!(route(Point::new(0, 0), Point::new(0, 4)).len(), 1);
+        assert!(route(Point::new(1, 1), Point::new(1, 1)).is_empty());
+    }
+
+    #[test]
+    fn divider_junctions_and_hits() {
+        let s = voltage_divider();
+        // Ground on the bottom wire and the label are T-junctions; the
+        // bottom-right corner joins only a wire end and a pin (no dot).
+        let dots = junctions(&s);
+        assert!(dots.contains(&Point::new(4, 2)), "{dots:?}");
+        assert!(!dots.contains(&Point::new(8, 2)), "{dots:?}");
+
+        let r1 = s.components[1].id;
+        assert_eq!(hit_test(&s, pos2(4.0, -2.0)), Some(Item::Component(r1)));
+        assert!(matches!(hit_test(&s, pos2(1.0, -2.0)), Some(Item::Wire(_))));
+        assert_eq!(hit_test(&s, pos2(40.0, 40.0)), None);
+    }
+
+    #[test]
+    fn moving_a_component_drags_attached_wire_ends() {
+        let mut s = voltage_divider();
+        let r1 = s.components[1].id;
+        let items: BTreeSet<Item> = [Item::Component(r1)].into();
+        move_items(&mut s, &items, Point::new(0, -3));
+        // Wire from V1 (0,-2) to R1's left pin (2,-2) now ends at (2,-5).
+        assert!(
+            s.wires
+                .iter()
+                .any(|w| w.a == Point::new(0, -2) && w.b == Point::new(2, -5))
+        );
+        // Connectivity is unchanged, so the netlist is still clean.
+        assert!(dunbrec_core::build_netlist(&s).diagnostics.is_empty());
+    }
+
+    #[test]
+    fn node_tags_sit_on_wires() {
+        let s = voltage_divider();
+        let netlist = dunbrec_core::build_netlist(&s);
+        let tags = node_tag_positions(&s, &netlist);
+        // Two non-ground nodes: the supply node and VOUT.
+        assert_eq!(tags.len(), 2);
+        let vout = netlist.node_by_name("VOUT").unwrap();
+        let tag = tags.iter().find(|t| t.node == vout).unwrap();
+        // VOUT's only wire runs (6,-2)–(8,-2): its midpoint is (7,-2). The
+        // VOUT label sits on that wire, so the tag moves below it.
+        assert_eq!(tag.at, pos2(7.0, -2.0));
+        assert!(!tag.vertical);
+        assert!(tag.flip);
+        let other = tags.iter().find(|t| t.node != vout).unwrap();
+        assert!(!other.flip);
+    }
+
+    #[test]
+    fn rubber_band_and_delete() {
+        let mut s = voltage_divider();
+        let all = items_in_rect(&s, Rect::from_min_max(pos2(-5.0, -10.0), pos2(20.0, 10.0)));
+        assert_eq!(
+            all.len(),
+            s.components.len() + s.wires.len() + s.labels.len()
+        );
+        let set: BTreeSet<Item> = all.into_iter().collect();
+        delete_items(&mut s, &set);
+        assert!(s.components.is_empty() && s.wires.is_empty() && s.labels.is_empty());
+    }
+}
