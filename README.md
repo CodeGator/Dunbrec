@@ -11,8 +11,8 @@ v1 targets analog circuits: discrete components, sources, diodes and transistors
 | `dunbrec-core` | Schematic data model, units, device models, netlister | Phase 1 ✅ |
 | `dunbrec-io` | `.dbr` native format; SPICE/KiCad import later | `.dbr` ✅ |
 | `dunbrec-sim` | Own MNA simulation engine with a mixed-signal-ready scheduler | DC + transient, diode/BJT/MOSFET ✅ |
-| `dunbrec-instruments` | Virtual instruments | Phase 6 |
-| `dunbrec-app` | egui/eframe desktop application | Schematic editor ✅ |
+| `dunbrec-instruments` | Oscilloscope and multimeter signal processing | ✅ |
+| `dunbrec-app` | egui/eframe desktop application | Editor + live simulation ✅ |
 
 ## Roadmap
 
@@ -21,7 +21,7 @@ v1 targets analog circuits: discrete components, sources, diodes and transistors
 3. Scheduler + transient analysis ✅
 4. Nonlinear devices: diode, BJT, MOSFET, with junction capacitances and transit times ✅ (ngspice cross-check still to do)
 5. Schematic editor ✅ (with live DC operating point)
-6. Live simulation + instruments
+6. Live simulation + instruments ✅
 7. SPICE / KiCad import, SPICE export
 8. DC sweep, AC analysis, Bode plotter, curve tracer
 9. Polish + v1 release
@@ -40,6 +40,12 @@ Editing: pick a part from the palette and click to place it (R rotates, X mirror
 W draws wires (click to bend, ends on a pin or wire), L adds net labels. Drag to move, drag
 empty space to box-select, Del deletes, Ctrl+Z / Ctrl+Y undo and redo. Wheel zooms, middle-drag pans.
 Values accept engineering notation: `4k7`, `10u`, `2.2M`.
+
+Simulating: press ▶ Run (or Space) to start a live transient simulation paced to the clock;
+the Speed box sets how much simulated time passes per second. Open the oscilloscope and
+multimeter from the toolbar, click an input's 🔌 Probe button, then click a wire or pin
+(or a part, for current). Edits while running take effect immediately: double-click a switch
+to flip it, drag a potentiometer's wiper, change a value. Changing the wiring restarts the run.
 
 ## Development
 

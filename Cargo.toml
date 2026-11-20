@@ -1,6 +1,12 @@
 [workspace]
 resolver = "3"
-members = ["crates/dunbrec-core", "crates/dunbrec-io", "crates/dunbrec-sim", "crates/dunbrec-app"]
+members = [
+    "crates/dunbrec-core",
+    "crates/dunbrec-io",
+    "crates/dunbrec-sim",
+    "crates/dunbrec-instruments",
+    "crates/dunbrec-app",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -12,6 +18,7 @@ rust-version = "1.90"
 dunbrec-core = { path = "crates/dunbrec-core" }
 dunbrec-io = { path = "crates/dunbrec-io" }
 dunbrec-sim = { path = "crates/dunbrec-sim" }
+dunbrec-instruments = { path = "crates/dunbrec-instruments" }
 serde = { version = "1", features = ["derive"] }
 ron = "0.10"
 thiserror = "2"

@@ -43,7 +43,8 @@ const BREAKPOINT_SHRINK: f64 = 0.1;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TransientOptions {
-    /// Simulation end time (s).
+    /// Simulation end time (s). May be infinite for a free-running
+    /// simulation (see [`TransientOptions::free_running`]).
     pub stop_time: f64,
     /// Largest step size (s). Defaults to `stop_time / 50`, further limited
     /// by sources (e.g. 50 steps per sine period).
@@ -63,6 +64,16 @@ impl TransientOptions {
     pub fn with_max_step(mut self, max_step: f64) -> Self {
         self.max_step = Some(max_step);
         self
+    }
+
+    /// Run indefinitely (until the caller stops stepping), never taking a
+    /// step longer than `max_step`. Used for live simulation.
+    pub fn free_running(max_step: f64) -> Self {
+        Self {
+            stop_time: f64::INFINITY,
+            max_step: Some(max_step),
+            tolerances: Tolerances::default(),
+        }
     }
 }
 
@@ -128,15 +139,23 @@ pub struct Transient {
     damp: bool,
     watches: Vec<Watch>,
     finished: bool,
+    /// Time scale of the run, used for absolute time tolerances: the stop
+    /// time, or for a free-running simulation a multiple of the max step.
+    span: f64,
 }
 
 impl Transient {
     /// Compute the initial operating point (honouring capacitor and inductor
     /// initial conditions) and prepare to step.
     pub fn new(mut circuit: Circuit, options: TransientOptions) -> Result<Self, SimError> {
-        if !(options.stop_time.is_finite() && options.stop_time > 0.0) {
+        if options.stop_time.is_nan() || options.stop_time <= 0.0 {
             return Err(SimError::InvalidOptions(
                 "stop time must be greater than zero".into(),
+            ));
+        }
+        if options.stop_time.is_infinite() && options.max_step.is_none() {
+            return Err(SimError::InvalidOptions(
+                "a free-running simulation needs a maximum step".into(),
             ));
         }
         if let Some(m) = options.max_step
@@ -162,13 +181,13 @@ impl Transient {
         }
 
         let stop = options.stop_time;
-        let h_max = circuit
-            .devices
-            .iter()
-            .filter_map(|d| d.max_step())
-            .chain(options.max_step)
-            .fold(stop / DEFAULT_STEPS, f64::min);
-        let h_min = stop * 1e-14;
+        let h_max = Self::max_step_for(&circuit, &options);
+        let span = if stop.is_finite() {
+            stop
+        } else {
+            h_max * DEFAULT_STEPS
+        };
+        let h_min = span * 1e-14;
 
         Ok(Self {
             circuit,
@@ -184,8 +203,61 @@ impl Transient {
             damp: false,
             watches: Vec::new(),
             finished: false,
+            span,
             options,
         })
+    }
+
+    fn max_step_for(circuit: &Circuit, options: &TransientOptions) -> f64 {
+        circuit
+            .devices
+            .iter()
+            .filter_map(|d| d.max_step())
+            .chain(options.max_step)
+            .fold(options.stop_time / DEFAULT_STEPS, f64::min)
+    }
+
+    /// Change the largest allowed step (e.g. when the oscilloscope
+    /// timebase changes). Sources may still impose a smaller limit.
+    pub fn set_max_step(&mut self, max_step: f64) -> Result<(), SimError> {
+        if !(max_step.is_finite() && max_step > 0.0) {
+            return Err(SimError::InvalidOptions(
+                "maximum step must be greater than zero".into(),
+            ));
+        }
+        self.options.max_step = Some(max_step);
+        self.h_max = Self::max_step_for(&self.circuit, &self.options);
+        self.h_next = self.h_next.min(self.h_max);
+        Ok(())
+    }
+
+    /// Replace one element's parameters while the simulation runs (a
+    /// potentiometer turned, a switch flipped, a source changed). `index`
+    /// is the element's position in the netlist the circuit was built from.
+    ///
+    /// The device is rebuilt and its state re-initialised from the present
+    /// solution, and the next step is treated like a breakpoint. Returns
+    /// `Ok(false)` without changing anything if the new parameters change
+    /// the circuit's structure (e.g. a model gaining a series resistance);
+    /// the caller must then restart the simulation.
+    pub fn update_element(
+        &mut self,
+        index: usize,
+        element: &dunbrec_core::Element,
+        models: &dunbrec_core::ModelLibrary,
+    ) -> Result<bool, SimError> {
+        if !self.circuit.replace_device(index, element, models)? {
+            return Ok(false);
+        }
+        let sol = SolutionView {
+            x: &self.x,
+            node_rows: node_rows(self.circuit.node_count()),
+        };
+        self.circuit.devices[index].begin_transient(&sol, self.time);
+        self.h_max = Self::max_step_for(&self.circuit, &self.options);
+        self.h_next = self.h_next.min(self.h_max);
+        self.restart = true;
+        Ok(true)
     }
 
     /// The operating point the transient started from.
@@ -260,7 +332,7 @@ impl Transient {
         } else {
             Integration::Trapezoidal
         };
-        let crossing_tol = (self.options.stop_time * 1e-9).max(self.h_min * 10.0);
+        let crossing_tol = (self.span * 1e-9).max(self.h_min * 10.0);
 
         for _ in 0..MAX_ATTEMPTS {
             if h < self.h_min {
@@ -372,7 +444,9 @@ impl Transient {
             })
             .collect();
 
-        let hit_target = (start + h - target).abs() <= self.h_min.max(target.abs() * 1e-12);
+        // An infinite target (free-running, no breakpoint ahead) is never hit.
+        let hit_target = target.is_finite()
+            && (start + h - target).abs() <= self.h_min.max(target.abs() * 1e-12);
         self.time = if hit_target { target } else { start + h };
         self.h_next = (h * MAX_GROWTH).min(h_error).min(self.h_max);
         self.restart = false;

@@ -10,7 +10,9 @@ mod app;
 mod canvas;
 mod document;
 mod examples;
+mod instruments_ui;
 mod library;
+mod live;
 mod properties;
 mod symbols;
 

@@ -25,6 +25,9 @@ pub struct Circuit {
     pub(crate) branch_owners: Vec<String>,
     /// Nodes given a [`FLOATING_SHUNT`] to ground.
     pub(crate) shunted: Vec<NodeId>,
+    /// Per device: first branch and first internal node it was given, so
+    /// a replacement device can take over the same unknowns.
+    slots: Vec<(Option<BranchId>, Option<NodeId>)>,
     pub(crate) warnings: Vec<SimWarning>,
 }
 
@@ -44,18 +47,22 @@ impl Circuit {
         }
 
         let mut devices = Vec::with_capacity(netlist.elements.len());
+        let mut slots = Vec::with_capacity(netlist.elements.len());
         let mut branch_owners = Vec::new();
         let mut node_names: Vec<String> = netlist.nodes.iter().map(|n| n.name.clone()).collect();
         for element in &netlist.elements {
             let mut device = make_device(element, models)?;
             let count = device.branch_count();
+            let mut slot = (None, None);
             if count > 0 {
+                slot.0 = Some(BranchId(branch_owners.len()));
                 device.assign_branches(BranchId(branch_owners.len()));
                 branch_owners.extend(std::iter::repeat_n(element.designator.clone(), count));
             }
             // Internal nodes are named "<designator>#<suffix>", e.g. "Q1#b".
             let internal = device.internal_nodes();
             if !internal.is_empty() {
+                slot.1 = Some(NodeId(node_names.len()));
                 device.assign_internal_nodes(NodeId(node_names.len()));
                 node_names.extend(
                     internal
@@ -64,6 +71,7 @@ impl Circuit {
                 );
             }
             devices.push(device);
+            slots.push(slot);
         }
 
         let mut circuit = Circuit {
@@ -72,6 +80,7 @@ impl Circuit {
             branch_owners,
             shunted: Vec::new(),
             warnings: Vec::new(),
+            slots,
         };
         circuit.check_topology()?;
         Ok(circuit)
@@ -87,6 +96,33 @@ impl Circuit {
 
     pub fn warnings(&self) -> &[SimWarning] {
         &self.warnings
+    }
+
+    /// Rebuild device `index` from `element` (same nodes, new parameters).
+    /// Returns `Ok(false)` if the new device would need a different number
+    /// of branches or internal nodes; nothing is changed in that case.
+    pub(crate) fn replace_device(
+        &mut self,
+        index: usize,
+        element: &Element,
+        models: &ModelLibrary,
+    ) -> Result<bool, SimError> {
+        let old = &self.devices[index];
+        let mut new = make_device(element, models)?;
+        if new.branch_count() != old.branch_count()
+            || new.internal_nodes().len() != old.internal_nodes().len()
+        {
+            return Ok(false);
+        }
+        let (branch, internal) = self.slots[index];
+        if let Some(b) = branch {
+            new.assign_branches(b);
+        }
+        if let Some(n) = internal {
+            new.assign_internal_nodes(n);
+        }
+        self.devices[index] = new;
+        Ok(true)
     }
 
     /// True if any device needs Newton-Raphson iteration.

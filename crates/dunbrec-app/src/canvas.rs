@@ -33,6 +33,9 @@ pub enum Tool {
     },
     Wire,
     Label,
+    /// Click a wire or pin (voltage) or a part (current) to attach the
+    /// instrument input chosen in the instrument windows.
+    Probe,
 }
 
 /// Maps schematic grid coordinates to screen pixels.
@@ -109,10 +112,49 @@ pub struct TagPlace {
     pub flip: bool,
 }
 
-/// Where to show each node's value: the midpoint of the node's longest
-/// wire, or failing that (a pin connected straight to a pin) a pin.
-pub fn node_tag_positions(s: &Schematic, netlist: &Netlist) -> Vec<TagPlace> {
-    // Seed with pin positions, then spread node numbers along wires.
+/// A coloured flag on the canvas showing where an instrument is connected.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Marker {
+    pub at: Point,
+    pub text: String,
+    pub color: Color32,
+}
+
+/// The node at each pin and wire end, and the node of each wire.
+pub struct NodeMap {
+    pub points: HashMap<Point, NodeId>,
+    pub wires: Vec<Option<NodeId>>,
+}
+
+impl NodeMap {
+    pub fn new(s: &Schematic, netlist: &Netlist) -> Self {
+        let (points, wires) = spread_nodes(s, netlist);
+        Self { points, wires }
+    }
+
+    /// Node at grid point `p`: a pin, a wire end, a point along a wire, or
+    /// a net label.
+    pub fn node_at(&self, s: &Schematic, netlist: &Netlist, p: Point) -> Option<NodeId> {
+        if let Some(n) = self.points.get(&p) {
+            return Some(*n);
+        }
+        let on_wire = s
+            .wires
+            .iter()
+            .zip(&self.wires)
+            .find(|(w, _)| w.contains_interior(p))
+            .and_then(|(_, n)| *n);
+        on_wire.or_else(|| {
+            s.labels
+                .iter()
+                .find(|l| l.position == p)
+                .and_then(|l| netlist.node_by_name(&l.name))
+        })
+    }
+}
+
+/// Seed node numbers at pin positions, then spread them along wires.
+fn spread_nodes(s: &Schematic, netlist: &Netlist) -> (HashMap<Point, NodeId>, Vec<Option<NodeId>>) {
     let mut node_at: HashMap<Point, NodeId> = HashMap::new();
     for e in &netlist.elements {
         if let Some(c) = s.component(e.component) {
@@ -143,6 +185,13 @@ pub fn node_tag_positions(s: &Schematic, netlist: &Netlist) -> Vec<TagPlace> {
             break;
         }
     }
+    (node_at, wire_node)
+}
+
+/// Where to show each node's value: the midpoint of the node's longest
+/// wire, or failing that (a pin connected straight to a pin) a pin.
+pub fn node_tag_positions(s: &Schematic, netlist: &Netlist) -> Vec<TagPlace> {
+    let (node_at, wire_node) = spread_nodes(s, netlist);
 
     // Longest wire per node, remembering whether a label sits on it.
     let mut best: HashMap<NodeId, (f32, TagPlace)> = HashMap::new();
@@ -194,6 +243,8 @@ pub struct Canvas {
     /// Point where the user clicked with the label tool; the app asks for a
     /// name and then calls [`Canvas::take_label_request`].
     label_request: Option<Point>,
+    /// Probe tool click: the grid point and the part under it, if any.
+    probe_request: Option<(Point, Option<ComponentId>)>,
 }
 
 impl Default for Canvas {
@@ -205,6 +256,7 @@ impl Default for Canvas {
             wire_start: None,
             drag: None,
             label_request: None,
+            probe_request: None,
         }
     }
 }
@@ -416,6 +468,15 @@ pub fn move_items(s: &mut Schematic, items: &BTreeSet<Item>, d: Point) {
     }
 }
 
+/// Flip a switch between open and closed.
+pub fn toggle_switch(s: &mut Schematic, id: ComponentId) {
+    if let Some(c) = s.component_mut(id)
+        && let ComponentKind::Switch { closed, .. } = &mut c.kind
+    {
+        *closed = !*closed;
+    }
+}
+
 pub fn delete_items(s: &mut Schematic, items: &BTreeSet<Item>) {
     s.components
         .retain(|c| !items.contains(&Item::Component(c.id)));
@@ -575,6 +636,10 @@ impl Canvas {
         self.label_request.take()
     }
 
+    pub fn take_probe_request(&mut self) -> Option<(Point, Option<ComponentId>)> {
+        self.probe_request.take()
+    }
+
     pub fn has_label_request(&self) -> bool {
         self.label_request.is_some()
     }
@@ -586,6 +651,7 @@ impl Canvas {
         doc: &mut Document,
         netlist: &Netlist,
         annotations: &[Annotation],
+        markers: &[Marker],
     ) {
         let (response, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
         let rect = response.rect;
@@ -641,6 +707,20 @@ impl Canvas {
             Tool::Label => {
                 if response.clicked() {
                     self.label_request = snapped;
+                }
+                if response.clicked_by(PointerButton::Secondary) {
+                    self.cancel();
+                }
+            }
+            Tool::Probe => {
+                if response.clicked()
+                    && let (Some(at), Some(g)) = (snapped, grid_pointer)
+                {
+                    let part = match hit_test(doc.schematic(), g) {
+                        Some(Item::Component(id)) => Some(id),
+                        _ => None,
+                    };
+                    self.probe_request = Some((at, part));
                 }
                 if response.clicked_by(PointerButton::Secondary) {
                     self.cancel();
@@ -782,7 +862,28 @@ impl Canvas {
                     );
                 }
             }
+            Tool::Probe => {
+                if let Some(at) = snapped {
+                    let c = p.screen(to_pos(at));
+                    let stroke = Stroke::new(1.5_f32, colors.selected);
+                    painter.circle_stroke(c, 5.0, stroke);
+                    painter.line_segment([c + vec2(4.0, -4.0), c + vec2(14.0, -14.0)], stroke);
+                }
+            }
             Tool::Select => {}
+        }
+        for m in markers {
+            let at = p.screen(to_pos(m.at));
+            let tip = at + vec2(-10.0, -18.0);
+            painter.line_segment([at, tip], Stroke::new(2.0_f32, m.color));
+            painter.circle_filled(at, 3.5, m.color);
+            let galley =
+                painter.layout_no_wrap(m.text.clone(), FontId::proportional(11.0), Color32::BLACK);
+            let r = Align2::RIGHT_BOTTOM
+                .anchor_size(tip + vec2(2.0, 0.0), galley.size())
+                .expand(2.0);
+            painter.rect_filled(r, 2.0, m.color);
+            painter.galley(r.min + vec2(2.0, 2.0), galley, Color32::BLACK);
         }
         if let (Some(Drag::Rubber { start }), Some(now)) = (&self.drag, pointer) {
             let r = Rect::from_two_pos(*start, now);
@@ -944,6 +1045,16 @@ impl Canvas {
                 None => {}
             }
         }
+        if response.double_clicked()
+            && let Some(Item::Component(id)) =
+                grid_pointer.and_then(|p| hit_test(doc.schematic(), p))
+            && matches!(
+                doc.schematic().component(id).map(|c| &c.kind),
+                Some(ComponentKind::Switch { .. })
+            )
+        {
+            doc.edit(|s| toggle_switch(s, id));
+        }
     }
 
     fn wire_tool(&mut self, response: &egui::Response, doc: &mut Document, snapped: Option<Point>) {
@@ -1064,6 +1175,24 @@ mod tests {
         assert!(tag.flip);
         let other = tags.iter().find(|t| t.node != vout).unwrap();
         assert!(!other.flip);
+    }
+
+    #[test]
+    fn node_map_finds_nodes_anywhere_on_a_net() {
+        let s = voltage_divider();
+        let netlist = dunbrec_core::build_netlist(&s);
+        let map = NodeMap::new(&s, &netlist);
+        let vout = netlist.node_by_name("VOUT").unwrap();
+        // R1's right pin, the wire end at R2, and a point along the wire.
+        for p in [Point::new(6, -2), Point::new(8, -2), Point::new(7, -2)] {
+            assert_eq!(map.node_at(&s, &netlist, p), Some(vout), "{p:?}");
+        }
+        // Along the bottom wire: ground.
+        assert_eq!(
+            map.node_at(&s, &netlist, Point::new(2, 2)),
+            Some(NodeId::GROUND)
+        );
+        assert_eq!(map.node_at(&s, &netlist, Point::new(30, 30)), None);
     }
 
     #[test]

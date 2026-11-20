@@ -795,6 +795,7 @@ name = "dunbrec-app"
 version = "0.1.0"
 dependencies = [
  "dunbrec-core",
+ "dunbrec-instruments",
  "dunbrec-io",
  "dunbrec-sim",
  "eframe",
@@ -809,6 +810,13 @@ dependencies = [
  "approx",
  "serde",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "dunbrec-instruments"
+version = "0.1.0"
+dependencies = [
+ "approx",
 ]
 
 [[package]]

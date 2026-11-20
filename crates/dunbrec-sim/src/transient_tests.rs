@@ -336,3 +336,177 @@ fn interpolation_helper() {
     let v = res.at(out, TAU_RC);
     assert!((v - (1.0 - 1.0 / E)).abs() < 3e-3, "{v}");
 }
+
+// ------------------------------------------------------ live simulation ---
+
+/// Step `sim` until its time reaches `t`, returning the last sample.
+fn run_until(sim: &mut Transient, t: f64) -> crate::Sample {
+    let mut last = sim.sample();
+    while sim.time() < t {
+        last = sim
+            .step()
+            .unwrap()
+            .expect("free-running never finishes")
+            .sample;
+    }
+    last
+}
+
+#[test]
+fn free_running_simulation_tracks_rc_charging() {
+    let mut sim =
+        Transient::new(circuit(rc_charge()), TransientOptions::free_running(1e-5)).unwrap();
+    let out = NodeId(2);
+    let s = run_until(&mut sim, TAU_RC);
+    let expected = 1.0 - (-s.time / TAU_RC).exp();
+    assert!((s.voltages[out.0] - expected).abs() < 2e-3);
+    run_until(&mut sim, 20.0 * TAU_RC);
+    assert!(!sim.is_finished());
+
+    let bad = TransientOptions {
+        stop_time: f64::INFINITY,
+        max_step: None,
+        tolerances: Default::default(),
+    };
+    assert!(matches!(
+        Transient::new(circuit(rc_charge()), bad).err(),
+        Some(SimError::InvalidOptions(_))
+    ));
+}
+
+#[test]
+fn changing_a_source_mid_run_continues_from_the_present_state() {
+    let netlist = NetlistBuilder::new()
+        .element(
+            "V1",
+            K::VoltageSource {
+                waveform: Waveform::Dc(1.0),
+            },
+            &["in", "0"],
+        )
+        .element("R1", r(1e3), &["in", "out"])
+        .element("C1", c(1e-6, None), &["out", "0"])
+        .build();
+    let models = ModelLibrary::new();
+    let mut sim = Transient::new(
+        Circuit::from_netlist(&netlist, &models).unwrap(),
+        TransientOptions::free_running(1e-5),
+    )
+    .unwrap();
+    // DC start: the capacitor is already at 1 V.
+    let before = run_until(&mut sim, 1e-3);
+    assert!((before.voltages[2] - 1.0).abs() < 1e-6);
+
+    // Step the source to 2 V: the output then charges from 1 V towards 2 V.
+    let mut v1 = netlist.elements[0].clone();
+    v1.kind = K::VoltageSource {
+        waveform: Waveform::Dc(2.0),
+    };
+    assert!(sim.update_element(0, &v1, &models).unwrap());
+    let t0 = sim.time();
+    let s = run_until(&mut sim, t0 + TAU_RC);
+    let expected = 2.0 - (-(s.time - t0) / TAU_RC).exp();
+    assert!(
+        (s.voltages[2] - expected).abs() < 3e-3,
+        "{} vs {expected}",
+        s.voltages[2]
+    );
+    assert!(
+        (s.voltages[1] - 2.0).abs() < 1e-9,
+        "source node follows at once"
+    );
+}
+
+#[test]
+fn closing_a_switch_mid_run() {
+    let switch = |closed| K::Switch {
+        closed,
+        r_on: 1e-3,
+        r_off: 1e12,
+    };
+    let netlist = NetlistBuilder::new()
+        .element(
+            "V1",
+            K::VoltageSource {
+                waveform: Waveform::Dc(5.0),
+            },
+            &["in", "0"],
+        )
+        .element("S1", switch(false), &["in", "a"])
+        .element("R1", r(1e3), &["a", "out"])
+        .element("C1", c(1e-6, None), &["out", "0"])
+        // An open switch is 1 TΩ, so a bleed resistor holds the output low.
+        .element("R2", r(1e6), &["out", "0"])
+        .build();
+    let models = ModelLibrary::new();
+    let mut sim = Transient::new(
+        Circuit::from_netlist(&netlist, &models).unwrap(),
+        TransientOptions::free_running(1e-5),
+    )
+    .unwrap();
+    let out = netlist.node_by_name("out").unwrap().0;
+    assert!(run_until(&mut sim, 1e-3).voltages[out].abs() < 1e-4);
+
+    let mut s1 = netlist.elements[1].clone();
+    s1.kind = switch(true);
+    assert!(sim.update_element(1, &s1, &models).unwrap());
+    let t0 = sim.time();
+    // Thevenin view from the capacitor: 5 V·R2/(R1+R2) behind R1 ∥ R2.
+    let final_v = 5.0 * 1e6 / (1e6 + 1e3);
+    let tau = (1e3 * 1e6 / (1e3 + 1e6)) * 1e-6;
+    let s = run_until(&mut sim, t0 + 3.0 * tau);
+    let expected = final_v * (1.0 - (-(s.time - t0) / tau).exp());
+    assert!(
+        (s.voltages[out] - expected).abs() < 1e-2,
+        "{} vs {expected}",
+        s.voltages[out]
+    );
+}
+
+#[test]
+fn structural_change_is_refused() {
+    use dunbrec_core::{DeviceModel, ModelKind};
+    let mut models = ModelLibrary::new();
+    models.insert(DeviceModel::new("D", ModelKind::Diode));
+    models.insert(DeviceModel::new("DRS", ModelKind::Diode).with("RS", 5.0));
+    let netlist = NetlistBuilder::new()
+        .element(
+            "V1",
+            K::VoltageSource {
+                waveform: Waveform::Dc(5.0),
+            },
+            &["in", "0"],
+        )
+        .element("R1", r(1e3), &["in", "a"])
+        .element("D1", K::Diode { model: "D".into() }, &["a", "0"])
+        .build();
+    let mut sim = Transient::new(
+        Circuit::from_netlist(&netlist, &models).unwrap(),
+        TransientOptions::free_running(1e-5),
+    )
+    .unwrap();
+    run_until(&mut sim, 1e-4);
+    // A series resistance needs an extra internal node: restart required.
+    let mut d1 = netlist.elements[2].clone();
+    d1.kind = K::Diode {
+        model: "DRS".into(),
+    };
+    assert!(!sim.update_element(2, &d1, &models).unwrap());
+    // The simulation carries on unchanged.
+    run_until(&mut sim, 2e-4);
+}
+
+#[test]
+fn max_step_can_change_mid_run() {
+    let mut sim =
+        Transient::new(circuit(rc_charge()), TransientOptions::free_running(1e-4)).unwrap();
+    run_until(&mut sim, 1e-3);
+    sim.set_max_step(1e-6).unwrap();
+    let mut last = sim.time();
+    for _ in 0..50 {
+        let t = sim.step().unwrap().unwrap().sample.time;
+        assert!(t - last <= 1e-6 * (1.0 + 1e-9));
+        last = t;
+    }
+    assert!(sim.set_max_step(0.0).is_err());
+}

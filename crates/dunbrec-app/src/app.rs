@@ -2,16 +2,21 @@
 
 use std::path::PathBuf;
 
-use dunbrec_core::{Diagnostic, Netlist, NodeId, Schematic, build_netlist, units::format_value};
-use dunbrec_sim::{Circuit, SimWarning, operating_point};
+use dunbrec_core::{
+    Diagnostic, Element, Netlist, NodeId, Schematic, build_netlist, units::format_value,
+};
+use dunbrec_sim::{Circuit, Sample, SimWarning, operating_point};
 use egui::{Color32, Key, KeyboardShortcut, Modifiers, RichText, ViewportCommand};
 
 use crate::canvas::{
-    Annotation, Canvas, Item, Tool, delete_items, node_tag_positions, transform_components,
+    Annotation, Canvas, Item, NodeMap, TagPlace, Tool, delete_items, node_tag_positions,
+    transform_components,
 };
 use crate::document::Document;
 use crate::examples::examples;
+use crate::instruments_ui::{Bench, MeterSignal, Signals};
 use crate::library::palette;
+use crate::live::{Command, Event, LiveSim};
 use crate::properties::Properties;
 
 /// Something that would discard unsaved changes, waiting for confirmation.
@@ -50,6 +55,50 @@ pub struct DunbrecApp {
     message: Option<String>,
     title: String,
     show_about: bool,
+
+    // ---- live simulation and instruments ----
+    bench: Bench,
+    live: Option<LiveSim>,
+    /// Document generation the running simulation reflects.
+    live_generation: u64,
+    live_time: f64,
+    live_keeping_up: f64,
+    /// Why the simulation could not start or stopped.
+    live_error: Option<String>,
+    /// Short hint after a probe click that did not connect.
+    probe_hint: Option<String>,
+    latest: Option<Sample>,
+    /// Probe signals, keyed by (document generation, probe revision).
+    signals: ((u64, u64), Signals),
+    /// Node lookup and voltage-tag positions, keyed by generation.
+    node_map: (u64, NodeMap, Vec<TagPlace>),
+}
+
+/// True if two netlists have the same nodes and connections, so a running
+/// simulation can take the new one's values without restarting.
+fn same_structure(a: &Netlist, b: &Netlist) -> bool {
+    a.nodes.len() == b.nodes.len()
+        && a.elements.len() == b.elements.len()
+        && a.elements
+            .iter()
+            .zip(&b.elements)
+            .all(|(x, y)| x.component == y.component && x.nodes == y.nodes)
+}
+
+/// Feed one simulation sample to the instruments.
+fn feed(bench: &mut Bench, signals: &Signals, s: &Sample) {
+    let v = |n: Option<NodeId>| {
+        n.and_then(|n| s.voltages.get(n.0).copied())
+            .unwrap_or(f64::NAN)
+    };
+    let scope = [0, 1, 2, 3].map(|ch| v(signals.scope[ch]));
+    bench.scope.push(s.time, scope);
+    let meter = match signals.meter {
+        MeterSignal::None => f64::NAN,
+        MeterSignal::Voltage(p, n) => v(Some(p)) - v(Some(n)),
+        MeterSignal::Current(i) => s.currents.get(i).copied().unwrap_or(f64::NAN),
+    };
+    bench.meter.push(s.time, meter);
 }
 
 impl DunbrecApp {
@@ -68,7 +117,19 @@ impl DunbrecApp {
             None => Document::default(),
         };
         let netlist = build_netlist(doc.schematic());
+        let node_map = NodeMap::new(doc.schematic(), &netlist);
+        let tags = node_tag_positions(doc.schematic(), &netlist);
         Self {
+            node_map: (doc.generation(), node_map, tags),
+            signals: ((u64::MAX, 0), Signals::default()),
+            bench: Bench::default(),
+            live: None,
+            live_generation: 0,
+            live_time: 0.0,
+            live_keeping_up: 1.0,
+            live_error: None,
+            probe_hint: None,
+            latest: None,
             netlist: (doc.generation(), netlist),
             doc,
             canvas: Canvas::default(),
@@ -127,6 +188,8 @@ impl DunbrecApp {
     }
 
     fn replace(&mut self, doc: Document) {
+        self.stop_sim();
+        self.bench = Bench::default();
         self.doc = doc;
         self.canvas.selection.clear();
         self.canvas.cancel();
@@ -306,8 +369,232 @@ impl DunbrecApp {
         if plain(Key::L) {
             self.canvas.tool = Tool::Label;
         }
+        if plain(Key::P) {
+            self.canvas.tool = Tool::Probe;
+        }
+        if plain(Key::Space) {
+            self.toggle_run();
+        }
         if plain(Key::S) {
             self.canvas.cancel();
+        }
+    }
+
+    // ------------------------------------------------ live simulation ---
+
+    fn start_sim(&mut self) {
+        self.stop_sim();
+        let netlist = self.netlist.1.clone();
+        if netlist.has_errors() {
+            self.live_error = Some("Fix the problems listed under Checks first.".into());
+            return;
+        }
+        self.bench.clear_readings();
+        let speed = self.bench.speed.value(&self.bench.scope);
+        let models = self.doc.schematic().models.clone();
+        match LiveSim::start(netlist, models, self.bench.max_step(), speed) {
+            Ok(live) => {
+                self.live = Some(live);
+                self.live_generation = self.doc.generation();
+                self.live_error = None;
+                self.live_time = 0.0;
+                self.live_keeping_up = 1.0;
+            }
+            Err(e) => self.live_error = Some(e),
+        }
+    }
+
+    fn stop_sim(&mut self) {
+        self.live = None;
+        self.latest = None;
+    }
+
+    /// Run, or pause/resume a running simulation.
+    fn toggle_run(&mut self) {
+        match &mut self.live {
+            None => self.start_sim(),
+            Some(live) if live.paused => live.send(Command::Resume),
+            Some(live) => live.send(Command::Pause),
+        }
+    }
+
+    /// Keep probe signals and node lookups in step with the schematic.
+    fn refresh_signals(&mut self) {
+        let generation = self.doc.generation();
+        if self.node_map.0 != generation {
+            let s = self.doc.schematic();
+            self.node_map = (
+                generation,
+                NodeMap::new(s, &self.netlist.1),
+                node_tag_positions(s, &self.netlist.1),
+            );
+        }
+        let key = (generation, self.bench.probe_revision);
+        if self.signals.0 != key {
+            let resolved =
+                self.bench
+                    .resolve(self.doc.schematic(), &self.netlist.1, &self.node_map.1);
+            self.signals = (key, resolved);
+        }
+    }
+
+    /// Take results from the simulation thread, and pass it any edits.
+    fn sync_live(&mut self) {
+        let Some(live) = &mut self.live else { return };
+        let events = live.poll();
+        let mut restart = false;
+        let mut error = None;
+        for event in events {
+            match event {
+                Event::Samples(samples) => {
+                    for s in samples {
+                        feed(&mut self.bench, &self.signals.1, &s);
+                        self.latest = Some(s);
+                    }
+                }
+                Event::Status { time, keeping_up } => {
+                    self.live_time = time;
+                    self.live_keeping_up = keeping_up;
+                }
+                Event::NeedsRestart => restart = true,
+                Event::Error(e) => error = Some(e),
+            }
+        }
+        self.bench.scope.update();
+        if let Some(e) = error {
+            self.stop_sim();
+            self.live_error = Some(format!("Simulation stopped: {e}"));
+            return;
+        }
+
+        let generation = self.doc.generation();
+        if !restart && generation != self.live_generation {
+            let new = &self.netlist.1;
+            if new.has_errors() {
+                self.stop_sim();
+                self.live_error =
+                    Some("Simulation stopped: the circuit now has problems (see Checks).".into());
+                return;
+            }
+            if same_structure(&live.netlist, new) {
+                // Same circuit, new values: update it in place.
+                let models = &self.doc.schematic().models;
+                let changed: Vec<(usize, Element)> = new
+                    .elements
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, e)| {
+                        let old = &live.netlist.elements[*i];
+                        old.kind != e.kind
+                            || e.kind
+                                .model_name()
+                                .is_some_and(|m| models.get(m) != live.models.get(m))
+                    })
+                    .map(|(i, e)| (i, e.clone()))
+                    .collect();
+                if !changed.is_empty() {
+                    live.send(Command::Update(changed, models.clone()));
+                }
+                live.netlist = new.clone();
+                live.models = models.clone();
+                self.live_generation = generation;
+            } else {
+                restart = true;
+            }
+        }
+        if restart {
+            self.start_sim();
+        }
+    }
+
+    fn run_toolbar(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::top("run").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                match &self.live {
+                    None => {
+                        if ui.button("▶ Run").on_hover_text("Start the live simulation (Space)").clicked() {
+                            self.start_sim();
+                        }
+                    }
+                    Some(live) => {
+                        let label = if live.paused { "▶ Resume" } else { "⏸ Pause" };
+                        if ui.button(label).on_hover_text("Space").clicked() {
+                            self.toggle_run();
+                        }
+                        if ui.button("⏹ Stop").clicked() {
+                            self.stop_sim();
+                        }
+                        if ui.button("↺ Restart").clicked() {
+                            self.start_sim();
+                        }
+                    }
+                }
+                ui.separator();
+                ui.label("Speed");
+                if self.bench.speed_combo(ui) {
+                    let speed = self.bench.speed.value(&self.bench.scope);
+                    if let Some(live) = &mut self.live {
+                        live.send(Command::SetSpeed(speed));
+                    }
+                }
+                if self.live.is_some() {
+                    ui.label(RichText::new(format!("t = {}", format_value(self.live_time, "s"))).monospace());
+                    if self.live_keeping_up < 0.95 {
+                        ui.label(
+                            RichText::new(format!(
+                                "running at {:.0}% of the chosen speed",
+                                self.live_keeping_up * 100.0
+                            ))
+                            .color(Color32::from_rgb(230, 150, 40)),
+                        )
+                        .on_hover_text("The circuit takes longer to simulate than the speed allows. Choose a slower speed or a longer time/div.");
+                    }
+                }
+                ui.separator();
+                let probing = self.canvas.tool == Tool::Probe;
+                if ui.selectable_label(probing, "🔌 Probe   (P)").clicked() {
+                    if probing {
+                        self.canvas.cancel();
+                    } else {
+                        self.canvas.tool = Tool::Probe;
+                    }
+                }
+                ui.toggle_value(&mut self.bench.show_scope, "📈 Oscilloscope");
+                ui.toggle_value(&mut self.bench.show_meter, "🔢 Multimeter");
+                if let Some(e) = &self.live_error {
+                    ui.separator();
+                    ui.label(RichText::new(e).color(Color32::from_rgb(225, 70, 70)));
+                } else if let Some(h) = &self.probe_hint {
+                    ui.separator();
+                    ui.label(RichText::new(h).color(Color32::from_rgb(230, 150, 40)));
+                }
+            });
+        });
+    }
+
+    fn instrument_windows(&mut self, ctx: &egui::Context) {
+        let probing = self.canvas.tool == Tool::Probe;
+        let s = self.doc.schematic();
+        let netlist = &self.netlist.1;
+        let map = &self.node_map.1;
+        let mut probe_clicked = false;
+        if self.bench.show_scope {
+            let (timebase_changed, clicked) =
+                self.bench.scope_window(ctx, s, netlist, map, probing);
+            probe_clicked |= clicked;
+            if timebase_changed && let Some(live) = &mut self.live {
+                live.send(Command::SetMaxStep(self.bench.max_step()));
+                live.send(Command::SetSpeed(self.bench.speed.value(&self.bench.scope)));
+            }
+        }
+        if self.bench.show_meter {
+            let running = self.live.is_some();
+            probe_clicked |= self
+                .bench
+                .meter_window(ctx, s, netlist, map, probing, running);
+        }
+        if probe_clicked {
+            self.canvas.tool = Tool::Probe;
         }
     }
 
@@ -436,6 +723,12 @@ impl DunbrecApp {
                     {
                         self.canvas.tool = Tool::Label;
                     }
+                    if ui
+                        .selectable_label(tool == Tool::Probe, "🔌 Probe   (P)")
+                        .clicked()
+                    {
+                        self.canvas.tool = Tool::Probe;
+                    }
                     ui.add_space(8.0);
                     let mut group = "";
                     for entry in palette() {
@@ -486,6 +779,34 @@ impl DunbrecApp {
                             }
                         });
 
+                    if let (Some(_), Some(sample)) = (&self.live, &self.latest) {
+                        cols[1].strong(format!(
+                            "Live values at t = {}",
+                            format_value(sample.time, "s")
+                        ));
+                        egui::ScrollArea::vertical()
+                            .id_salt("live")
+                            .show(&mut cols[1], |ui| {
+                                egui::Grid::new("live_table").striped(true).show(ui, |ui| {
+                                    for (i, node) in self.netlist.1.nodes.iter().enumerate().skip(1)
+                                    {
+                                        if let Some(v) = sample.voltages.get(i) {
+                                            ui.monospace(format!("V({})", node.name));
+                                            ui.monospace(format_value(*v, "V"));
+                                            ui.end_row();
+                                        }
+                                    }
+                                    for (e, i) in
+                                        self.netlist.1.elements.iter().zip(&sample.currents)
+                                    {
+                                        ui.monospace(format!("I({})", e.designator));
+                                        ui.monospace(format_value(*i, "A"));
+                                        ui.end_row();
+                                    }
+                                });
+                            });
+                        return;
+                    }
                     cols[1].strong("DC operating point");
                     egui::ScrollArea::vertical()
                         .id_salt("dc")
@@ -602,6 +923,7 @@ impl DunbrecApp {
                     Tool::Place { .. } => "Click to place · R rotate · X mirror · Esc or right-click to stop",
                     Tool::Wire => "Click to start, click to bend · ends on a pin or wire · double-click, Esc or right-click to stop",
                     Tool::Label => "Click on a wire or pin to name that net",
+                    Tool::Probe => "Click a wire or pin to connect the chosen instrument input (a part, for current) · Esc to stop",
                 };
                 ui.label(RichText::new(hint).weak());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -627,6 +949,11 @@ impl eframe::App for DunbrecApp {
 
         self.shortcuts(ctx);
         self.refresh_netlist();
+        self.refresh_signals();
+        self.sync_live();
+        if self.live.as_ref().is_some_and(|l| !l.paused) {
+            ctx.request_repaint();
+        }
 
         let title = format!(
             "{}{} — Dunbrec",
@@ -639,6 +966,7 @@ impl eframe::App for DunbrecApp {
         }
 
         self.menu_bar(ctx);
+        self.run_toolbar(ctx);
         self.status_bar(ctx);
         self.results_panel(ctx);
         self.palette_panel(ctx);
@@ -654,19 +982,45 @@ impl eframe::App for DunbrecApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ctx, |ui| {
-                let annotations: &[Annotation] = match (&self.dc, self.show_voltages) {
+                // Live values while simulating, otherwise the DC point.
+                let live_tags: Vec<Annotation>;
+                let annotations: &[Annotation] = match (&self.live, &self.latest, &self.dc) {
+                    _ if !self.show_voltages => &[],
+                    (Some(_), Some(sample), _) if self.live_generation == self.doc.generation() => {
+                        live_tags = self
+                            .node_map
+                            .2
+                            .iter()
+                            .filter_map(|place| {
+                                sample.voltages.get(place.node.0).map(|v| Annotation {
+                                    place: *place,
+                                    text: format_value(*v, "V"),
+                                })
+                            })
+                            .collect();
+                        &live_tags
+                    }
                     (
+                        None,
+                        _,
                         Some(DcResults {
                             outcome: Ok(t),
                             generation,
                         }),
-                        true,
                     ) if *generation == self.doc.generation() => &t.annotations,
                     _ => &[],
                 };
+                let markers = self.bench.markers(self.doc.schematic());
                 self.canvas
-                    .show(ui, &mut self.doc, &self.netlist.1, annotations);
+                    .show(ui, &mut self.doc, &self.netlist.1, annotations, &markers);
             });
+
+        if let Some((at, part)) = self.canvas.take_probe_request() {
+            let s = self.doc.schematic();
+            let on_net = self.node_map.1.node_at(s, &self.netlist.1, at).is_some();
+            self.probe_hint = self.bench.connect(at, part, on_net).err();
+        }
+        self.instrument_windows(ctx);
 
         // Drop selections of items that no longer exist (after undo etc.).
         let s = self.doc.schematic();
