@@ -147,6 +147,25 @@ Key mechanisms worth knowing before changing the engine:
    - MCU: SPI, I²C, EEPROM, watchdog, serial receive and other chips.
    - Simulation: a fixed temperature of 27 °C, MOSFET level 1 only, and a single logic family.
    - Import: KiCad hierarchical sheets, SPICE `.param` expressions and EXP/SFFM sources.
+8. **Project folders** (requested 2026-11-21): create a project folder and keep every file of a
+   project together in it. It matters more once Arduino C++ sketches can have several files
+   (design doc, Phase C open question 2: today it is one source file per microcontroller
+   reference). Not designed yet; questions to settle first, with plain-language options and a
+   recommendation, before anything is built:
+   - Where source text lives. Today it is embedded in the `.dbr` (`Schematic.sources`). In a
+     project folder it could be real files (`.ino`, `.cpp`, `.h`, `.asm`) beside the `.dbr`, so
+     other editors, version control and `arduino-cli` see them as they are. Embedded text
+     would then become an import step for old files.
+   - What a project is: a folder with one `.dbr` and its sources, or a small project file
+     listing schematics, sources and settings (several schematics per project?).
+   - File → New project, Open project, a file tree in the Code panel (add, rename, delete files),
+     and the firmware reference (`source:<name>` today) becoming a path or a project-relative
+     name. Renaming a file must keep the microcontrollers pointing at it.
+   - Multi-file C++ builds: build the whole sketch folder, per-file errors in the list, and a
+     per-project build cache. The `.hex` files and build output belong in a subfolder that
+     version control can ignore.
+   - Recent-files list and "Open example" on projects; relative paths already resolve against
+     the `.dbr`'s folder.
 
 ## Gotchas
 
