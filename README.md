@@ -129,7 +129,7 @@ at it); the first one starts as a blink program for D13. The dialect is Atmel's:
 `high()`, and the register, bit and vector names from `m328Pdef.inc`. Text is coloured as you
 type and built on every change: mistakes are underlined, listed under the editor (click one to
 jump to it), and reported by line when the circuit runs. The part's firmware reads
-`source:<name>`. In the debugger the listing shows the source line beside each instruction.
+`source:<name>`. Click a line number to set or clear a breakpoint on it (red dot; an arrow marks the current instruction while the circuit is paused), and the debugger listing shows the source line beside each instruction.
 Macros, `.include` and data or EEPROM segments are not supported yet.
 
 **Parts library.** Besides generic parts, the palette has real ones: the 2N3904 and 2N3906

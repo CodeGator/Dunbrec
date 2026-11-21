@@ -142,7 +142,7 @@ Key mechanisms worth knowing before changing the engine:
    - A CMOS 555 (TLC555) would need different output levels.
    - The ngspice cross-check (item 1) can now also cover the exported 741 subcircuit.
 6. **MCU firmware development** (debugger, assembly text, Arduino C++ builds): phases A and B
-   built (B4 partly); C (Arduino C++ via arduino-cli) and D (more chips) are not. See
+   built; C (Arduino C++ via arduino-cli) and D (more chips) are not. See
    [docs/mcu-firmware-development.md](docs/mcu-firmware-development.md). None of the new
    windows (debugger, code panel) has been looked at on screen yet.
 7. **Not yet supported:**

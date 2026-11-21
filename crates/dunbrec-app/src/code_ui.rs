@@ -22,7 +22,9 @@ use dunbrec_mcu::asm_text::{self, AsmError, Assembled, FLASH_WORDS};
 use egui::text::{CCursor, CCursorRange, LayoutJob, TextFormat};
 use egui::{Align, Color32, FontId, Id, RichText, Stroke, Ui};
 
+use crate::debugger_ui::Debugger;
 use crate::document::Document;
+use crate::live::LiveSim;
 
 /// What a new project's first source file contains: a program that blinks
 /// the LED on D13, about twice a second at 16 MHz.
@@ -310,12 +312,17 @@ fn gutter(lines: usize, errors: &[AsmError], font: &FontId, plain: Color32) -> L
         };
         job.append(
             &text,
-            0.0,
+            LEADING,
             TextFormat::simple(font.clone(), if bad { ERROR_RED } else { plain }),
         );
     }
     job
 }
+
+/// Space left of the line numbers for the breakpoint dots.
+const LEADING: f32 = 14.0;
+const BREAKPOINT: Color32 = Color32::from_rgb(220, 50, 50);
+const PC_MARK: Color32 = Color32::from_rgb(255, 190, 60);
 
 /// Character index in `text` of 1-based `line` and `column`, clamped to the
 /// line.
@@ -381,7 +388,13 @@ impl CodeEditor {
         &self.built.as_ref().expect("just built").result
     }
 
-    pub fn show(&mut self, ui: &mut Ui, doc: &mut Document) {
+    pub fn show(
+        &mut self,
+        ui: &mut Ui,
+        doc: &mut Document,
+        debugger: &mut Debugger,
+        live: &mut Option<LiveSim>,
+    ) {
         let names: Vec<String> = doc.schematic().sources.keys().cloned().collect();
         if self.selected.as_ref().is_none_or(|n| !names.contains(n)) {
             self.selected = names.first().cloned();
@@ -459,7 +472,7 @@ impl CodeEditor {
         }
 
         egui::CentralPanel::default().show_inside(ui, |ui| {
-            self.editor(ui, doc, &name, &file, &errors);
+            self.editor(ui, doc, debugger, live, &name, &file, &errors);
         });
     }
 
@@ -553,10 +566,13 @@ impl CodeEditor {
         self.typing = false;
     }
 
+    #[allow(clippy::too_many_arguments)] // the editor needs the document, the debugger and the file
     fn editor(
         &mut self,
         ui: &mut Ui,
         doc: &mut Document,
+        debugger: &mut Debugger,
+        live: &mut Option<LiveSim>,
         name: &str,
         file: &SourceFile,
         errors: &[AsmError],
@@ -584,7 +600,13 @@ impl CodeEditor {
         }
 
         let lines = text.split('\n').count();
+        let marks = if is_asm {
+            debugger.source_marks(name, &file.text, live)
+        } else {
+            Default::default()
+        };
         let gutter_job = gutter(lines, errors, &font, weak);
+        let mut clicked_line = None;
         let mut changed = false;
         let mut has_focus = false;
         egui::ScrollArea::both()
@@ -592,7 +614,49 @@ impl CodeEditor {
             .show(ui, |ui| {
                 ui.horizontal_top(|ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
-                    ui.add(egui::Label::new(gutter_job).selectable(false));
+                    let numbers = ui.add(egui::Label::new(gutter_job).selectable(false));
+                    if is_asm {
+                        let area = numbers.rect.expand2(egui::vec2(2.0, 0.0));
+                        let click = ui.interact(area, id.with("gutter"), egui::Sense::click());
+                        let top = numbers.rect.top();
+                        let dot = |line: usize| {
+                            egui::pos2(
+                                numbers.rect.left() + 6.0,
+                                top + (line as f32 - 0.5) * row_height,
+                            )
+                        };
+                        let painter = ui.painter();
+                        for &line in &marks.breakpoints {
+                            painter.circle_filled(dot(line), 4.5, BREAKPOINT);
+                        }
+                        if let Some(line) = marks.pc_line {
+                            let at = dot(line);
+                            painter.add(egui::Shape::convex_polygon(
+                                vec![
+                                    at + egui::vec2(-4.0, -5.0),
+                                    at + egui::vec2(5.0, 0.0),
+                                    at + egui::vec2(-4.0, 5.0),
+                                ],
+                                PC_MARK,
+                                Stroke::NONE,
+                            ));
+                        }
+                        if let Some(pos) = click.hover_pos() {
+                            let line = ((pos.y - top) / row_height).floor().max(0.0) as usize + 1;
+                            let line = line.min(lines);
+                            if !marks.breakpoints.contains(&line) {
+                                painter.circle_filled(
+                                    dot(line),
+                                    4.5,
+                                    BREAKPOINT.gamma_multiply(0.3),
+                                );
+                            }
+                            if click.clicked() {
+                                clicked_line = Some(line);
+                            }
+                        }
+                        click.on_hover_text("Click to set or clear a breakpoint on this line");
+                    }
                     let mut layouter = |ui: &Ui, buffer: &dyn egui::TextBuffer, _wrap: f32| {
                         let job = if is_asm {
                             highlight(buffer.as_str(), &font, &palette, errors)
@@ -628,6 +692,9 @@ impl CodeEditor {
                 });
             });
 
+        if let Some(line) = clicked_line {
+            debugger.toggle_source_line(live, name, &file.text, line);
+        }
         if changed {
             if !self.typing {
                 doc.checkpoint();
@@ -748,10 +815,13 @@ mod tests {
     fn the_panel_draws_and_typing_edits_the_document() {
         let mut doc = Document::default();
         let mut editor = CodeEditor::default();
+        let mut debugger = Debugger::default();
+        let mut live = None;
         let ctx = egui::Context::default();
-        let frame = |doc: &mut Document, editor: &mut CodeEditor| {
+        let mut frame = |doc: &mut Document, editor: &mut CodeEditor| {
             let _ = ctx.run(egui::RawInput::default(), |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| editor.show(ui, doc));
+                egui::CentralPanel::default()
+                    .show(ctx, |ui| editor.show(ui, doc, &mut debugger, &mut live));
             });
         };
         // No files: the empty state draws.

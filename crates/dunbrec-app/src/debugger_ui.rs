@@ -81,6 +81,14 @@ struct Stopped {
     reason: Option<HaltReason>,
 }
 
+/// What the debugger knows about a source file, by line.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct SourceMarks {
+    pub breakpoints: BTreeSet<usize>,
+    /// The line the program counter is on, while the circuit is paused.
+    pub pc_line: Option<usize>,
+}
+
 #[derive(Default)]
 pub struct Debugger {
     pub show: bool,
@@ -322,6 +330,67 @@ impl Debugger {
         if let (Some(part), Some(live)) = (self.part(live), live.as_mut()) {
             live.send(Command::SetBreakpoints { part, words });
         }
+    }
+
+    // ----------------------------------------------- source file marks ---
+
+    /// The microcontroller whose program was built from exactly this text of
+    /// source file `name`. (After an edit the listing is out of date until
+    /// the app reloads it; nothing matches meanwhile.)
+    fn source_mcu(&self, name: &str, text: &str) -> Option<usize> {
+        self.mcus.iter().position(|m| {
+            m.source.as_ref().is_some_and(|s| {
+                s.name == name && s.text.iter().map(String::as_str).eq(text.lines())
+            })
+        })
+    }
+
+    /// Breakpoints and the current instruction of source file `name`, as
+    /// line numbers, for the code panel's gutter.
+    pub fn source_marks(&self, name: &str, text: &str, live: &Option<LiveSim>) -> SourceMarks {
+        let mut marks = SourceMarks::default();
+        let Some(index) = self.source_mcu(name, text) else {
+            return marks;
+        };
+        let mcu = &self.mcus[index];
+        let map = mcu.source.as_ref().expect("matched on its source");
+        if let Some(set) = self.breakpoints.get(&mcu.designator) {
+            marks.breakpoints = set
+                .iter()
+                .filter_map(|&word| map.built.line_for_address(word))
+                .collect();
+        }
+        if index == self.selected
+            && live.as_ref().is_some_and(|l| l.paused)
+            && let Some(stopped) = &self.stopped
+        {
+            marks.pc_line = map.built.line_for_address(stopped.snapshot.pc);
+        }
+        marks
+    }
+
+    /// Set or clear the breakpoint on `line` of source file `name`. False
+    /// if the line has no instruction (or the listing is out of date).
+    pub fn toggle_source_line(
+        &mut self,
+        live: &mut Option<LiveSim>,
+        name: &str,
+        text: &str,
+        line: usize,
+    ) -> bool {
+        let Some(index) = self.source_mcu(name, text) else {
+            return false;
+        };
+        let map = self.mcus[index]
+            .source
+            .as_ref()
+            .expect("matched on its source");
+        let Some(&(word, _)) = map.built.lines.iter().find(|(_, l)| *l == line) else {
+            return false;
+        };
+        self.selected = index;
+        self.toggle_breakpoint(live, word);
+        true
     }
 
     // ------------------------------------------------------------ window ---
@@ -688,6 +757,48 @@ loop: rjmp loop
         assert!(dbg.mcus[0].source.is_some());
         assert!(dbg.mcus[1].source.is_none());
         assert!(dbg.mcus[2].error.as_deref().unwrap().contains("gone"));
+    }
+
+    #[test]
+    fn breakpoints_can_be_set_and_shown_by_source_line() {
+        let text = "; start\n  sbi DDRB, 5\nloop: rjmp loop\n";
+        let mut nl = netlist(&["source:main"]);
+        nl.sources.insert(
+            "main".into(),
+            dunbrec_core::SourceFile {
+                language: SourceLanguage::Asm,
+                text: text.into(),
+            },
+        );
+        let mut dbg = Debugger::default();
+        dbg.load(&nl, None);
+        let mut live = None;
+        assert_eq!(
+            dbg.source_marks("main", text, &live),
+            SourceMarks::default()
+        );
+        // Line 3 is `rjmp`, at word 1; a comment line has no instruction.
+        assert!(dbg.toggle_source_line(&mut live, "main", text, 3));
+        assert!(!dbg.toggle_source_line(&mut live, "main", text, 1));
+        assert_eq!(dbg.breakpoints["U1"], BTreeSet::from([1]));
+        assert_eq!(
+            dbg.source_marks("main", text, &live).breakpoints,
+            BTreeSet::from([3])
+        );
+        // The listing's own gutter and the source gutter share breakpoints.
+        dbg.toggle_breakpoint(&mut live, 0);
+        assert_eq!(
+            dbg.source_marks("main", text, &live).breakpoints,
+            BTreeSet::from([2, 3])
+        );
+        assert!(dbg.toggle_source_line(&mut live, "main", text, 3));
+        // After an edit the old listing no longer matches the text.
+        let edited = format!("{text}nop\n");
+        assert!(!dbg.toggle_source_line(&mut live, "main", &edited, 2));
+        assert_eq!(
+            dbg.source_marks("main", &edited, &live),
+            SourceMarks::default()
+        );
     }
 
     #[test]

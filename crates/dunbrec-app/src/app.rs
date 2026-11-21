@@ -871,7 +871,9 @@ impl DunbrecApp {
         }
 
         // The debugger lists the firmware of the circuit as it is now.
-        if self.debugger.show && self.debug_loaded != Some(self.netlist.0) {
+        if (self.debugger.show || dock::is_open(&self.dock, Pane::Code))
+            && self.debug_loaded != Some(self.netlist.0)
+        {
             let dir = self.firmware_dir();
             self.debugger.load(&self.netlist.1, dir.as_deref());
             self.debug_loaded = Some(self.netlist.0);
@@ -915,16 +917,19 @@ impl DunbrecApp {
         let markers = self.bench.markers(self.doc.schematic());
         let lit = self.lit_leds();
 
+        let running = self.live.is_some();
         let mut viewer = PaneViewer {
             doc: &mut self.doc,
             canvas: &mut self.canvas,
             properties: &mut self.properties,
             code: &mut self.code,
+            debugger: &mut self.debugger,
+            live: &mut self.live,
             palette_search: &mut self.palette_search,
             netlist: &self.netlist.1,
             dc: &self.dc,
             latest: &self.latest,
-            running: self.live.is_some(),
+            running,
             annotations,
             markers: &markers,
             lit: &lit,
@@ -1501,6 +1506,8 @@ struct PaneViewer<'a> {
     canvas: &'a mut Canvas,
     properties: &'a mut Properties,
     code: &'a mut CodeEditor,
+    debugger: &'a mut Debugger,
+    live: &'a mut Option<LiveSim>,
     palette_search: &'a mut String,
     netlist: &'a Netlist,
     dc: &'a Option<DcResults>,
@@ -1537,7 +1544,7 @@ impl TabViewer for PaneViewer<'_> {
             }
             Pane::Checks => checks_ui(ui, self.netlist, self.doc.schematic()),
             Pane::Values => values_ui(ui, self.netlist, self.running, self.latest, self.dc),
-            Pane::Code => self.code.show(ui, self.doc),
+            Pane::Code => self.code.show(ui, self.doc, self.debugger, self.live),
             Pane::Retired => {}
         }
     }
