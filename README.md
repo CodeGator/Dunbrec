@@ -135,15 +135,30 @@ time, the 32 registers (changed ones highlighted), and a view of data memory. It
 the circuit has seen at the stop, not a live view of a running chip. Breakpoints are kept per
 part for the session; *Clear all breakpoints* removes them all.
 
+**Projects.** A project is a folder that keeps a design's schematics and firmware source files
+together: any number of `.dbr` schematics, and the `.asm` / `.ino` sources they use, as ordinary
+files that other editors, Git and `arduino-cli` see as they are. File → *New project…* asks for a
+folder name and creates the folder with a first schematic in it; *Open project…* (and *Open
+recent project*) picks an existing folder, and the app reopens the last project at start. The
+**Project** panel (View → Panels; it opens beside the palette) shows the folder as a tree.
+Double-click a schematic to open it, or a source file to open it in the Code panel; right-click
+to rename or delete (schematics that use a renamed source are updated to the new name, a folder
+rename included) or to make a new schematic, assembly file, Arduino sketch or folder (＋ New).
+Coming back to the window rescans the folder and takes up edits made in other programs, unless
+the open schematic has unsaved changes. Schematics saved by older versions keep their sources
+inside the `.dbr`; the panel offers *Move to files in this folder* for those.
+
 **Writing firmware in assembly.** View → Panels → *Code* opens an editor tab beside the
-schematic for AVR assembly kept inside the schematic file. Create a file with *New…* (or pick
-*Source file → New assembly file…* in a microcontroller's properties, which also points the part
-at it); the first one starts as a blink program for D13. The dialect is Atmel's: `ldi r16, 0xFF`,
+schematic for AVR assembly. A source is a file beside the schematic (`main.asm`, or in a
+subfolder `fw/main.asm`); the schematic itself stores only the name, and Save writes the
+files. Create one with *New…* (or *Source file → New assembly file…* in a microcontroller's
+properties, which also points the part at it; or from the Project panel); the first one starts as
+a blink program for D13. The dialect is Atmel's: `ldi r16, 0xFF`,
 `sbi PORTB, PB5`, labels, `.equ`, `.def`, `.org`, `.db`, `.dw`, expressions with `low()` and
 `high()`, and the register, bit and vector names from `m328Pdef.inc`. Text is coloured as you
 type and built on every change: mistakes are underlined, listed under the editor (click one to
-jump to it), and reported by line when the circuit runs. The part's firmware reads
-`source:<name>`. Click a line number to set or clear a breakpoint on it (red dot; an arrow marks the current instruction while the circuit is paused), and the debugger listing shows the source line beside each instruction.
+jump to it), and reported by line when the circuit runs. The part's firmware reads the
+file's path, relative to the schematic (`main.asm`; older files say `source:<name>`). Click a line number to set or clear a breakpoint on it (red dot; an arrow marks the current instruction while the circuit is paused), and the debugger listing shows the source line beside each instruction.
 Macros, `.include` and data or EEPROM segments are not supported yet.
 
 **Writing Arduino C++.** *New…* in the Code panel can also create an Arduino C++ sketch. Sketches

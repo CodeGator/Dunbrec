@@ -22,6 +22,8 @@ mod library;
 mod live;
 mod logic_ui;
 mod plot;
+mod project;
+mod project_ui;
 mod properties;
 mod serial_ui;
 mod settings;

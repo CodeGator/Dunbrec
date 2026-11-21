@@ -857,6 +857,21 @@ pub struct SourceFile {
 /// schematic.
 pub const SOURCE_PREFIX: &str = "source:";
 
+/// The language of a firmware source file from its name, if the name is
+/// one: `.asm` and `.s` are assembly, `.ino` and `.cpp` Arduino C++.
+///
+/// A source whose name is one of these is a *file*: its text lives in a
+/// file of that (relative) path beside the schematic rather than inside it,
+/// and a microcontroller refers to it by that path.
+pub fn source_language_of(name: &str) -> Option<SourceLanguage> {
+    let ext = name.trim().rsplit_once('.')?.1.to_ascii_lowercase();
+    match ext.as_str() {
+        "asm" | "s" => Some(SourceLanguage::Asm),
+        "ino" | "cpp" => Some(SourceLanguage::Cpp),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct Schematic {
     #[serde(default)]

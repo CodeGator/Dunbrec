@@ -640,3 +640,59 @@ fn sketch_millis_counts_real_milliseconds() {
     let expect = 100 * (times.len() as i64 - 1);
     assert!((span - expect).abs() <= 1, "{times:?}");
 }
+
+const BLINK_SOURCE: &str = "sbi DDRB, PB5\nloop: rjmp loop\n";
+
+#[test]
+fn a_source_file_is_named_by_its_path() {
+    let expected = dunbrec_mcu::asm_text::assemble(BLINK_SOURCE).unwrap().image;
+    // Open in the schematic under its path: built from that text, even
+    // though no such file exists.
+    let mut sources = std::collections::BTreeMap::new();
+    sources.insert(
+        "fw/main.asm".to_string(),
+        dunbrec_core::SourceFile {
+            language: dunbrec_core::SourceLanguage::Asm,
+            text: BLINK_SOURCE.into(),
+        },
+    );
+    let image = crate::load_firmware("fw/main.asm", None, &sources).unwrap();
+    assert_eq!(image, expected);
+
+    // Not open: read from disk, relative to the schematic's folder.
+    let dir = std::env::temp_dir().join(format!("dunbrec-src-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("fw")).unwrap();
+    std::fs::write(dir.join("fw").join("main.asm"), BLINK_SOURCE).unwrap();
+    let none = std::collections::BTreeMap::new();
+    let image = crate::load_firmware(" fw/main.asm ", Some(&dir), &none).unwrap();
+    assert_eq!(image, expected);
+
+    // The text open in the schematic wins over the file on disk.
+    let mut edited = sources.clone();
+    edited.get_mut("fw/main.asm").unwrap().text = "nop\nloop: rjmp loop\n".into();
+    let image = crate::load_firmware("fw/main.asm", Some(&dir), &edited).unwrap();
+    assert_ne!(image, expected);
+
+    // Errors name the file.
+    std::fs::write(dir.join("bad.asm"), "bogus r1\n").unwrap();
+    let err = crate::load_firmware("bad.asm", Some(&dir), &none).unwrap_err();
+    assert!(err.contains("bad.asm:1:1:"), "{err}");
+    // A missing file is explained, and a hex path still works as before.
+    let err = crate::load_firmware("gone.asm", Some(&dir), &none).unwrap_err();
+    assert!(err.contains("cannot read"), "{err}");
+    let err = crate::load_firmware("gone.hex", Some(&dir), &none).unwrap_err();
+    assert!(err.contains("cannot read"), "{err}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn source_files_are_recognised_by_their_extension() {
+    use dunbrec_core::{SourceLanguage::*, source_language_of};
+    assert_eq!(source_language_of("main.asm"), Some(Asm));
+    assert_eq!(source_language_of("fw/Blink.S"), Some(Asm));
+    assert_eq!(source_language_of("sketch.ino"), Some(Cpp));
+    assert_eq!(source_language_of("a.CPP"), Some(Cpp));
+    assert_eq!(source_language_of("main"), None);
+    assert_eq!(source_language_of("blink.hex"), None);
+    assert_eq!(source_language_of("builtin:blink"), None);
+}

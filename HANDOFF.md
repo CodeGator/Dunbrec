@@ -113,8 +113,9 @@ Key mechanisms worth knowing before changing the engine:
     project became GPL-3.0; the in-house emulator stays).
   - ATmega328P first.
   - Firmware is a `.hex` path stored in the schematic (relative to the `.dbr`), reloaded on
-    every Run, plus `builtin:<name>` demo programs and `source:<name>` (assembly text kept in
-    the schematic, built on every Run).
+    every Run, plus `builtin:<name>` demo programs, a source file's path (`main.asm`,
+    `fw/blink.ino`: the file beside the `.dbr`, built on every Run), and the older
+    `source:<name>` (text kept inside the schematic).
   - File format: `Schematic.sources` (a map of name to `{ language, text }`) was added with
     `#[serde(default)]`, so older `.dbr` files load unchanged and the version number was not
     bumped. An older Dunbrec opening a file that has sources ignores them.
@@ -151,25 +152,35 @@ Key mechanisms worth knowing before changing the engine:
    - MCU: SPI, I²C, EEPROM, watchdog, serial receive and other chips.
    - Simulation: a fixed temperature of 27 °C, MOSFET level 1 only, and a single logic family.
    - Import: KiCad hierarchical sheets, SPICE `.param` expressions and EXP/SFFM sources.
-8. **Project folders** (requested 2026-11-21): create a project folder and keep every file of a
-   project together in it. It matters more once Arduino C++ sketches can have several files
-   (design doc, Phase C open question 2: today it is one source file per microcontroller
-   reference). Not designed yet; questions to settle first, with plain-language options and a
-   recommendation, before anything is built:
-   - Where source text lives. Today it is embedded in the `.dbr` (`Schematic.sources`). In a
-     project folder it could be real files (`.ino`, `.cpp`, `.h`, `.asm`) beside the `.dbr`, so
-     other editors, version control and `arduino-cli` see them as they are. Embedded text
-     would then become an import step for old files.
-   - What a project is: a folder with one `.dbr` and its sources, or a small project file
-     listing schematics, sources and settings (several schematics per project?).
-   - File → New project, Open project, a file tree in the Code panel (add, rename, delete files),
-     and the firmware reference (`source:<name>` today) becoming a path or a project-relative
-     name. Renaming a file must keep the microcontrollers pointing at it.
-   - Multi-file C++ builds: build the whole sketch folder, per-file errors in the list, and a
-     per-project build cache. The `.hex` files and build output belong in a subfolder that
-     version control can ignore.
-   - Recent-files list and "Open example" on projects; relative paths already resolve against
-     the `.dbr`'s folder.
+8. **Projects** (built in 0.3.0; **not seen on screen yet**). A project is a plain folder; every
+   `.dbr` in it is one of its schematics, and firmware sources are real files beside them.
+   - `project.rs` (no UI, tested against a scratch folder): `scan` the tree, `Project`, create
+     project / schematic / source / folder, `rename` (renames on disk, then rewrites the firmware
+     references in every other `.dbr` of the project with `rewrite_refs`; the open schematic is
+     updated in memory by the app), `delete`, and the source plumbing below.
+   - **Source files.** A source whose name ends in `.asm`, `.s`, `.ino` or `.cpp`
+     (`dunbrec_core::source_language_of`) is a *file*: its key in `Schematic.sources` is its path
+     relative to the schematic's folder, with `/`, and a microcontroller's firmware field holds
+     the same string. `hydrate` reads the files a schematic refers to when it opens;
+     `for_saving` leaves them out of the `.dbr`; `write_sources` writes them on Save (only if the
+     text differs); `sync_from_disk` takes up outside edits. Sources named without such an
+     extension are the older embedded kind (`source:<name>`), still supported;
+     `extract_embedded` moves them into files (the panel's *Move to files* button).
+   - `dunbrec_sim::load_firmware` accepts `source:<name>`, a path of a source file (from
+     `sources` if open, else read from disk beside the schematic) and `.hex`/`builtin:` as before.
+   - `project_ui.rs` is the panel (`Pane::Project`, a tab beside the palette): tree, a small
+     form for new/rename/delete, and it returns a `Command` that `DunbrecApp::run_project_command`
+     carries out. File → New project / Open project / Open recent project / Close project. The last
+     project is saved in `Settings.project` and reopened at start. Focus returning to the window
+     rescans (`refresh_project`).
+   - Decisions taken with the user: plain folder (no project file), real source files, a file-tree
+     panel, several schematics per project.
+   - **Not done yet:** multi-file C++ builds (a sketch folder with several `.cpp`/`.h`; the
+     Arduino build still takes one file's text) and a per-project build cache with the `.hex`
+     output in an ignorable subfolder; a source file shared by two open schematics is
+     read separately by each; the firmware picker lists only sources already open in the
+     schematic (open a file from the Project panel to add it); no "reveal in Explorer"; no
+     project-wide search.
 
 ## Gotchas
 

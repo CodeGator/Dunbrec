@@ -22,6 +22,8 @@ pub enum Pane {
     Values,
     /// The firmware source editor.
     Code,
+    /// The files of the open project.
+    Project,
     /// A panel an older build could dock (the instruments). Layouts saved by
     /// those builds still load; these tabs are dropped on the way in.
     #[serde(other)]
@@ -30,8 +32,9 @@ pub enum Pane {
 
 impl Pane {
     /// The panels the user can bring back from View → Panels.
-    pub const SIDE_PANELS: [Pane; 5] = [
+    pub const SIDE_PANELS: [Pane; 6] = [
         Pane::Palette,
+        Pane::Project,
         Pane::Properties,
         Pane::Checks,
         Pane::Values,
@@ -46,6 +49,7 @@ impl Pane {
             Pane::Checks => "Checks",
             Pane::Values => "Values",
             Pane::Code => "Code",
+            Pane::Project => "Project",
             Pane::Retired => "",
         }
     }
@@ -104,6 +108,12 @@ pub fn open(dock: &mut DockState<Pane>, pane: Pane) {
     match pane {
         Pane::Schematic => dock.push_to_first_leaf(pane),
         Pane::Palette => split_schematic(dock, Split::Left, PALETTE_SHARE, pane),
+        // A tab beside the palette, or a column of its own on the left.
+        Pane::Project => {
+            if !join(dock, &[Pane::Palette], pane) {
+                split_schematic(dock, Split::Left, PALETTE_SHARE, pane);
+            }
+        }
         Pane::Properties => split_schematic(dock, Split::Right, SCHEMATIC_SHARE, pane),
         Pane::Checks | Pane::Values => {
             if !join(dock, &[Pane::Checks, Pane::Values], pane) {
@@ -267,12 +277,14 @@ mod tests {
         assert_eq!(leaf_of(&dock, Pane::Checks), leaf_of(&dock, Pane::Values));
         // The code editor is a tab beside the schematic.
         assert_eq!(leaf_of(&dock, Pane::Code), leaf_of(&dock, Pane::Schematic));
-        assert_eq!(panes(&dock).len(), 6);
+        // The project panel is a tab beside the palette.
+        assert_eq!(leaf_of(&dock, Pane::Project), leaf_of(&dock, Pane::Palette));
+        assert_eq!(panes(&dock).len(), 7);
         // Opening one that is already open leaves it alone.
         let before = leaf_of(&dock, Pane::Palette);
         open(&mut dock, Pane::Palette);
         assert_eq!(leaf_of(&dock, Pane::Palette), before);
-        assert_eq!(panes(&dock).len(), 6);
+        assert_eq!(panes(&dock).len(), 7);
     }
 
     #[test]

@@ -32,6 +32,10 @@ pub struct Settings {
     pub theme: Theme,
     /// Most recent first.
     pub recent: Vec<PathBuf>,
+    /// Project folders, most recent first.
+    pub recent_projects: Vec<PathBuf>,
+    /// The project that was open when the app last closed.
+    pub project: Option<PathBuf>,
 }
 
 impl Settings {
@@ -44,6 +48,21 @@ impl Settings {
 
     pub fn forget(&mut self, path: &Path) {
         self.recent.retain(|p| p != path);
+    }
+
+    /// Put the project folder `path` at the top of the recent projects.
+    pub fn remember_project(&mut self, path: &Path) {
+        self.recent_projects.retain(|p| p != path);
+        self.recent_projects.insert(0, path.to_path_buf());
+        self.recent_projects.truncate(RECENT_LIMIT);
+        self.project = Some(path.to_path_buf());
+    }
+
+    pub fn forget_project(&mut self, path: &Path) {
+        self.recent_projects.retain(|p| p != path);
+        if self.project.as_deref() == Some(path) {
+            self.project = None;
+        }
     }
 }
 
@@ -69,6 +88,19 @@ mod tests {
         );
         s.forget(Path::new("f5.dbr"));
         assert!(!s.recent.contains(&PathBuf::from("f5.dbr")));
+    }
+
+    #[test]
+    fn recent_projects_are_remembered_and_forgotten() {
+        let mut s = Settings::default();
+        s.remember_project(Path::new("a"));
+        s.remember_project(Path::new("b"));
+        s.remember_project(Path::new("a"));
+        assert_eq!(s.recent_projects, [PathBuf::from("a"), PathBuf::from("b")]);
+        assert_eq!(s.project, Some(PathBuf::from("a")));
+        s.forget_project(Path::new("a"));
+        assert_eq!(s.recent_projects, [PathBuf::from("b")]);
+        assert_eq!(s.project, None);
     }
 
     #[test]

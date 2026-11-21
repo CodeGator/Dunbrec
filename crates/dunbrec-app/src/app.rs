@@ -23,6 +23,8 @@ use crate::examples::examples;
 use crate::instruments_ui::{Bench, MeterSignal, Signals};
 use crate::library::{PaletteEntry, palette_groups};
 use crate::live::{Command, Event, LiveSim};
+use crate::project::{self, Project};
+use crate::project_ui::{self, ProjectPanel};
 use crate::properties::Properties;
 use crate::serial_ui::SerialMonitor;
 use crate::settings::{STORAGE_KEY, Settings, Theme};
@@ -137,6 +139,14 @@ pub struct DunbrecApp {
     /// firmware it has loaded.
     debugger: Debugger,
     debug_loaded: Option<u64>,
+
+    // ---- projects ----
+    /// The open project folder.
+    project: Option<Project>,
+    project_panel: ProjectPanel,
+    /// Whether the window had the focus last frame: getting it back
+    /// rescans the project and picks up edits made in other programs.
+    was_focused: bool,
 }
 
 /// True if two netlists have the same nodes and connections, so a running
@@ -180,8 +190,12 @@ impl DunbrecApp {
             .and_then(|s| eframe::get_value(s, STORAGE_KEY))
             .unwrap_or_default();
         cc.egui_ctx.set_theme(settings.theme.preference());
+        let mut startup_problems = Vec::new();
         let doc = match initial {
-            Some((s, path)) => {
+            Some((mut s, path)) => {
+                if let Some(dir) = path.as_deref().and_then(|p| p.parent()) {
+                    startup_problems = project::hydrate(&mut s, dir);
+                }
                 let mut d = Document::new(s, None);
                 if let Some(p) = path {
                     d.mark_saved(p);
@@ -197,7 +211,14 @@ impl DunbrecApp {
         let netlist = build_netlist(doc.schematic());
         let node_map = NodeMap::new(doc.schematic(), &netlist);
         let tags = node_tag_positions(doc.schematic(), &netlist);
-        Self {
+        let project = settings
+            .project
+            .as_deref()
+            .and_then(|root| Project::open(root).ok());
+        let mut app = Self {
+            project,
+            project_panel: ProjectPanel::default(),
+            was_focused: true,
             dock,
             palette_search: String::new(),
             debugger: Debugger::default(),
@@ -231,7 +252,14 @@ impl DunbrecApp {
             about: Default::default(),
             show_shortcuts: false,
             settings,
+        };
+        if app.project.is_some() {
+            dock::open(&mut app.dock, Pane::Project);
         }
+        if !startup_problems.is_empty() {
+            app.message = Some(source_problems(&startup_problems));
+        }
+        app
     }
 
     // ------------------------------------------------------- files ---
@@ -368,11 +396,19 @@ impl DunbrecApp {
 
     fn open_path(&mut self, path: PathBuf) {
         match dunbrec_io::dbr::load(&path) {
-            Ok(s) => {
+            Ok(mut s) => {
                 self.settings.remember(&path);
+                // The firmware source files it uses live beside it.
+                let problems = path
+                    .parent()
+                    .map(|dir| project::hydrate(&mut s, dir))
+                    .unwrap_or_default();
                 let mut d = Document::new(s, None);
                 d.mark_saved(path);
                 self.replace(d);
+                if !problems.is_empty() {
+                    self.message = Some(source_problems(&problems));
+                }
             }
             Err(e) => {
                 self.settings.forget(&path);
@@ -405,15 +441,280 @@ impl DunbrecApp {
         if path.extension().is_none() {
             path.set_extension("dbr");
         }
-        match dunbrec_io::dbr::save(self.doc.schematic(), &path) {
+        // Firmware source files are saved as files beside the schematic, and
+        // the schematic itself keeps only the names.
+        if let Some(dir) = path.parent()
+            && let Err(e) = project::write_sources(self.doc.schematic(), dir)
+        {
+            self.message = Some(Message::error("Could not save the source files", e));
+            return false;
+        }
+        match dunbrec_io::dbr::save(&project::for_saving(self.doc.schematic()), &path) {
             Ok(()) => {
                 self.settings.remember(&path);
                 self.doc.mark_saved(path);
+                if let Some(p) = &mut self.project {
+                    p.refresh();
+                }
                 true
             }
             Err(e) => {
                 self.message = Some(Message::file_error("Could not save the file", &path, e));
                 false
+            }
+        }
+    }
+
+    // ------------------------------------------------------ projects ---
+
+    /// Make `root` the open project and show its panel.
+    fn open_project(&mut self, root: &std::path::Path) {
+        match Project::open(root) {
+            Ok(p) => {
+                self.settings.remember_project(root);
+                self.project = Some(p);
+                dock::open(&mut self.dock, Pane::Project);
+                if let Some(at) = self.dock.find_tab(&Pane::Project) {
+                    self.dock.set_active_tab(at);
+                }
+            }
+            Err(e) => {
+                self.settings.forget_project(root);
+                self.message = Some(Message::error("Could not open the project", e));
+            }
+        }
+    }
+
+    /// Open a project folder; if it holds a single schematic and none of
+    /// the project is open yet, open that too.
+    fn open_project_and_schematic(&mut self, root: &std::path::Path) {
+        self.open_project(root);
+        let Some(project) = &self.project else { return };
+        let inside = self.doc.path().is_some_and(|p| project.contains(p));
+        if let [only] = project.schematics().as_slice()
+            && !inside
+        {
+            self.request(Pending::OpenPath(only.clone()));
+        }
+    }
+
+    fn pick_and_open_project(&mut self) {
+        if let Some(dir) = rfd::FileDialog::new()
+            .set_title("Open project folder")
+            .pick_folder()
+        {
+            self.open_project_and_schematic(&dir);
+        }
+    }
+
+    /// Ask for a name, make the project folder with a first schematic in it,
+    /// and open them.
+    fn new_project(&mut self) {
+        let Some(dir) = rfd::FileDialog::new()
+            .set_title("New project: type a name for its folder")
+            .set_file_name("My project")
+            .save_file()
+        else {
+            return;
+        };
+        match project::create_project(&dir) {
+            Ok(first) => {
+                self.open_project(&dir);
+                self.request(Pending::OpenPath(first));
+            }
+            Err(e) => {
+                self.message = Some(Message::error("Could not create the project", e));
+            }
+        }
+    }
+
+    /// Carry out what the Project panel asked for.
+    fn run_project_command(&mut self, command: project_ui::Command) {
+        use project_ui::{Command as C, Create};
+        match command {
+            C::NewProject => self.new_project(),
+            C::OpenProject => self.pick_and_open_project(),
+            C::OpenProjectPath(root) => self.open_project_and_schematic(&root),
+            C::CloseProject => {
+                self.project = None;
+                self.settings.project = None;
+            }
+            C::OpenSchematic(path) => self.request(Pending::OpenPath(path)),
+            C::OpenSource(path) => self.open_source(&path),
+            C::Create { dir, name, what } => {
+                let made = match what {
+                    Create::Schematic => project::new_schematic(&dir, &name),
+                    Create::Assembly => {
+                        project::new_source(&dir, &name, project::NewSource::Assembly)
+                    }
+                    Create::Sketch => project::new_source(&dir, &name, project::NewSource::Sketch),
+                    Create::Folder => project::new_folder(&dir, &name),
+                };
+                match made {
+                    Ok(path) => {
+                        if let Some(p) = &mut self.project {
+                            p.refresh();
+                        }
+                        match what {
+                            Create::Schematic => self.request(Pending::OpenPath(path)),
+                            Create::Assembly | Create::Sketch => self.open_source(&path),
+                            Create::Folder => {}
+                        }
+                    }
+                    Err(e) => self.message = Some(Message::error("Could not create it", e)),
+                }
+            }
+            C::Rename { from, to } => self.rename_in_project(&from, &to),
+            C::Delete(path) => self.delete_in_project(&path),
+            C::Refresh => self.refresh_project(),
+            C::MoveSourcesToFiles => self.move_sources_to_files(),
+        }
+    }
+
+    /// Show the source file at `path` in the Code panel, opening it in the
+    /// current schematic if it is not open already.
+    fn open_source(&mut self, path: &std::path::Path) {
+        let Some(dir) = self.firmware_dir() else {
+            self.message = Some(Message::info(
+                "Save the schematic first",
+                "A source file belongs to a schematic and is found by its place relative to \
+                 it. Save this schematic (Ctrl+S), preferably in the project folder, and \
+                 then open the file again.",
+            ));
+            return;
+        };
+        let name = project::relative_to(&dir, path);
+        if let Err(e) = project::attach(self.doc.schematic_mut(), &dir, &name) {
+            self.message = Some(Message::error("Could not open the source file", e));
+            return;
+        }
+        dock::open(&mut self.dock, Pane::Code);
+        if let Some(at) = self.dock.find_tab(&Pane::Code) {
+            self.dock.set_active_tab(at);
+        }
+        self.code.select(&name);
+    }
+
+    fn rename_in_project(&mut self, from: &std::path::Path, to: &std::path::Path) {
+        let Some(root) = self.project.as_ref().map(|p| p.root.clone()) else {
+            return;
+        };
+        let open = self.doc.path().map(|p| p.to_path_buf());
+        if let Err(e) = project::rename(&root, from, to, open.as_deref()) {
+            self.message = Some(Message::error("Could not rename it", e));
+            return;
+        }
+        // The open schematic follows in memory: its own file may have moved,
+        // and its references to the renamed file change.
+        if let Some(open) = open {
+            let none = std::path::Path::new("");
+            let old_dir = open.parent().unwrap_or(none).to_path_buf();
+            let new_open = match project::normalize(&open).strip_prefix(project::normalize(from)) {
+                Ok(rest) if rest.as_os_str().is_empty() => to.to_path_buf(),
+                Ok(rest) => to.join(rest),
+                Err(_) => open.clone(),
+            };
+            let new_dir = new_open.parent().unwrap_or(none).to_path_buf();
+            let mut probe = self.doc.schematic().clone();
+            if project::rewrite_refs(&mut probe, &old_dir, &new_dir, from, to) > 0 {
+                self.doc.edit(|s| {
+                    project::rewrite_refs(s, &old_dir, &new_dir, from, to);
+                });
+            }
+            if new_open != open {
+                self.settings.forget(&open);
+                self.settings.remember(&new_open);
+                self.doc.set_path(new_open);
+            }
+        }
+        self.refresh_project();
+    }
+
+    fn delete_in_project(&mut self, path: &std::path::Path) {
+        if let Err(e) = project::delete(path) {
+            self.message = Some(Message::error("Could not delete it", e));
+            return;
+        }
+        let gone = project::normalize(path);
+        // Drop open source files that were deleted with it.
+        if let Some(dir) = self.firmware_dir() {
+            let dead: Vec<String> = self
+                .doc
+                .schematic()
+                .sources
+                .keys()
+                .filter(|n| project::is_file_source(n))
+                .filter(|n| project::normalize(&dir.join(n)).starts_with(&gone))
+                .cloned()
+                .collect();
+            for name in dead {
+                self.doc.schematic_mut().sources.remove(&name);
+            }
+        }
+        if self
+            .doc
+            .path()
+            .is_some_and(|p| project::normalize(p).starts_with(&gone))
+        {
+            self.message = Some(Message::info(
+                "The open schematic's file is gone",
+                "The schematic you are working on was deleted from the disk. Save it (Ctrl+S) \
+                 to keep it.",
+            ));
+        }
+        self.refresh_project();
+    }
+
+    /// Rescan the project folder, and take up edits made to the open
+    /// schematic's source files elsewhere (unless it has unsaved changes,
+    /// which win).
+    fn refresh_project(&mut self) {
+        if let Some(p) = &mut self.project {
+            p.refresh();
+        }
+        if !self.doc.is_dirty()
+            && let Some(dir) = self.firmware_dir()
+        {
+            let changed = project::sync_from_disk(self.doc.schematic_mut(), &dir);
+            if !changed.is_empty() {
+                // The debugger lists the new text.
+                self.debug_loaded = None;
+            }
+        }
+    }
+
+    /// Move the sources an older version kept inside the schematic out into
+    /// files beside it.
+    fn move_sources_to_files(&mut self) {
+        let Some(dir) = self.firmware_dir() else {
+            self.message = Some(Message::info(
+                "Save the schematic first",
+                "The source files are written beside the schematic, so it needs a place on \
+                 the disk first. Save it (Ctrl+S) and try again.",
+            ));
+            return;
+        };
+        let mut copy = self.doc.schematic().clone();
+        match project::extract_embedded(&mut copy, &dir) {
+            Ok(moved) if moved.is_empty() => {}
+            Ok(moved) => {
+                self.doc.edit(|s| *s = copy);
+                let list: Vec<String> = moved
+                    .iter()
+                    .map(|(old, file)| format!("• {old} → {file}"))
+                    .collect();
+                self.message = Some(
+                    Message::info(
+                        "Sources moved to files",
+                        "Each source is now a file beside the schematic. Save the schematic \
+                         to keep the new firmware names.",
+                    )
+                    .with_detail(list.join("\n")),
+                );
+                self.refresh_project();
+            }
+            Err(e) => {
+                self.message = Some(Message::error("Could not move the sources", e));
             }
         }
     }
@@ -1009,6 +1310,7 @@ impl DunbrecApp {
         let lit = self.lit_leds();
 
         let running = self.live.is_some();
+        let mut project_command = None;
         let mut viewer = PaneViewer {
             doc: &mut self.doc,
             canvas: &mut self.canvas,
@@ -1024,10 +1326,17 @@ impl DunbrecApp {
             annotations,
             markers: &markers,
             lit: &lit,
+            project: self.project.as_ref(),
+            recent_projects: &self.settings.recent_projects,
+            project_panel: &mut self.project_panel,
+            project_command: &mut project_command,
         };
         DockArea::new(&mut self.dock)
             .style(egui_dock::Style::from_egui(ctx.style().as_ref()))
             .show(ctx, &mut viewer);
+        if let Some(command) = project_command {
+            self.run_project_command(command);
+        }
         // "Edit" on a microcontroller's source file opens it in the editor.
         if let Some(name) = self.properties.open_code.take() {
             dock::open(&mut self.dock, Pane::Code);
@@ -1076,6 +1385,39 @@ impl DunbrecApp {
                                 self.request(Pending::Example(i));
                                 ui.close();
                             }
+                        }
+                    });
+                    ui.separator();
+                    if ui.button("New project…").clicked() {
+                        self.new_project();
+                        ui.close();
+                    }
+                    if ui.button("Open project…").clicked() {
+                        self.pick_and_open_project();
+                        ui.close();
+                    }
+                    ui.add_enabled_ui(!self.settings.recent_projects.is_empty(), |ui| {
+                        ui.menu_button("Open recent project", |ui| {
+                            for path in self.settings.recent_projects.clone() {
+                                let name = path.file_name().map_or_else(
+                                    || path.display().to_string(),
+                                    |n| n.to_string_lossy().into_owned(),
+                                );
+                                if ui
+                                    .button(name)
+                                    .on_hover_text(path.display().to_string())
+                                    .clicked()
+                                {
+                                    self.open_project_and_schematic(&path);
+                                    ui.close();
+                                }
+                            }
+                        });
+                    });
+                    ui.add_enabled_ui(self.project.is_some(), |ui| {
+                        if ui.button("Close project").clicked() {
+                            self.run_project_command(project_ui::Command::CloseProject);
+                            ui.close();
                         }
                     });
                     ui.separator();
@@ -1606,6 +1948,18 @@ fn values_ui(
         });
 }
 
+/// Tell the user which source files could not be opened with a schematic.
+fn source_problems(problems: &[String]) -> Message {
+    let mut message = Message::info(
+        "Some source files could not be opened",
+        "The schematic refers to firmware source files that are missing or unreadable. \
+         The rest of it opened normally.",
+    )
+    .with_detail(problems.join("\n"));
+    message.kind = dialog::Kind::Warning;
+    message
+}
+
 /// What the dock needs to draw each panel: the parts of the app they show
 /// or edit, borrowed for one frame.
 struct PaneViewer<'a> {
@@ -1623,6 +1977,11 @@ struct PaneViewer<'a> {
     annotations: &'a [Annotation],
     markers: &'a [Marker],
     lit: &'a std::collections::HashSet<dunbrec_core::ComponentId>,
+    project: Option<&'a Project>,
+    recent_projects: &'a [PathBuf],
+    project_panel: &'a mut ProjectPanel,
+    /// What the Project panel asked for this frame.
+    project_command: &'a mut Option<project_ui::Command>,
 }
 
 impl TabViewer for PaneViewer<'_> {
@@ -1652,6 +2011,22 @@ impl TabViewer for PaneViewer<'_> {
             Pane::Checks => checks_ui(ui, self.netlist, self.doc.schematic()),
             Pane::Values => values_ui(ui, self.netlist, self.running, self.latest, self.dc),
             Pane::Code => self.code.show(ui, self.doc, self.debugger, self.live),
+            Pane::Project => {
+                let embedded = if self.doc.path().is_some() {
+                    project::embedded_count(self.doc.schematic())
+                } else {
+                    0
+                };
+                let view = project_ui::View {
+                    project: self.project,
+                    recent: self.recent_projects,
+                    current: self.doc.path(),
+                    embedded,
+                };
+                if let Some(command) = self.project_panel.show(ui, &view) {
+                    *self.project_command = Some(command);
+                }
+            }
             Pane::Retired => {}
         }
     }
@@ -1699,6 +2074,14 @@ impl eframe::App for DunbrecApp {
         if self.allow_close {
             ctx.send_viewport_cmd(ViewportCommand::Close);
         }
+
+        // Coming back from another program: its edits to the project's
+        // files show up.
+        let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
+        if focused && !self.was_focused {
+            self.refresh_project();
+        }
+        self.was_focused = focused;
 
         self.shortcuts(ctx);
         self.refresh_netlist();
