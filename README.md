@@ -141,9 +141,11 @@ files that other editors, Git and `arduino-cli` see as they are. File → *New p
 folder name and creates the folder with a first schematic in it; *Open project…* (and *Open
 recent project*) picks an existing folder, and the app reopens the last project at start. The
 **Project** panel (View → Panels; it opens beside the palette) shows the folder as a tree.
-Double-click a schematic to open it, or a source file to open it in the Code panel; right-click
-to rename or delete (schematics that use a renamed source are updated to the new name, a folder
-rename included) or to make a new schematic, assembly file, Arduino sketch or folder (＋ New).
+Circuits are listed by name, sources with their extension. Double-click a circuit to open it, or
+a source file to open it in the Code panel. Right-click the project's name, a folder or empty
+space to add a circuit, assembly file, Arduino sketch or folder (the ＋ New button does the same);
+right-click a file or folder to rename or delete it (circuits that use a renamed source are
+updated to the new name, a folder rename included).
 Coming back to the window rescans the folder and takes up edits made in other programs, unless
 the open schematic has unsaved changes. Schematics saved by older versions keep their sources
 inside the `.dbr`; the panel offers *Move to files in this folder* for those.

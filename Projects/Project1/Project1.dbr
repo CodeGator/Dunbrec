@@ -1,0 +1,14 @@
+(
+    format: "dunbrec",
+    version: 1,
+    schematic: (
+        components: [],
+        wires: [],
+        labels: [],
+        models: (
+            models: {},
+        ),
+        sources: {},
+        next_id: 0,
+    ),
+)

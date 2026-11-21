@@ -18,12 +18,30 @@ pub enum Create {
 }
 
 impl Create {
+    /// Everything the panel can add, in menu order.
+    const ALL: [Create; 4] = [
+        Create::Schematic,
+        Create::Assembly,
+        Create::Sketch,
+        Create::Folder,
+    ];
+
     fn title(self) -> &'static str {
         match self {
-            Create::Schematic => "New schematic",
+            Create::Schematic => "New circuit",
             Create::Assembly => "New assembly file",
             Create::Sketch => "New Arduino sketch",
             Create::Folder => "New folder",
+        }
+    }
+
+    /// The menu entry.
+    fn menu_label(self) -> &'static str {
+        match self {
+            Create::Schematic => "Circuit…",
+            Create::Assembly => "Assembly source file…",
+            Create::Sketch => "Arduino sketch…",
+            Create::Folder => "Folder…",
         }
     }
 }
@@ -87,6 +105,15 @@ fn same(a: &Path, b: &Path) -> bool {
     normalize(a) == normalize(b)
 }
 
+/// What a row says: a circuit by its name alone, any other file with its
+/// extension (which tells an assembly file from a sketch).
+fn shown_name(e: &Entry) -> &str {
+    match e.kind {
+        EntryKind::Schematic => e.name.strip_suffix(".dbr").unwrap_or(&e.name),
+        _ => &e.name,
+    }
+}
+
 fn icon(kind: EntryKind) -> &'static str {
     match kind {
         EntryKind::Folder => "📁",
@@ -106,8 +133,16 @@ impl ProjectPanel {
         };
         let mut out = None;
         ui.horizontal(|ui| {
-            ui.label(RichText::new(format!("📁 {}", project.name())).strong())
-                .on_hover_text(project.root.display().to_string());
+            ui.add(
+                egui::Label::new(RichText::new(format!("📁 {}", project.name())).strong())
+                    .sense(egui::Sense::click()),
+            )
+            .on_hover_text(format!(
+                "{}
+Right-click to add to the project",
+                project.root.display()
+            ))
+            .context_menu(|ui| self.new_menu(ui, &project.root));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
                     .small_button("✕")
@@ -123,30 +158,7 @@ impl ProjectPanel {
                 {
                     out = Some(Command::Refresh);
                 }
-                ui.menu_button("＋ New", |ui| {
-                    for what in [
-                        Create::Schematic,
-                        Create::Assembly,
-                        Create::Sketch,
-                        Create::Folder,
-                    ] {
-                        let label = match what {
-                            Create::Schematic => "Schematic…",
-                            Create::Assembly => "Assembly source file…",
-                            Create::Sketch => "Arduino sketch…",
-                            Create::Folder => "Folder…",
-                        };
-                        if ui.button(label).clicked() {
-                            self.form = Some(Form::Create {
-                                dir: project.root.clone(),
-                                what,
-                                name: String::new(),
-                                fresh: true,
-                            });
-                            ui.close();
-                        }
-                    }
-                });
+                ui.menu_button("＋ New", |ui| self.new_menu(ui, &project.root));
             });
         });
         ui.separator();
@@ -176,11 +188,22 @@ impl ProjectPanel {
             out = Some(command);
         }
 
+        // Right-clicking empty space adds to the project too. This is made
+        // first, so the rows drawn over it get their own clicks.
+        let area = ui.available_rect_before_wrap();
+        ui.interact(
+            area,
+            ui.id().with("project_background"),
+            egui::Sense::click(),
+        )
+        .context_menu(|ui| self.new_menu(ui, &project.root));
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 if project.entries.is_empty() {
-                    ui.label(RichText::new("This folder is empty.").weak());
+                    ui.label(
+                        RichText::new("Nothing here yet. Right-click to add a circuit.").weak(),
+                    );
                 }
                 if let Some(command) = self.tree(ui, &project.entries, view.current) {
                     out = Some(command);
@@ -201,22 +224,7 @@ impl ProjectPanel {
                     out = Some(command);
                 }
                 header.header_response.context_menu(|ui| {
-                    for what in [
-                        Create::Schematic,
-                        Create::Assembly,
-                        Create::Sketch,
-                        Create::Folder,
-                    ] {
-                        if ui.button(format!("{} here…", what.title())).clicked() {
-                            self.form = Some(Form::Create {
-                                dir: e.path.clone(),
-                                what,
-                                name: String::new(),
-                                fresh: true,
-                            });
-                            ui.close();
-                        }
-                    }
+                    self.new_menu(ui, &e.path);
                     ui.separator();
                     self.rename_delete(ui, e);
                 });
@@ -224,7 +232,7 @@ impl ProjectPanel {
             }
             let selected = current.is_some_and(|c| same(c, &e.path));
             let openable = matches!(e.kind, EntryKind::Schematic | EntryKind::Source(_));
-            let mut label = RichText::new(format!("{} {}", icon(e.kind), e.name));
+            let mut label = RichText::new(format!("{} {}", icon(e.kind), shown_name(e)));
             if !openable {
                 label = label.weak();
             }
@@ -255,6 +263,21 @@ impl ProjectPanel {
             });
         }
         out
+    }
+
+    /// The entries that add something to the folder `dir`.
+    fn new_menu(&mut self, ui: &mut Ui, dir: &Path) {
+        for what in Create::ALL {
+            if ui.button(what.menu_label()).clicked() {
+                self.form = Some(Form::Create {
+                    dir: dir.to_path_buf(),
+                    what,
+                    name: String::new(),
+                    fresh: true,
+                });
+                ui.close();
+            }
+        }
     }
 
     fn rename_delete(&mut self, ui: &mut Ui, e: &Entry) {
@@ -509,6 +532,20 @@ mod tests {
             assert!(panel.form.is_some(), "the form stays open until answered");
         }
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn circuits_are_listed_by_name_without_the_extension() {
+        let entry = |name: &str| Entry {
+            name: name.to_string(),
+            path: PathBuf::from(name),
+            kind: crate::project::kind_of(name),
+            children: Vec::new(),
+        };
+        assert_eq!(shown_name(&entry("Blinker.dbr")), "Blinker");
+        assert_eq!(shown_name(&entry("main.asm")), "main.asm");
+        assert_eq!(shown_name(&entry("fade.ino")), "fade.ino");
+        assert_eq!(shown_name(&entry("notes.txt")), "notes.txt");
     }
 
     #[test]
