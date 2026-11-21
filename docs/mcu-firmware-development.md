@@ -86,8 +86,10 @@ Other chips are explicitly out of scope here (see Phase D).
 - Debugger first, then assembly text and the code panel, then Arduino C++ builds.
 - Source is edited in a code panel in the app and stored with the schematic.
 - Instruments stay floating windows that never dock (user decision). The debugger follows that.
-- The toolchain is an **external process**, never linked or bundled: it is GPL, and the repo is
-  MIT (the same reason simavr was rejected).
+- The toolchain is an **external process**, never linked or bundled, so its version and size stay
+  out of the repo. (Under the original MIT licence this was also a licensing reason, as it was for
+  rejecting simavr. The project is GPL-3.0 now, so bundling GPL tools would be allowed; there is
+  just no need.)
 - Existing `.hex` and `builtin:` firmware keeps working unchanged.
 
 ## Cross-cutting design

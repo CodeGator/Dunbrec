@@ -182,4 +182,10 @@ python tools/make_icon.py   # regenerate assets/dunbrec.png and .ico
 
 ## License
 
-MIT © 2026 CodeGator. See [LICENSE](LICENSE).
+Copyright © 2026 CodeGator. Dunbrec is free software: you can redistribute it and/or modify it
+under the terms of the GNU General Public License, version 3 only, as published by the Free
+Software Foundation. It is distributed in the hope that it will be useful, but without any
+warranty. See [LICENSE](LICENSE) for the full text.
+
+The project was published under the MIT licence until 2026-11-21; copies obtained under that
+licence stay under it, and everything from this change on is GPL-3.0.

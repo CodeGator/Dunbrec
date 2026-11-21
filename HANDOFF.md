@@ -102,9 +102,11 @@ Key mechanisms worth knowing before changing the engine:
 
 - GUI egui/eframe; own Rust simulation engine. ngspice is a dev-time reference only and is
   never shipped.
-- Publisher CodeGator; MIT licence; version stays 0.1.0 for now.
+- Publisher CodeGator; **GPL-3.0-only** licence (changed from MIT on 2026-11-21; earlier commits
+  were published under MIT); version stays 0.1.0 for now.
 - Microcontrollers:
-  - Own AVR emulator; simavr was rejected because it is GPL.
+  - Own AVR emulator; simavr was rejected because it is GPL (that reason lapsed when the
+    project became GPL-3.0; the in-house emulator stays).
   - ATmega328P first.
   - Firmware is a `.hex` path stored in the schematic (relative to the `.dbr`), reloaded on
     every Run, plus `builtin:<name>` demo programs.
