@@ -166,7 +166,7 @@ fn write_netlist(
         let n: Vec<String> = e.nodes.iter().map(|&id| node(id)).collect();
         let d = &e.designator;
         let line = match &e.kind {
-            K::Ground => continue,
+            K::Ground | K::Junction => continue,
             // Rejected by `export` before writing.
             K::Gate { .. }
             | K::Inverter { .. }

@@ -43,6 +43,13 @@ drag empty space to box-select, Del deletes, Ctrl+C / X / V / D copy, cut, paste
 duplicate, Ctrl+Z / Y undo and redo. Wheel zooms, middle-drag pans. Values accept engineering
 notation (`4k7`, `10u`, `2.2M`). Help → Keyboard shortcuts lists everything.
 
+**Crossing wires.** Wires that cross are *not* connected, and are drawn with a small hop in the
+horizontal wire to show it. To connect two crossing wires, place a **Junction** (palette group
+*Wiring*) on the crossing: it joins every wire through its point, is drawn as a dot, and has no
+other effect (no designator, nothing in the simulation or the SPICE export). A wire that ends on
+another wire, or a pin on a wire, is connected without one and gets a dot where three or more
+connections meet.
+
 **Panels.** The schematic, palette, properties, checks and live values are tabs you can drag.
 Drop one on the edge of another panel to split the window, on the middle of one to stack it as
 a tab, or outside the window area to float it. Drag the dividers to resize. Closing a tab hides

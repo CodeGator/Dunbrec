@@ -390,6 +390,12 @@ pub fn hit_test(s: &Schematic, p: Pos2) -> Option<Item> {
             return Some(Item::Label(l.id));
         }
     }
+    // A junction sits on the wires it joins, so it is tested before them.
+    for c in s.components.iter().rev() {
+        if matches!(c.kind, ComponentKind::Junction) && to_pos(c.position).distance(p) < 0.35 {
+            return Some(Item::Component(c.id));
+        }
+    }
     for w in s.wires.iter().rev() {
         if segment_distance(p, to_pos(w.a), to_pos(w.b)) < 0.35 {
             return Some(Item::Wire(w.id));
@@ -448,6 +454,35 @@ pub fn junctions(s: &Schematic) -> Vec<Point> {
         .collect();
     dots.sort();
     dots
+}
+
+/// Radius of the hop drawn where a wire passes over another (grid units).
+const HOP_RADIUS: f32 = 0.4;
+
+/// Where a horizontal wire crosses a vertical one without being connected
+/// to it: the horizontal wire and the crossing point. The wire is drawn
+/// with a small hop there. A crossing is connected, and gets no hop, if a
+/// pin (a junction part, say), a wire end or a label sits on it.
+pub fn hops(s: &Schematic) -> Vec<(WireId, Point)> {
+    let touched = |p: Point| {
+        s.wires.iter().any(|w| w.a == p || w.b == p)
+            || s.components
+                .iter()
+                .any(|c| c.pin_positions().any(|(_, q)| q == p))
+            || s.labels.iter().any(|l| l.position == p)
+    };
+    let mut out = Vec::new();
+    for h in s.wires.iter().filter(|w| w.a.y == w.b.y && w.a.x != w.b.x) {
+        for v in s.wires.iter().filter(|w| w.a.x == w.b.x && w.a.y != w.b.y) {
+            let p = Point::new(v.a.x, h.a.y);
+            if h.contains_interior(p) && v.contains_interior(p) && !touched(p) {
+                out.push((h.id, p));
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// True if `p` is a connection point: a pin, a wire end, or on a wire.
@@ -678,8 +713,10 @@ fn classify_wire_press(wire_in_progress: bool, s: &Schematic, p: Pos2) -> WirePr
 /// of some part. A wire already ending there does not matter.
 fn pin_at(s: &Schematic, p: Pos2) -> Option<Point> {
     let at = snap(p);
+    // A junction's dot is something to select, not a pin to wire from.
     s.components
         .iter()
+        .filter(|c| !matches!(c.kind, ComponentKind::Junction))
         .any(|c| c.pin_positions().any(|(_, pin)| pin == at))
         .then_some(at)
 }
@@ -782,7 +819,7 @@ pub fn value_text(kind: &ComponentKind) -> String {
         Waveform::Pwl(points) => format!("PWL ({} points)", points.len()),
     };
     match kind {
-        ComponentKind::Ground => String::new(),
+        ComponentKind::Ground | ComponentKind::Junction => String::new(),
         ComponentKind::Resistor { resistance } => format_value(*resistance, "Ω"),
         ComponentKind::Capacitor { capacitance, .. } => format_value(*capacitance, "F"),
         ComponentKind::Inductor { inductance, .. } => format_value(*inductance, "H"),
@@ -1094,16 +1131,50 @@ impl Canvas {
             );
         }
 
+        let hops = hops(s);
         for w in &s.wires {
             let color = if self.selection.contains(&Item::Wire(w.id)) {
                 colors.selected
             } else {
                 colors.wire
             };
-            painter.line_segment(
-                [p.screen(to_pos(w.a)), p.screen(to_pos(w.b))],
-                Stroke::new(width, color),
-            );
+            let stroke = Stroke::new(width, color);
+            let mut over: Vec<f32> = hops
+                .iter()
+                .filter(|(id, _)| *id == w.id)
+                .map(|(_, at)| at.x as f32)
+                .collect();
+            if over.is_empty() {
+                painter.line_segment([p.screen(to_pos(w.a)), p.screen(to_pos(w.b))], stroke);
+                continue;
+            }
+            // Break the wire into pieces joined by small arcs over each
+            // wire it crosses.
+            let y = w.a.y as f32;
+            let dir = if w.b.x >= w.a.x { 1.0 } else { -1.0 };
+            over.sort_by(|a, b| (a * dir).total_cmp(&(b * dir)));
+            let mut from = w.a.x as f32;
+            for at in over {
+                painter.line_segment(
+                    [
+                        p.screen(pos2(from, y)),
+                        p.screen(pos2(at - dir * HOP_RADIUS, y)),
+                    ],
+                    stroke,
+                );
+                let arc: Vec<Pos2> = (0..=12)
+                    .map(|i| {
+                        let t = std::f32::consts::PI * i as f32 / 12.0;
+                        p.screen(pos2(
+                            at - dir * HOP_RADIUS * t.cos(),
+                            y - HOP_RADIUS * t.sin(),
+                        ))
+                    })
+                    .collect();
+                painter.add(Shape::line(arc, stroke));
+                from = at + dir * HOP_RADIUS;
+            }
+            painter.line_segment([p.screen(pos2(from, y)), p.screen(to_pos(w.b))], stroke);
         }
         for j in junctions(s) {
             painter.circle_filled(
@@ -1677,6 +1748,42 @@ impl Canvas {
 mod tests {
     use super::*;
     use crate::examples::voltage_divider;
+
+    #[test]
+    fn unconnected_crossings_get_a_hop_and_connected_ones_do_not() {
+        let mut s = Schematic::new();
+        let h = s.add_wire(Point::new(0, 0), Point::new(10, 0));
+        s.add_wire(Point::new(5, -4), Point::new(5, 4));
+        s.add_wire(Point::new(8, -4), Point::new(8, 4));
+        // Two vertical wires cross the horizontal one: two hops.
+        assert_eq!(hops(&s), vec![(h, Point::new(5, 0)), (h, Point::new(8, 0))]);
+        // A junction part on the first crossing connects it: no hop there.
+        s.add_component(ComponentKind::Junction, Point::new(5, 0));
+        assert_eq!(hops(&s), vec![(h, Point::new(8, 0))]);
+        // A wire ending on the second one (a four-way meeting) connects it too.
+        s.add_wire(Point::new(8, 0), Point::new(8, 2));
+        assert!(hops(&s).is_empty());
+    }
+
+    #[test]
+    fn a_junction_on_a_wire_can_be_clicked() {
+        let mut s = Schematic::new();
+        let w = s.add_wire(Point::new(0, 0), Point::new(10, 0));
+        let j = s.add_component(ComponentKind::Junction, Point::new(5, 0));
+        assert_eq!(hit_test(&s, pos2(5.1, 0.1)), Some(Item::Component(j)));
+        assert_eq!(hit_test(&s, pos2(2.0, 0.0)), Some(Item::Wire(w)));
+        // Clicking it selects it rather than starting a wire.
+        assert_eq!(pin_at(&s, pos2(5.0, 0.0)), None);
+    }
+
+    #[test]
+    fn wires_that_only_meet_at_ends_or_in_a_t_have_no_hop() {
+        let mut s = Schematic::new();
+        s.add_wire(Point::new(0, 0), Point::new(10, 0));
+        s.add_wire(Point::new(5, 0), Point::new(5, 4)); // a T
+        s.add_wire(Point::new(10, 0), Point::new(10, 4)); // a corner
+        assert!(hops(&s).is_empty());
+    }
 
     #[test]
     fn toggling_flips_every_kind_of_switch() {

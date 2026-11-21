@@ -101,7 +101,7 @@ impl Properties {
             .num_columns(2)
             .spacing([8.0, 6.0])
             .show(ui, |ui| {
-                if !matches!(c.kind, ComponentKind::Ground)
+                if !matches!(c.kind, ComponentKind::Ground | ComponentKind::Junction)
                     && let Some(d) =
                         self.text_field(ui, &key(id, "des"), "Designator", &c.designator)
                 {
@@ -120,7 +120,7 @@ impl Properties {
                 // along with the firmware change.
                 let mut new_source: Option<String> = None;
                 let changed = match &mut k {
-                    ComponentKind::Ground => false,
+                    ComponentKind::Ground | ComponentKind::Junction => false,
                     ComponentKind::Resistor { resistance } => {
                         self.value(ui, id, "Resistance", "Ω", resistance)
                     }
@@ -752,6 +752,7 @@ fn parse_pwl(text: &str) -> Option<Vec<(f64, f64)>> {
 pub fn kind_name(kind: &ComponentKind) -> &'static str {
     match kind {
         ComponentKind::Ground => "Ground",
+        ComponentKind::Junction => "Junction",
         ComponentKind::Resistor { .. } => "Resistor",
         ComponentKind::Capacitor { .. } => "Capacitor",
         ComponentKind::Inductor { .. } => "Inductor",

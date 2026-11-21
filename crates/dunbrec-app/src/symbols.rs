@@ -99,6 +99,16 @@ fn changeover_pole(prims: &mut Vec<Prim>, y: f32, up: f32, down: f32, thrown: bo
     y + (tip_y - y) * 0.53
 }
 
+/// A regular polygon close enough to a circle to fill as a dot.
+fn dot_points(x: f32, y: f32, radius: f32) -> Vec<(f32, f32)> {
+    (0..12)
+        .map(|i| {
+            let a = std::f32::consts::TAU * i as f32 / 12.0;
+            (x + radius * a.cos(), y + radius * a.sin())
+        })
+        .collect()
+}
+
 fn resistor_body(prims: &mut Vec<Prim>) {
     prims.push(line(&[(-2.0, 0.0), (-1.2, 0.0)]));
     prims.push(line(&[(1.2, 0.0), (2.0, 0.0)]));
@@ -225,6 +235,12 @@ pub fn symbol_styled(kind: &ComponentKind, zener: bool) -> Symbol {
             p.push(line(&[(-0.5, 0.9), (0.5, 0.9)]));
             p.push(line(&[(-0.2, 1.2), (0.2, 1.2)]));
             label = pos2(1.0, 0.6);
+        }
+        ComponentKind::Junction => {
+            // A dot. The zero-length line is the lead that ends on the pin.
+            p.push(line(&[(0.0, 0.0), (0.0, 0.0)]));
+            p.push(filled(&dot_points(0.0, 0.0, 0.22)));
+            label = pos2(0.0, -0.8);
         }
         ComponentKind::Resistor { .. } => resistor_body(&mut p),
         ComponentKind::Potentiometer { .. } => {
