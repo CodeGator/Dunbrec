@@ -255,14 +255,14 @@ pub fn palette() -> &'static [PaletteEntry] {
         },
         PaletteEntry {
             name: "741 op-amp",
-            group: "Integrated circuits",
+            group: "Linear",
             make: || ComponentKind::OpAmp {
                 part: "uA741".into(),
             },
         },
         PaletteEntry {
             name: "555 timer",
-            group: "Integrated circuits",
+            group: "Linear",
             make: || ComponentKind::Timer555,
         },
         PaletteEntry {
@@ -509,6 +509,20 @@ mod tests {
         let transistors = &all.iter().find(|(g, _)| *g == "Transistors").unwrap().1;
         let position = |n: &str| transistors.iter().position(|e| e.name == n).unwrap();
         assert!(position("NPN transistor") < position("2N3904 NPN"));
+    }
+
+    #[test]
+    fn chips_are_either_linear_or_digital() {
+        let all = palette_groups("");
+        let group_of = |part: &str| {
+            all.iter()
+                .find(|(_, entries)| entries.iter().any(|e| e.name == part))
+                .map(|(g, _)| *g)
+        };
+        assert_eq!(group_of("741 op-amp"), Some("Linear"));
+        assert_eq!(group_of("555 timer"), Some("Linear"));
+        assert_eq!(group_of("AND gate"), Some("Digital"));
+        assert!(all.iter().all(|(g, _)| *g != "Integrated circuits"));
     }
 
     #[test]

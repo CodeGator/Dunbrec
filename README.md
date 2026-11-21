@@ -81,7 +81,7 @@ through 50 Ω with a 5 ns edge, inputs switch at 3.5 V rising and 1.5 V falling.
 drive a capacitor, an analog signal can clock a counter, and the scope works on any net. Try
 File → Open example → Logic gates or Binary counter (run with Speed at real time).
 
-**Integrated circuits.** The palette's *Integrated circuits* group has two classic chips:
+**Linear integrated circuits.** The palette's *Linear* group has two classic chips:
 
 - **741 op-amp** — the standard Boyle macromodel of the uA741 (as in the PSpice library):
   two input transistors, about 200 000 open-loop gain, 1 MHz gain-bandwidth, 0.5 V/µs slew
