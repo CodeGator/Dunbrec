@@ -24,8 +24,10 @@
 
 pub mod asm;
 mod avr;
+pub mod disasm;
 pub mod firmware;
 pub mod hex;
+pub mod isa;
 mod periph;
 pub mod programs;
 
