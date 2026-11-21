@@ -1,13 +1,14 @@
 //! Microcontroller co-simulation tests: real firmware driving and reading
 //! analog circuits.
 
-use dunbrec_core::{ComponentKind as K, ModelLibrary, NetlistBuilder, Waveform};
+use dunbrec_core::{ComponentKind as K, ModelLibrary, NetlistBuilder, NodeId, Waveform};
 use dunbrec_mcu::asm::{Asm, io, mem};
 
 use crate::mcu::{MCU_R_OUT, MCU_R_PULLUP};
 use crate::transient::run;
 use crate::{
-    Circuit, SimError, Transient, TransientOptions, TransientResult, operating_point, transient,
+    Circuit, HaltReason, McuHalt, SimError, Transient, TransientOptions, TransientResult,
+    operating_point, transient,
 };
 
 fn r(ohms: f64) -> K {
@@ -317,4 +318,136 @@ fn live_edits_of_the_mcu_need_a_restart() {
     let mut r1 = netlist.elements[0].clone();
     r1.kind = r(2e3);
     assert!(sim.update_element(0, &r1, &models).unwrap());
+}
+
+// ---------------------------------------------------------- debugging ---
+
+/// Step the simulation until a microcontroller halts for the debugger.
+fn until_halt(sim: &mut Transient) -> (McuHalt, f64) {
+    for _ in 0..200_000 {
+        sim.step().unwrap().expect("simulation finished");
+        if let Some(halt) = sim.take_mcu_halt() {
+            return (halt, sim.time());
+        }
+    }
+    panic!("no halt");
+}
+
+fn node_index(sim: &Transient, name: &str) -> usize {
+    (0..sim.circuit().node_count())
+        .find(|&i| sim.circuit().node_name(NodeId(i)) == name)
+        .unwrap()
+}
+
+/// D13 high for four cycles of an eight-cycle loop.
+fn blinker() -> Asm {
+    let mut a = Asm::new();
+    a.sbi(io::DDRB, 5);
+    a.label("loop");
+    a.sbi(io::PORTB, 5).nop().nop();
+    a.label("late");
+    a.cbi(io::PORTB, 5).rjmp("loop");
+    a
+}
+
+#[test]
+fn a_breakpoint_halts_the_whole_simulation_at_its_exact_time() {
+    let a = blinker();
+    let late = a.label_address("late").unwrap();
+    let circuit = circuit_with_program(NetlistBuilder::new(), &a, "bp");
+    let mut sim = Transient::new(circuit, TransientOptions::free_running(1e-6)).unwrap();
+    sim.set_breakpoints(0, &[late]);
+
+    let (halt, t) = until_halt(&mut sim);
+    assert_eq!(
+        halt,
+        McuHalt {
+            part: 0,
+            reason: HaltReason::Breakpoint
+        }
+    );
+    let snap = sim.mcu_snapshot(0).unwrap();
+    assert_eq!(snap.pc, late, "stopped before the breakpoint's instruction");
+    // SBI DDRB (2) + SBI PORTB (2) + two NOPs: cycle 6. The simulated time
+    // is that cycle, to within half a cycle.
+    assert_eq!(snap.cycle, 6);
+    assert!((t - 6.0 / 16e6).abs() < 0.5 / 16e6, "t = {t}");
+    // The circuit is at the same moment: D13 has been high for two cycles.
+    let d13 = node_index(&sim, "D13");
+    assert!(sim.sample().voltages[d13] > 4.9);
+
+    // Resuming runs on to the next pass: one loop of 8 cycles later.
+    let (halt, t2) = until_halt(&mut sim);
+    assert_eq!(halt.reason, HaltReason::Breakpoint);
+    assert!((t2 - t - 8.0 / 16e6).abs() < 1e-9, "{}", t2 - t);
+    assert_eq!(sim.mcu_snapshot(0).unwrap().pc, late);
+    assert!(sim.sample().voltages[d13] > 4.9);
+}
+
+#[test]
+fn single_steps_advance_the_chip_and_the_circuit_together() {
+    let a = blinker();
+    let circuit = circuit_with_program(NetlistBuilder::new(), &a, "step");
+    let mut sim = Transient::new(circuit, TransientOptions::free_running(1e-6)).unwrap();
+    // Cost of each instruction in turn: SBI 2, SBI 2, NOP 1, NOP 1, CBI 2,
+    // RJMP 2, then round again: SBI 2, NOP 1.
+    let mut cycle = 0u64;
+    for (n, cost) in [2u64, 2, 1, 1, 2, 2, 2, 1].into_iter().enumerate() {
+        sim.step_mcu(0);
+        let (halt, t) = until_halt(&mut sim);
+        assert_eq!(halt.reason, HaltReason::Stepped, "step {n}");
+        cycle += cost;
+        let snap = sim.mcu_snapshot(0).unwrap();
+        assert_eq!(snap.cycle, cycle, "step {n}");
+        assert!(
+            (t - cycle as f64 / 16e6).abs() < 0.5 / 16e6,
+            "step {n}: t = {t}"
+        );
+    }
+}
+
+#[test]
+fn an_input_edge_during_a_step_does_not_make_it_run_two_instructions() {
+    // Twenty two-cycle instructions (125 ns each) while D2 rises at various
+    // moments. Three cases: the edge lands in the first instruction's first
+    // half (the step's result is adopted at once), exactly at an instruction
+    // boundary (nothing to replay), and in the second half of the second
+    // instruction, where the chip must be replayed over the instruction in
+    // flight to reach the edge. Every step must still be exactly one
+    // instruction.
+    for edge in [100e-9, 130e-9, 170e-9] {
+        let mut a = Asm::new();
+        for _ in 0..20 {
+            a.sbiw(24, 1);
+        }
+        a.label("end").rjmp("end");
+        let b = NetlistBuilder::new().element(
+            "V1",
+            K::VoltageSource {
+                waveform: Waveform::Pulse {
+                    v1: 0.0,
+                    v2: 5.0,
+                    delay: edge,
+                    rise: 1e-9,
+                    fall: 1e-9,
+                    width: 1.0,
+                    period: 0.0,
+                },
+            },
+            &["D2", "0"],
+        );
+        let circuit = circuit_with_program(b, &a, "edge");
+        let mut sim = Transient::new(circuit, TransientOptions::free_running(1e-6)).unwrap();
+        for n in 1..=10u64 {
+            sim.step_mcu(0);
+            let (halt, _) = until_halt(&mut sim);
+            assert_eq!(halt.reason, HaltReason::Stepped);
+            let snap = sim.mcu_snapshot(0).unwrap();
+            assert_eq!(
+                (snap.pc as u64, snap.cycle),
+                (n, 2 * n),
+                "edge at {edge}, step {n}"
+            );
+        }
+    }
 }

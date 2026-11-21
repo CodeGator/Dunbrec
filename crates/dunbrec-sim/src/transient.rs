@@ -27,7 +27,7 @@ use crate::dc::OperatingPoint;
 use crate::device::{Integration, StampContext, Tolerances};
 use crate::digital::{CMOS_5V, DigitalSystem, Logic, settle_dc};
 use crate::error::SimError;
-use crate::mcu::{MCU_VIH, MCU_VIL, McuSystem, SerialByte};
+use crate::mcu::{MCU_VIH, MCU_VIL, McuHalt, McuInfo, McuSystem, SerialByte};
 use crate::newton::{TRANSIENT_MAX_ITERATIONS, Workspace, dc_solve, newton};
 use crate::stamp::{SolutionView, node_rows};
 
@@ -413,6 +413,42 @@ impl Transient {
         }
         let span = self.h_max.clamp(MCU_HORIZON.0, MCU_HORIZON.1);
         m.run_ahead(self.time + span);
+    }
+
+    /// The microcontrollers, in the order the debugger methods index them.
+    pub fn mcu_parts(&self) -> Vec<McuInfo> {
+        self.mcu.as_ref().map(|m| m.infos()).unwrap_or_default()
+    }
+
+    /// Stop microcontroller `part` before the instructions at these word
+    /// addresses (replacing its previous breakpoints).
+    pub fn set_breakpoints(&mut self, part: usize, words: &[usize]) {
+        if let Some(m) = &mut self.mcu {
+            m.set_breakpoints(part, words);
+        }
+        self.run_mcu();
+    }
+
+    /// Run microcontroller `part` for exactly one instruction. Keep calling
+    /// [`step`](Self::step) until [`take_mcu_halt`](Self::take_mcu_halt)
+    /// reports it.
+    pub fn step_mcu(&mut self, part: usize) {
+        if let Some(m) = &mut self.mcu {
+            m.request_step(part);
+        }
+        self.run_mcu();
+    }
+
+    /// Committed state of microcontroller `part`.
+    pub fn mcu_snapshot(&self, part: usize) -> Option<dunbrec_mcu::CpuSnapshot> {
+        self.mcu.as_ref().and_then(|m| m.snapshot(part))
+    }
+
+    /// A microcontroller that stopped at a breakpoint or finished a step,
+    /// if one did since the last call. Simulated time is exactly the time
+    /// of that stop.
+    pub fn take_mcu_halt(&mut self) -> Option<McuHalt> {
+        self.mcu.as_mut().and_then(|m| m.take_halt())
     }
 
     /// Bytes sent on microcontroller serial ports since the last call.

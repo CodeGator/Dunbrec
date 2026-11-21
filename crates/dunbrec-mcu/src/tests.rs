@@ -606,12 +606,13 @@ fn stepping_runs_exactly_one_instruction() {
     assert_eq!(step(&mut c), Stop::Stepped);
     assert_eq!((c.pc(), c.cycle()), (3, 5));
 
-    // A step stops at a breakpoint without running anything.
+    // A step runs the instruction at the program counter even on a
+    // breakpoint (stepping off one must not stall)...
     c.set_breakpoints(&[3]);
-    assert_eq!(step(&mut c), Stop::Breakpoint);
-    assert_eq!(c.cycle(), 5);
-    // And the next step runs it.
     assert_eq!(step(&mut c), Stop::Stepped);
+    assert_eq!(c.cycle(), 7);
+    // ...but arriving at one by running stops before it.
+    assert_eq!(c.run(100), Stop::Breakpoint);
     assert_eq!(c.cycle(), 7);
 }
 

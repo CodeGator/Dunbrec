@@ -669,6 +669,10 @@ impl DunbrecApp {
                     }
                 }
                 Event::NeedsRestart => restart = true,
+                // A breakpoint or step paused the simulation. The debugger
+                // window (phase A4) will show the snapshot.
+                Event::Halted { .. } => live.paused = true,
+                Event::McuState { .. } => {}
                 Event::Error(e) => error = Some(e),
             }
         }

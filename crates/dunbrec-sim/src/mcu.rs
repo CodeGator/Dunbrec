@@ -22,7 +22,7 @@ use std::cell::Cell;
 use std::path::Path;
 
 use dunbrec_core::{ComponentKind, NodeId};
-use dunbrec_mcu::{Atmega328p, PIN_COUNT, PinDrive, Stop};
+use dunbrec_mcu::{Atmega328p, CpuSnapshot, PIN_COUNT, PinDrive, Stop};
 
 use crate::ac::{AcContext, AcStamper};
 use crate::device::{Device, Mode, StampContext};
@@ -155,14 +155,55 @@ pub struct SerialByte {
     pub byte: u8,
 }
 
+/// Why a microcontroller stopped the simulation for the debugger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HaltReason {
+    /// The next instruction is at a breakpoint and has not run.
+    Breakpoint,
+    /// A requested single step finished.
+    Stepped,
+}
+
+/// A microcontroller that stopped the simulation for the debugger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct McuHalt {
+    /// Which microcontroller (an index into [`McuSystem::infos`]).
+    pub part: usize,
+    pub reason: HaltReason,
+}
+
+/// A microcontroller of the circuit, as debugger commands address it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McuInfo {
+    pub part: usize,
+    /// Index of the part in the netlist.
+    pub element: usize,
+    pub designator: String,
+}
+
+/// A chip run ahead of the circuit to its next event.
+#[derive(Debug, Clone)]
+struct Ahead {
+    chip: Atmega328p,
+    /// Why it stopped.
+    stop: Stop,
+    /// It was started as a single step.
+    step: bool,
+}
+
 #[derive(Debug, Clone)]
 struct Part {
     spec: McuSpec,
     clock: f64,
     /// State at the last committed point.
     chip: Atmega328p,
-    /// Speculative copy run to its next event, and why it stopped.
-    ahead: Option<(Atmega328p, Stop)>,
+    /// Speculative copy run to its next event.
+    ahead: Option<Ahead>,
+    /// A single step requested at this cycle that has not finished yet.
+    step: Option<u64>,
+    /// Why this chip last stopped the simulation for the debugger, until
+    /// it is taken.
+    halt: Option<HaltReason>,
     /// Drive each pin's device currently has.
     applied: [PinDrive; PIN_COUNT],
 }
@@ -191,13 +232,22 @@ impl Part {
         }
     }
 
-    /// Adopt the speculative copy if it has reached `cycle`.
+    /// Adopt the speculative copy if it has reached `cycle`. A breakpoint
+    /// stop or a finished step is recorded as a halt for the debugger.
     fn adopt_if_due(&mut self, cycle: u64, voltage: &dyn Fn(NodeId) -> f64) -> bool {
         match &self.ahead {
-            Some((a, _)) if a.cycle() <= cycle => {
-                let (a, stop) = self.ahead.take().expect("checked");
-                self.chip = a;
+            Some(a) if a.chip.cycle() <= cycle => {
+                let Ahead { chip, stop, step } = self.ahead.take().expect("checked");
+                self.chip = chip;
                 self.handle(stop, voltage);
+                if stop == Stop::Breakpoint {
+                    self.halt = Some(HaltReason::Breakpoint);
+                } else if step && stop != Stop::Reached {
+                    // `Reached` instead means the chip slept through the
+                    // whole horizon without running an instruction.
+                    self.step = None;
+                    self.halt = Some(HaltReason::Stepped);
+                }
                 true
             }
             _ => false,
@@ -245,6 +295,8 @@ impl McuSystem {
                     applied: chip.pin_drives(),
                     chip,
                     ahead: None,
+                    step: None,
+                    halt: None,
                 })
             })
             .collect::<Result<Vec<_>, SimError>>()?;
@@ -299,10 +351,15 @@ impl McuSystem {
     pub fn run_ahead(&mut self, horizon: f64) {
         for part in &mut self.parts {
             if part.ahead.is_none() {
-                let mut a = part.chip.clone();
-                let target = part.cycle_at(horizon).max(a.cycle() + 1);
-                let stop = a.run(target);
-                part.ahead = Some((a, stop));
+                let mut chip = part.chip.clone();
+                let target = part.cycle_at(horizon).max(chip.cycle() + 1);
+                let step = part.step.is_some();
+                let stop = if step {
+                    chip.step_instruction(target)
+                } else {
+                    chip.run(target)
+                };
+                part.ahead = Some(Ahead { chip, stop, step });
             }
         }
     }
@@ -313,8 +370,8 @@ impl McuSystem {
         self.parts
             .iter()
             .filter_map(|p| {
-                let (a, stop) = p.ahead.as_ref()?;
-                Some((p.time_of(a.cycle()), *stop == Stop::Pins))
+                let a = p.ahead.as_ref()?;
+                Some((p.time_of(a.chip.cycle()), a.stop == Stop::Pins))
             })
             .min_by(|a, b| a.0.total_cmp(&b.0))
     }
@@ -354,9 +411,63 @@ impl McuSystem {
         p.run_to(cycle, voltage);
         p.chip.set_input(pin, high);
         p.ahead = None;
+        // Replaying up to the crossing ran whole instructions, so a step
+        // requested before it is already done (it must not run one more).
+        if let Some(from) = p.step
+            && p.chip.cycle() > from
+        {
+            p.step = None;
+            p.halt = Some(HaltReason::Stepped);
+        }
         let changes = p.changes();
         self.collect_serial();
         changes
+    }
+
+    // ----------------------------------------------------- debugging ---
+
+    /// The microcontrollers, in the order debugger commands index them.
+    pub fn infos(&self) -> Vec<McuInfo> {
+        self.parts
+            .iter()
+            .enumerate()
+            .map(|(part, p)| McuInfo {
+                part,
+                element: p.spec.element,
+                designator: p.spec.designator.clone(),
+            })
+            .collect()
+    }
+
+    /// Stop `part` before the instructions at these word addresses.
+    pub fn set_breakpoints(&mut self, part: usize, words: &[usize]) {
+        if let Some(p) = self.parts.get_mut(part) {
+            p.chip.set_breakpoints(words);
+            // The speculative copy ran under the old set.
+            p.ahead = None;
+        }
+    }
+
+    /// Run `part` for exactly one instruction, then halt.
+    pub fn request_step(&mut self, part: usize) {
+        if let Some(p) = self.parts.get_mut(part) {
+            p.step = Some(p.chip.cycle());
+            p.ahead = None;
+        }
+    }
+
+    /// The committed state of `part`: what the circuit has seen so far,
+    /// never the speculative run-ahead.
+    pub fn snapshot(&self, part: usize) -> Option<CpuSnapshot> {
+        self.parts.get(part).map(|p| p.chip.snapshot())
+    }
+
+    /// The first pending halt, if any chip stopped for the debugger.
+    pub fn take_halt(&mut self) -> Option<McuHalt> {
+        self.parts
+            .iter_mut()
+            .enumerate()
+            .find_map(|(part, p)| p.halt.take().map(|reason| McuHalt { part, reason }))
     }
 
     fn collect_serial(&mut self) {

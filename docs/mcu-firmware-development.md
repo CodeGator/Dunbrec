@@ -8,8 +8,8 @@ order.*
 | Step | Status |
 |---|---|
 | A2 emulator debug API | **Done** (2026-11-21, uncommitted until the user says so): `Atmega328p::set_breakpoints`, `Stop::Breakpoint`, `step_instruction(until)` with `Stop::Stepped`, `snapshot() -> CpuSnapshot`, public `sp`, `data`, `flash`; `Asm::label_address`. Tests in `dunbrec-mcu/src/tests.rs` (section "debugging"), including a breakpoint stopping before an instruction without losing the "instruction after SEI runs before an interrupt" rule. |
-| A3 simulation integration | **Next.** Breakpoints and single-step through `McuSystem` / `Transient` / `live.rs` (see "Pause and step semantics"). Tests first, before any UI. |
-| A1 disassembler, A4 debugger window, A5 docs | Not started. A1 does not depend on A3 and can be done any time. |
+| A3 simulation integration | **Done** (2026-11-21, uncommitted until the user says so). `McuSystem`/`Transient`: `set_breakpoints`, `step_mcu`, `mcu_snapshot`, `take_mcu_halt`, `mcu_parts`; halts are recorded when the run-ahead copy is adopted, so simulated time is exactly the stop's cycle time. Worker (`live.rs`): `Command::{SetBreakpoints, Step, Snapshot}`, `Event::{Halted, McuState}`, `LiveSim::start_debug(.., DebugSetup { breakpoints, start_paused })`, `LiveSim::mcus`. A halt pauses the worker; a step is an unpaced burst until its halt. Tests: `dunbrec-sim/src/mcu_tests.rs` ("debugging") and `live.rs`. The new commands, events and `mcus` carry a temporary `#[allow(dead_code)]` until A4 consumes them. |
+| A1 disassembler, A4 debugger window, A5 docs | Not started. **Next: A1 then A4.** A4 consumes the A3 events and removes the `allow(dead_code)` markers. |
 | Phases B, C, D | Not started. |
 
 Debug API contract (A2), for whoever builds A3:
@@ -24,6 +24,23 @@ Debug API contract (A2), for whoever builds A3:
   and `AdcSample` all mean it ran (the last two mean the circuit must hear about it);
   `Breakpoint` means nothing ran.
 - Stopping at a breakpoint preserves the one-instruction interrupt delay after `SEI`/`RETI`.
+- **A3 changed one A2 rule:** `step_instruction` now runs the instruction at the program counter
+  even if a breakpoint is set there (stepping off a breakpoint must not stall); it never
+  returns `Breakpoint`. Arriving at a breakpoint by `run` still stops before it.
+
+A3 contract, for whoever builds A4:
+
+- `Transient` has no pause of its own; the worker pauses by not calling `step()`. A halt is
+  just a flag (`take_mcu_halt`) that the worker turns into a pause and an `Event::Halted`.
+- The snapshot is of the **committed** chip (what the circuit has seen), never the run-ahead
+  copy. A pin change at the halt's exact time has not yet reached the analog voltage (its edge
+  starts at that moment), so the circuit reads as it did an instant before.
+- A step requested before an input edge arrives never runs two instructions: replaying the
+  chip to the edge counts as the step (`McuSystem::input_event`). A test checks it.
+- Breakpoints live in the chip, so they are lost on Restart: send them again, or pass them in
+  `DebugSetup` (applied before the first step; also how to catch the very first instruction).
+- `Command::Step` on a sleeping chip waits for an interrupt to wake it, up to `STEP_LIMIT`
+  simulation steps, then reports an error.
 
 ## Goal
 

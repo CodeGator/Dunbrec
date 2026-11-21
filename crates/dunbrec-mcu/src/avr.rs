@@ -314,11 +314,13 @@ impl Atmega328p {
     }
 
     /// Execute one instruction (or interrupt entry), unless cycle `until`
-    /// comes first. The instruction has run when this returns
-    /// [`Stop::Stepped`], `Pins` or `AdcSample` (the last two mean the
-    /// outside world must hear about it); with [`Stop::Breakpoint`] nothing
-    /// ran.
+    /// comes first. It runs the instruction at the program counter even if a
+    /// breakpoint is set there. [`Stop::Stepped`], `Pins` and `AdcSample` all
+    /// mean the instruction ran (the last two mean the outside world must
+    /// hear about it); `Reached` means `until` came first (a sleeping chip
+    /// runs nothing).
     pub fn step_instruction(&mut self, until: u64) -> Stop {
+        self.armed = false;
         self.run_for(until, 1)
     }
 
