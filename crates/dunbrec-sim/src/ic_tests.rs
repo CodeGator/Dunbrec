@@ -359,3 +359,154 @@ fn ne555_reset_holds_output_low() {
         "output moved while reset"
     );
 }
+
+// ---------------------------------------------------------- CD4066B ---
+
+/// A CD4066B on a `vdd` supply (VSS at ground), with 5 V
+/// applied to one signal pin of switch A through 1 Ω, a 10 kΩ load on
+/// the other, and control A at `ctrl_a`. Switch B is fed 5 V and loaded
+/// the same way, with control B at `ctrl_b`. Returns the settled voltages
+/// at the loads of A and B.
+fn cd4066_run(vdd: f64, ctrl_a: f64, ctrl_b: f64, r_on: f64, reversed: bool) -> (f64, f64) {
+    // Pins: A1 A2 B2 B1 CB CC VSS C1 C2 D2 D1 CD CA VDD.
+    let (a_in, a_out) = if reversed { ("a2", "a1") } else { ("a1", "a2") };
+    let netlist = NetlistBuilder::new()
+        .element("VDD", K::VoltageSource { waveform: dc(vdd) }, &["vdd", "0"])
+        .element("VIN", K::VoltageSource { waveform: dc(5.0) }, &["sig", "0"])
+        .element(
+            "VCA",
+            K::VoltageSource {
+                waveform: dc(ctrl_a),
+            },
+            &["ca", "0"],
+        )
+        .element(
+            "VCB",
+            K::VoltageSource {
+                waveform: dc(ctrl_b),
+            },
+            &["cb", "0"],
+        )
+        .element("RA", r(1.0), &["sig", a_in])
+        .element("RB", r(1.0), &["sig", "b1"])
+        .element("RLA", r(10e3), &[a_out, "0"])
+        .element("RLB", r(10e3), &["b2", "0"])
+        .element(
+            "U1",
+            K::Cd4066 { r_on },
+            &[
+                "a1", "a2", "b2", "b1", "cb", "0", "0", "c1", "c2", "d2", "d1", "0", "ca", "vdd",
+            ],
+        )
+        .element("RC1", r(1e6), &["c1", "0"])
+        .element("RC2", r(1e6), &["c2", "0"])
+        .element("RD1", r(1e6), &["d1", "0"])
+        .element("RD2", r(1e6), &["d2", "0"])
+        .build();
+    let circuit = Circuit::from_netlist(&netlist, &ModelLibrary::new()).unwrap();
+    let res = transient(circuit, TransientOptions::new(500e-9)).unwrap();
+    let last = |node: &str| *res.voltage(node).unwrap().last().unwrap();
+    (last(a_out), last("b2"))
+}
+
+#[test]
+fn cd4066_passes_the_signal_when_its_control_is_high() {
+    let (a_on, _) = cd4066_run(10.0, 10.0, 0.0, 180.0, false);
+    // 5 V through 180 Ω + 1 Ω into 10 kΩ.
+    let expected = 5.0 * 10e3 / (10e3 + 181.0);
+    assert!(
+        (a_on - expected).abs() < 5e-3,
+        "on: {a_on} V, wanted {expected}"
+    );
+    let (a_off, _) = cd4066_run(10.0, 0.0, 0.0, 180.0, false);
+    assert!(a_off.abs() < 1e-3, "off: {a_off} V");
+}
+
+#[test]
+fn cd4066_switches_work_both_ways_and_independently() {
+    // Signal in at A2 and out at A1 passes as well.
+    let (a, _) = cd4066_run(10.0, 10.0, 0.0, 180.0, true);
+    assert!(a > 4.8, "reversed: {a} V");
+    // Switch A on, B off, and the other way round.
+    let (a, b) = cd4066_run(10.0, 10.0, 0.0, 180.0, false);
+    assert!(a > 4.8 && b.abs() < 1e-3, "A on, B off: {a} V, {b} V");
+    let (a, b) = cd4066_run(10.0, 0.0, 10.0, 180.0, false);
+    assert!(a.abs() < 1e-3 && b > 4.8, "A off, B on: {a} V, {b} V");
+}
+
+#[test]
+fn cd4066_control_threshold_is_half_the_supply() {
+    for (vdd, below, above) in [(5.0, 2.0, 3.0), (10.0, 4.0, 6.0), (15.0, 7.0, 8.0)] {
+        let (low, _) = cd4066_run(vdd, below, 0.0, 180.0, false);
+        let (high, _) = cd4066_run(vdd, above, 0.0, 180.0, false);
+        assert!(
+            low < 0.1,
+            "VDD {vdd}: control at {below} V should be off, got {low} V"
+        );
+        assert!(
+            high > 4.8,
+            "VDD {vdd}: control at {above} V should be on, got {high} V"
+        );
+    }
+}
+
+#[test]
+fn cd4066_on_resistance_is_a_property() {
+    // 5 V into the 10 kΩ load through 1 kΩ of switch.
+    let (v, _) = cd4066_run(10.0, 10.0, 0.0, 1e3, false);
+    let expected = 5.0 * 10e3 / (10e3 + 1e3 + 1.0);
+    assert!((v - expected).abs() < 5e-3, "{v} V, wanted {expected}");
+}
+
+#[test]
+fn cd4066_follows_a_control_signal_while_running() {
+    // A 1 kHz square wave on control A gates a DC level into the load.
+    let netlist = NetlistBuilder::new()
+        .element(
+            "VDD",
+            K::VoltageSource { waveform: dc(10.0) },
+            &["vdd", "0"],
+        )
+        .element("VIN", K::VoltageSource { waveform: dc(5.0) }, &["a1", "0"])
+        .element(
+            "VCA",
+            K::VoltageSource {
+                waveform: Waveform::Pulse {
+                    v1: 0.0,
+                    v2: 10.0,
+                    delay: 0.0,
+                    rise: 1e-7,
+                    fall: 1e-7,
+                    width: 0.5e-3,
+                    period: 1e-3,
+                },
+            },
+            &["ca", "0"],
+        )
+        .element("RL", r(10e3), &["a2", "0"])
+        .element(
+            "U1",
+            K::Cd4066 { r_on: 180.0 },
+            &[
+                "a1", "a2", "b2", "b1", "0", "0", "0", "c1", "c2", "d2", "d1", "0", "ca", "vdd",
+            ],
+        )
+        .element("RB1", r(1e6), &["b1", "0"])
+        .element("RB2", r(1e6), &["b2", "0"])
+        .element("RC1", r(1e6), &["c1", "0"])
+        .element("RC2", r(1e6), &["c2", "0"])
+        .element("RD1", r(1e6), &["d1", "0"])
+        .element("RD2", r(1e6), &["d2", "0"])
+        .build();
+    let circuit = Circuit::from_netlist(&netlist, &ModelLibrary::new()).unwrap();
+    let res = transient(circuit, TransientOptions::new(3e-3)).unwrap();
+    let out = res.voltage("a2").unwrap();
+    // High for the first half-millisecond of each period, low for the rest.
+    for k in 0..3 {
+        let t = k as f64 * 1e-3;
+        let on = res.at(out, t + 0.25e-3);
+        let off = res.at(out, t + 0.75e-3);
+        assert!(on > 4.8, "period {k}: on at {on} V");
+        assert!(off < 0.2, "period {k}: off at {off} V");
+    }
+}

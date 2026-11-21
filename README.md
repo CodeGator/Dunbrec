@@ -81,7 +81,7 @@ through 50 Ω with a 5 ns edge, inputs switch at 3.5 V rising and 1.5 V falling.
 drive a capacitor, an analog signal can clock a counter, and the scope works on any net. Try
 File → Open example → Logic gates or Binary counter (run with Speed at real time).
 
-**Linear integrated circuits.** The palette's *Linear* group has two classic chips:
+**Linear integrated circuits.** The palette's *Linear* group has three classic chips:
 
 - **741 op-amp** — the standard Boyle macromodel of the uA741 (as in the PSpice library):
   two input transistors, about 200 000 open-loop gain, 1 MHz gain-bandwidth, 0.5 V/µs slew
@@ -92,6 +92,13 @@ File → Open example → Logic gates or Binary counter (run with Speed at real 
   1/3 VCC and low when THR rises above CTRL, DIS shorts to GND while the output is low, and
   RESET below 0.7 V forces the output low. Astable and monostable circuits time to the usual
   formulas.
+- **CD4066 analog switch** — the CD4066B quad bilateral switch, in package pin order. Each of
+  its four switches passes a signal either way between its two pins while its control pin is
+  above half of VDD, and blocks it below (with a little hysteresis and a delay of tens of
+  nanoseconds); signals must stay between VSS and VDD. The on resistance is a property: the
+  data sheet's typical 470 Ω at 5 V, 180 Ω at 10 V and 125 Ω at 15 V, which it does not
+  follow automatically, so set it to match your supply (default 180 Ω). Changing it while
+  running restarts the simulation. Not exportable to SPICE. Tie unused controls to VSS.
 
 Try File → Open example → Op-amp inverting amplifier, 555 LED blinker or 555 one-shot (run the
 555 examples at real-time speed). Each chip is a *composite part*: one symbol that simulates as

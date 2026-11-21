@@ -266,6 +266,13 @@ pub fn palette() -> &'static [PaletteEntry] {
             make: || ComponentKind::Timer555,
         },
         PaletteEntry {
+            name: "CD4066 analog switch",
+            group: "Linear",
+            make: || ComponentKind::Cd4066 {
+                r_on: dunbrec_core::CD4066_DEFAULT_R_ON,
+            },
+        },
+        PaletteEntry {
             name: "AND gate",
             group: "Digital",
             make: || ComponentKind::Gate {
@@ -521,6 +528,7 @@ mod tests {
         };
         assert_eq!(group_of("741 op-amp"), Some("Linear"));
         assert_eq!(group_of("555 timer"), Some("Linear"));
+        assert_eq!(group_of("CD4066 analog switch"), Some("Linear"));
         assert_eq!(group_of("AND gate"), Some("Digital"));
         assert!(all.iter().all(|(g, _)| *g != "Integrated circuits"));
     }

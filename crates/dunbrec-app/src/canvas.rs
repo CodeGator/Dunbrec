@@ -815,6 +815,7 @@ pub fn value_text(kind: &ComponentKind) -> String {
         ComponentKind::Mcu { firmware, .. } => firmware_label(firmware),
         ComponentKind::OpAmp { part } => part.clone(),
         ComponentKind::Timer555 => "NE555".into(),
+        ComponentKind::Cd4066 { .. } => "CD4066B".into(),
     }
 }
 

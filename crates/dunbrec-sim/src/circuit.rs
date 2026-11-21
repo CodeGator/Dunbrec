@@ -13,7 +13,8 @@ use crate::digital::{CMOS_5V, DigitalDriver, InputSense, NullDevice, PartSpec, S
 use crate::error::{SimError, SimWarning};
 use crate::linalg::{DenseMatrix, LinearSolver};
 use crate::macromodel::{
-    Composite, TIMER555_EDGE, TIMER555_PORTS, TIMER555_R_OFF, TIMER555_R_ON, opamp, timer555,
+    CD4066_EDGE, CD4066_R_OFF, Composite, TIMER555_EDGE, TIMER555_PORTS, TIMER555_R_OFF,
+    TIMER555_R_ON, cd4066, opamp, timer555,
 };
 use crate::mcu::{McuPin, McuSpec};
 use crate::semiconductor::{Bjt, BjtParams, Diode, DiodeParams, Mosfet, MosfetParams};
@@ -102,6 +103,22 @@ impl Circuit {
                     slots[index],
                     devices.len(),
                 );
+                for switch in switches {
+                    devices.push(Box::new(switch));
+                    slots.push((None, None));
+                }
+                digital.push(spec);
+                continue;
+            }
+            if let ComponentKind::Cd4066 { r_on } = element.kind {
+                let (spec, switches) = cd4066_logic(
+                    index,
+                    element,
+                    r_on,
+                    devices[index].as_ref(),
+                    slots[index],
+                    devices.len(),
+                )?;
                 for switch in switches {
                     devices.push(Box::new(switch));
                     slots.push((None, None));
@@ -413,6 +430,55 @@ fn timer555_logic(
     (spec, switches)
 }
 
+/// Comparator hysteresis of the CD4066B's control pins (V).
+const CD4066_HYSTERESIS: f64 = 0.1;
+
+/// The logic half of a CD4066B placed as element `index`: each control pin
+/// is compared with the half-supply net, and drives a switch between its
+/// signal pins.
+fn cd4066_logic(
+    index: usize,
+    element: &Element,
+    r_on: f64,
+    device: &dyn Device,
+    (_, first_internal): (Option<BranchId>, Option<NodeId>),
+    first_driver: usize,
+) -> Result<(PartSpec, Vec<SwitchDriver>), SimError> {
+    let r_on = check_positive(element, "on resistance", r_on)?;
+    let mid = {
+        let k = device
+            .internal_nodes()
+            .iter()
+            .position(|n| n == "mid")
+            .expect("CD4066 internal net");
+        NodeId(first_internal.expect("CD4066 has an internal net").0 + k)
+    };
+    let mut inputs = Vec::new();
+    let mut switches = Vec::new();
+    for (k, &(a, b, control)) in dunbrec_core::CD4066_SWITCHES.iter().enumerate() {
+        inputs.push(InputSense::comparator(
+            element.nodes[control],
+            mid,
+            CD4066_HYSTERESIS,
+        ));
+        switches.push(SwitchDriver::new(
+            format!("{}:{}", element.designator, (b'A' + k as u8) as char),
+            (element.nodes[a], element.nodes[b]),
+            (r_on, CD4066_R_OFF),
+            CD4066_EDGE,
+            CMOS_5V,
+        ));
+    }
+    let spec = PartSpec {
+        element: index,
+        kind: element.kind.clone(),
+        inputs,
+        drivers: (first_driver..first_driver + switches.len()).collect(),
+        output_nodes: vec![None; switches.len()],
+    };
+    Ok((spec, switches))
+}
+
 fn invalid(e: &Element, message: impl Into<String>) -> SimError {
     SimError::InvalidParameter {
         designator: e.designator.clone(),
@@ -482,6 +548,10 @@ pub(crate) fn make_device(e: &Element, models: &ModelLibrary) -> Result<Box<dyn 
             Box::new(Composite::new(name, model, &e.nodes)?)
         }
         ComponentKind::Timer555 => Box::new(Composite::new(name, timer555(), &e.nodes)?),
+        ComponentKind::Cd4066 { r_on } => {
+            check_positive(e, "on resistance", *r_on)?;
+            Box::new(Composite::new(name, cd4066(), &e.nodes)?)
+        }
         ComponentKind::Resistor { resistance } => {
             let r = check_finite(e, "resistance", *resistance)?;
             if r == 0.0 {

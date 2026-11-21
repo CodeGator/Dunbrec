@@ -126,7 +126,7 @@ pub fn export(
     let digital: Vec<String> = netlist
         .elements
         .iter()
-        .filter(|e| e.kind.is_digital() || matches!(e.kind, K::Timer555))
+        .filter(|e| e.kind.is_digital() || matches!(e.kind, K::Timer555 | K::Cd4066 { .. }))
         .map(|e| e.designator.clone())
         .collect();
     if !digital.is_empty() {
@@ -176,7 +176,8 @@ fn write_netlist(
             | K::LogicSwitch { .. }
             | K::LogicLed
             | K::Mcu { .. }
-            | K::Timer555 => continue,
+            | K::Timer555
+            | K::Cd4066 { .. } => continue,
             K::OpAmp { part } => match dunbrec_core::schematic::opamp_subckt(part) {
                 Some((name, text)) => {
                     if !subckts.contains(&text) {
@@ -459,6 +460,20 @@ mod tests {
         );
         assert_eq!(text.matches(".subckt UA741 1 2 3 4 5").count(), 1, "{text}");
         assert!(text.contains(".ends UA741"));
+    }
+
+    #[test]
+    fn analog_switch_chips_are_not_exported() {
+        let s = lone_part(
+            K::Cd4066 { r_on: 180.0 },
+            &[
+                "a1", "a2", "b2", "b1", "cb", "0", "0", "c1", "c2", "d2", "d1", "cd", "ca", "vdd",
+            ],
+        );
+        match export(&s, "", &[]) {
+            Err(ExportError::Digital(parts)) => assert_eq!(parts, vec!["U1".to_string()]),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

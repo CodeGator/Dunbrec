@@ -508,6 +508,17 @@ pub fn symbol_styled(kind: &ComponentKind, zener: bool) -> Symbol {
             p.push(text(0.2, 0.0, "555", 0.9));
             label = pos2(2.6, -5.0);
         }
+        ComponentKind::Cd4066 { .. } => {
+            p.push(rect(-3.0, -7.0, 3.0, 7.0));
+            for pin in kind.pins() {
+                let (x, y) = (pin.offset.x as f32, pin.offset.y as f32);
+                let left = x < 0.0;
+                p.push(line(&[(x, y), (if left { -3.0 } else { 3.0 }, y)]));
+                p.push(text(if left { -2.0 } else { 2.0 }, y, pin.name, 0.5));
+            }
+            p.push(text(0.0, 0.0, "4066", 0.9));
+            label = pos2(0.0, -8.0);
+        }
         ComponentKind::Vcvs { .. }
         | ComponentKind::Vccs { .. }
         | ComponentKind::Ccvs { .. }

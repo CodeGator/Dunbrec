@@ -233,6 +233,38 @@ const TIMER555: &[PinDef] = &[
     pin("VCC", -1, -6),
 ];
 
+/// CD4066B pins in package order (pin 1 to pin 14): the four switches'
+/// signal pins `<n>1` and `<n>2` (either way round), their control pins
+/// `C<n>`, and the supplies.
+pub const CD4066_PINS: &[PinDef] = &[
+    pin("A1", -5, -6),
+    pin("A2", -5, -4),
+    pin("B2", -5, -2),
+    pin("B1", -5, 0),
+    pin("CB", -5, 2),
+    pin("CC", -5, 4),
+    pin("VSS", -5, 6),
+    pin("C1", 5, 6),
+    pin("C2", 5, 4),
+    pin("D2", 5, 2),
+    pin("D1", 5, 0),
+    pin("CD", 5, -2),
+    pin("CA", 5, -4),
+    pin("VDD", 5, -6),
+];
+
+/// The four switches of a CD4066B as `(signal pin, signal pin, control
+/// pin)` indices into [`CD4066_PINS`].
+pub const CD4066_SWITCHES: [(usize, usize, usize); 4] =
+    [(0, 1, 12), (3, 2, 4), (7, 8, 5), (10, 9, 11)];
+
+/// Typical on-resistance of the CD4066B at 25 °C (Ω) for supplies of 5 V,
+/// 10 V and 15 V (TI data sheet SCHS051J).
+pub const CD4066_R_ON: [(f64, f64); 3] = [(5.0, 470.0), (10.0, 180.0), (15.0, 125.0)];
+
+/// Default on-resistance of a placed CD4066B: the 10 V figure (Ω).
+pub const CD4066_DEFAULT_R_ON: f64 = 180.0;
+
 const CONTROLLED: &[PinDef] = &[
     pin("out+", 2, -2),
     pin("out-", 2, 2),
@@ -486,6 +518,13 @@ pub enum ComponentKind {
     /// NE555 timer: threshold and trigger comparators on an internal
     /// divider, a set/reset latch, a discharge switch and an output stage.
     Timer555,
+    /// CD4066B quad bilateral switch. Each of its four switches joins its
+    /// two signal pins, in either direction, while its control pin is high
+    /// (above half the supply). `r_on` is the closed resistance, which on
+    /// the real chip depends on the supply (see [`CD4066_R_ON`]).
+    Cd4066 {
+        r_on: f64,
+    },
 
     // ---- Digital parts (5 V CMOS-style logic) ----
     /// Two-input gate; output Y changes `delay` seconds after an input.
@@ -659,6 +698,7 @@ impl ComponentKind {
             ComponentKind::Mcu { .. } => MCU,
             ComponentKind::OpAmp { .. } => OPAMP,
             ComponentKind::Timer555 => TIMER555,
+            ComponentKind::Cd4066 { .. } => CD4066_PINS,
         }
     }
 
@@ -686,7 +726,8 @@ impl ComponentKind {
             | ComponentKind::Counter4 { .. }
             | ComponentKind::Mcu { .. }
             | ComponentKind::OpAmp { .. }
-            | ComponentKind::Timer555 => "U",
+            | ComponentKind::Timer555
+            | ComponentKind::Cd4066 { .. } => "U",
             ComponentKind::Clock { .. } => "CLK",
             ComponentKind::LogicSwitch { .. } => "SW",
             ComponentKind::LogicLed => "LED",

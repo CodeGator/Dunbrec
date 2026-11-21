@@ -261,6 +261,35 @@ pub fn timer555() -> MacroModel {
     }
 }
 
+/// Output rise and fall time of a CD4066B switch (s): its on/off change
+/// follows the control pin within the data sheet's tens of nanoseconds.
+pub const CD4066_EDGE: f64 = 10e-9;
+/// Off-state resistance of a CD4066B switch (Ω): the data sheet's 10 pA
+/// leakage at 10 V is about 1 TΩ; 1 GΩ keeps the matrices well conditioned.
+pub const CD4066_R_OFF: f64 = 1e9;
+/// Resistance of each half of the divider that sets the control threshold
+/// at half the supply (Ω): the chip's own supply current stays below 1 µA.
+const CD4066_DIVIDER: f64 = 10e6;
+
+/// Analog half of the CD4066B: a divider that puts net `mid` halfway
+/// between VDD and VSS, which the four control pins are compared with.
+/// The switches themselves are added by the circuit builder.
+pub fn cd4066() -> MacroModel {
+    let mut e = Elements(Vec::new());
+    e.r("RH", "VDD", "mid", CD4066_DIVIDER);
+    e.r("RL", "mid", "VSS", CD4066_DIVIDER);
+    MacroModel {
+        ports: CD4066_PORTS,
+        elements: e.0,
+        models: ModelLibrary::new(),
+    }
+}
+
+/// Pin names of the CD4066B, in package order.
+pub const CD4066_PORTS: &[&str] = &[
+    "A1", "A2", "B2", "B1", "CB", "CC", "VSS", "C1", "C2", "D2", "D1", "CD", "CA", "VDD",
+];
+
 /// One placed chip, simulated as the devices of its macromodel.
 #[derive(Debug)]
 pub struct Composite {
