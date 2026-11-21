@@ -507,13 +507,12 @@ impl DunbrecApp {
         }
     }
 
-    /// Ask for a name, make the project folder with a first schematic in it,
-    /// and open them.
+    /// Ask for the project's folder (the dialog can make a new one), put a
+    /// first circuit in it, and open them.
     fn new_project(&mut self) {
         let Some(dir) = rfd::FileDialog::new()
-            .set_title("New project: type a name for its folder")
-            .set_file_name("My project")
-            .save_file()
+            .set_title("New project: choose an empty folder (or make a new one)")
+            .pick_folder()
         else {
             return;
         };
@@ -568,6 +567,8 @@ impl DunbrecApp {
             C::Delete(path) => self.delete_in_project(&path),
             C::Refresh => self.refresh_project(),
             C::MoveSourcesToFiles => self.move_sources_to_files(),
+            C::ForgetProject(path) => self.settings.forget_project(&path),
+            C::ClearRecentProjects => self.settings.clear_recent_projects(),
         }
     }
 
@@ -1377,6 +1378,11 @@ impl DunbrecApp {
                                     ui.close();
                                 }
                             }
+                            ui.separator();
+                            if ui.button("Clear list").clicked() {
+                                self.settings.clear_recent();
+                                ui.close();
+                            }
                         });
                     });
                     ui.menu_button("Open example", |ui| {
@@ -1403,14 +1409,28 @@ impl DunbrecApp {
                                     || path.display().to_string(),
                                     |n| n.to_string_lossy().into_owned(),
                                 );
-                                if ui
-                                    .button(name)
-                                    .on_hover_text(path.display().to_string())
-                                    .clicked()
-                                {
-                                    self.open_project_and_schematic(&path);
-                                    ui.close();
-                                }
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .button(name)
+                                        .on_hover_text(path.display().to_string())
+                                        .clicked()
+                                    {
+                                        self.open_project_and_schematic(&path);
+                                        ui.close();
+                                    }
+                                    if ui
+                                        .small_button("✕")
+                                        .on_hover_text("Remove from the list")
+                                        .clicked()
+                                    {
+                                        self.settings.forget_project(&path);
+                                    }
+                                });
+                            }
+                            ui.separator();
+                            if ui.button("Clear list").clicked() {
+                                self.settings.clear_recent_projects();
+                                ui.close();
                             }
                         });
                     });

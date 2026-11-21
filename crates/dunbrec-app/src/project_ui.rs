@@ -35,6 +35,47 @@ impl Create {
         }
     }
 
+    /// A name to start the form with, which nothing in `dir` has yet.
+    fn suggest(self, dir: &Path) -> String {
+        let (base, ext) = match self {
+            Create::Schematic => ("Circuit", "dbr"),
+            Create::Assembly => ("main", "asm"),
+            Create::Sketch => ("sketch", "ino"),
+            Create::Folder => ("New folder", ""),
+        };
+        let taken = |name: &str| {
+            let file = if ext.is_empty() {
+                name.to_string()
+            } else {
+                format!("{name}.{ext}")
+            };
+            dir.join(file).exists()
+        };
+        // Circuits are numbered from 1 ("Circuit 1"); the rest only get a
+        // number when the plain name is taken ("main2", "New folder 2").
+        let spaced = matches!(self, Create::Schematic | Create::Folder);
+        let numbered = |n: usize| {
+            if spaced {
+                format!("{base} {n}")
+            } else {
+                format!("{base}{n}")
+            }
+        };
+        if self == Create::Schematic {
+            return (1..)
+                .map(numbered)
+                .find(|n| !taken(n))
+                .expect("a free number");
+        }
+        if !taken(base) {
+            return base.to_string();
+        }
+        (2..)
+            .map(numbered)
+            .find(|n| !taken(n))
+            .expect("a free number")
+    }
+
     /// The menu entry.
     fn menu_label(self) -> &'static str {
         match self {
@@ -67,6 +108,9 @@ pub enum Command {
     Delete(PathBuf),
     Refresh,
     MoveSourcesToFiles,
+    /// Take a project off the recent list.
+    ForgetProject(PathBuf),
+    ClearRecentProjects,
 }
 
 enum Form {
@@ -272,7 +316,7 @@ Right-click to add to the project",
                 self.form = Some(Form::Create {
                     dir: dir.to_path_buf(),
                     what,
-                    name: String::new(),
+                    name: what.suggest(dir),
                     fresh: true,
                 });
                 ui.close();
@@ -326,7 +370,7 @@ Right-click to add to the project",
                         .desired_width(f32::INFINITY),
                 );
                 if std::mem::take(fresh) {
-                    r.request_focus();
+                    select_all(ui, &r, name);
                 }
                 let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 ui.horizontal(|ui| {
@@ -354,7 +398,7 @@ Right-click to add to the project",
                 let ok = valid_name(name) && name.trim() != was;
                 let r = ui.add(egui::TextEdit::singleline(name).desired_width(f32::INFINITY));
                 if std::mem::take(fresh) {
-                    r.request_focus();
+                    select_all(ui, &r, name);
                 }
                 let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 ui.label(
@@ -418,6 +462,21 @@ Right-click to add to the project",
     }
 }
 
+/// Focus a text box and select what is in it, so typing replaces it.
+fn select_all(ui: &Ui, response: &egui::Response, text: &str) {
+    response.request_focus();
+    if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), response.id) {
+        let end = egui::text::CCursor::new(text.chars().count());
+        state
+            .cursor
+            .set_char_range(Some(egui::text::CCursorRange::two(
+                egui::text::CCursor::new(0),
+                end,
+            )));
+        state.store(ui.ctx(), response.id);
+    }
+}
+
 /// What the panel shows with no project open.
 fn no_project(ui: &mut Ui, recent: &[PathBuf]) -> Option<Command> {
     let mut out = None;
@@ -439,19 +498,36 @@ fn no_project(ui: &mut Ui, recent: &[PathBuf]) -> Option<Command> {
     }
     if !recent.is_empty() {
         ui.add_space(8.0);
-        ui.label(RichText::new("Recent projects").strong());
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Recent projects").strong());
+            if ui
+                .small_button("Clear list")
+                .on_hover_text("Forget all of them (the folders are not touched)")
+                .clicked()
+            {
+                out = Some(Command::ClearRecentProjects);
+            }
+        });
         for path in recent {
             let name = path.file_name().map_or_else(
                 || path.display().to_string(),
                 |n| n.to_string_lossy().into_owned(),
             );
-            if ui
-                .button(format!("📁 {name}"))
-                .on_hover_text(path.display().to_string())
-                .clicked()
-            {
-                out = Some(Command::OpenProjectPath(path.clone()));
-            }
+            ui.horizontal(|ui| {
+                let open = ui
+                    .button(format!("📁 {name}"))
+                    .on_hover_text(path.display().to_string());
+                if open.clicked() {
+                    out = Some(Command::OpenProjectPath(path.clone()));
+                }
+                if ui
+                    .small_button("✕")
+                    .on_hover_text("Remove from the list (the folder is not touched)")
+                    .clicked()
+                {
+                    out = Some(Command::ForgetProject(path.clone()));
+                }
+            });
         }
     }
     out
@@ -546,6 +622,26 @@ mod tests {
         assert_eq!(shown_name(&entry("main.asm")), "main.asm");
         assert_eq!(shown_name(&entry("fade.ino")), "fade.ino");
         assert_eq!(shown_name(&entry("notes.txt")), "notes.txt");
+    }
+
+    #[test]
+    fn new_items_start_with_a_free_name() {
+        let dir = std::env::temp_dir().join(format!("dunbrec-suggest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(Create::Schematic.suggest(&dir), "Circuit 1");
+        assert_eq!(Create::Assembly.suggest(&dir), "main");
+        assert_eq!(Create::Sketch.suggest(&dir), "sketch");
+        assert_eq!(Create::Folder.suggest(&dir), "New folder");
+        for f in ["Circuit 1.dbr", "Circuit 2.dbr", "main.asm", "sketch.ino"] {
+            std::fs::write(dir.join(f), "").unwrap();
+        }
+        std::fs::create_dir(dir.join("New folder")).unwrap();
+        assert_eq!(Create::Schematic.suggest(&dir), "Circuit 3");
+        assert_eq!(Create::Assembly.suggest(&dir), "main2");
+        assert_eq!(Create::Sketch.suggest(&dir), "sketch2");
+        assert_eq!(Create::Folder.suggest(&dir), "New folder 2");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

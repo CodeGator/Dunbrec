@@ -292,8 +292,11 @@ pub fn with_extension(name: &str, ext: &str) -> String {
     }
 }
 
-/// Create the project folder `dir` and its first schematic, named after the
-/// folder. The folder may exist if it is empty. Returns the schematic's path.
+/// Name of the first circuit of a new project.
+pub const FIRST_CIRCUIT: &str = "Circuit 1";
+
+/// Create the project folder `dir` (it may exist if it is empty) and a first
+/// circuit in it, `Circuit 1.dbr`. Returns the circuit's path.
 pub fn create_project(dir: &Path) -> Result<PathBuf, String> {
     let name = dir
         .file_name()
@@ -310,13 +313,14 @@ pub fn create_project(dir: &Path) -> Result<PathBuf, String> {
                 .is_none();
         if !empty {
             return Err(format!(
-                "{} already exists and is not empty; use Open project for an existing folder",
+                "{} is not empty. Choose an empty folder (the folder dialog has a button to make \
+                 a new one), or use Open project for a folder that already holds a project.",
                 dir.display()
             ));
         }
     }
     std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-    let path = dir.join(format!("{name}.dbr"));
+    let path = dir.join(format!("{FIRST_CIRCUIT}.dbr"));
     dunbrec_io::dbr::save(&Schematic::new(), &path).map_err(|e| e.to_string())?;
     Ok(path)
 }
@@ -734,7 +738,7 @@ mod tests {
         let root = scratch("new");
         let dir = root.join("Blinker");
         let first = create_project(&dir).unwrap();
-        assert_eq!(first, dir.join("Blinker.dbr"));
+        assert_eq!(first, dir.join("Circuit 1.dbr"));
         assert!(dunbrec_io::dbr::load(&first).unwrap().components.is_empty());
         // Not on top of something that is already there.
         assert!(create_project(&dir).unwrap_err().contains("not empty"));
