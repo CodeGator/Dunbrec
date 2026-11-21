@@ -108,7 +108,7 @@ pub trait Device: Send + std::fmt::Debug {
 
     /// Names of internal nodes this device needs (e.g. the point between a
     /// diode's junction and its series resistance).
-    fn internal_nodes(&self) -> Vec<&'static str> {
+    fn internal_nodes(&self) -> Vec<String> {
         Vec::new()
     }
 

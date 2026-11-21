@@ -30,6 +30,7 @@ pub mod device;
 pub mod digital;
 pub mod error;
 pub mod linalg;
+pub mod macromodel;
 pub mod mcu;
 mod newton;
 pub mod semiconductor;
@@ -53,6 +54,8 @@ pub use transient::{
 mod ac_tests;
 #[cfg(test)]
 mod digital_tests;
+#[cfg(test)]
+mod ic_tests;
 #[cfg(test)]
 mod mcu_tests;
 #[cfg(test)]

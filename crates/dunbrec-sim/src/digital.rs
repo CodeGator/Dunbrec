@@ -12,6 +12,11 @@
 //!
 //! So logic can drive any analog load, analog signals can clock logic, and
 //! instruments see digital nets as ordinary voltages.
+//!
+//! Mixed-signal chips use the same machinery with two generalisations: an
+//! input may compare two voltages (a comparator, see [`InputSense`]), and an
+//! output may open and close a resistive path instead of driving a level
+//! ([`SwitchDriver`]). The 555 timer is built this way.
 
 use std::cell::Cell;
 use std::cmp::{Ordering, Reverse};
@@ -57,6 +62,52 @@ pub enum Logic {
     High,
     /// Unknown (e.g. an output before its inputs are known).
     X,
+}
+
+/// What a digital input reads: the voltage `V(p) - V(n)`. Rising through
+/// `rise` makes it high, falling through `fall` makes it low.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct InputSense {
+    pub p: NodeId,
+    pub n: NodeId,
+    pub rise: f64,
+    pub fall: f64,
+}
+
+impl InputSense {
+    /// An ordinary logic input on `node`, with the family's thresholds.
+    pub fn logic(node: NodeId, f: &LogicFamily) -> Self {
+        Self {
+            p: node,
+            n: NodeId::GROUND,
+            rise: f.vih,
+            fall: f.vil,
+        }
+    }
+
+    /// A comparator: high when `V(p) > V(n)`, with `hysteresis` volts
+    /// between its switching points.
+    pub fn comparator(p: NodeId, n: NodeId, hysteresis: f64) -> Self {
+        Self {
+            p,
+            n,
+            rise: 0.5 * hysteresis,
+            fall: -0.5 * hysteresis,
+        }
+    }
+
+    /// Level of a steady input (no history for hysteresis): beyond a
+    /// threshold it is decided, in between the midpoint decides.
+    pub fn level(&self, voltage: &impl Fn(NodeId) -> f64) -> Logic {
+        let v = voltage(self.p) - voltage(self.n);
+        if v >= self.rise {
+            Logic::High
+        } else if v <= self.fall {
+            Logic::Low
+        } else {
+            Logic::from_bool(v >= 0.5 * (self.rise + self.fall))
+        }
+    }
 }
 
 impl Logic {
@@ -235,6 +286,108 @@ impl Device for DigitalDriver {
     }
 }
 
+/// The analog face of an output that switches a path rather than driving a
+/// level: a conductance between `a` and `b`, closed when the output is high.
+/// While switching it moves between its off and on values geometrically
+/// over `edge` seconds, like a transistor turning on.
+#[derive(Debug)]
+pub struct SwitchDriver {
+    pub name: String,
+    pub a: NodeId,
+    pub b: NodeId,
+    g_on: f64,
+    g_off: f64,
+    edge: f64,
+    family: LogicFamily,
+    /// How closed the switch is, 0 (open) to 1 (closed).
+    ramp: Cell<Ramp>,
+}
+
+impl SwitchDriver {
+    pub fn new(
+        name: String,
+        (a, b): (NodeId, NodeId),
+        (r_on, r_off): (f64, f64),
+        edge: f64,
+        family: LogicFamily,
+    ) -> Self {
+        Self {
+            name,
+            a,
+            b,
+            g_on: 1.0 / r_on,
+            g_off: 1.0 / r_off,
+            edge,
+            family,
+            ramp: Cell::new(Ramp {
+                t0: 0.0,
+                from: 0.5,
+                to: 0.5,
+                edge,
+            }),
+        }
+    }
+
+    fn conductance(&self, closed: f64) -> f64 {
+        self.g_off * (self.g_on / self.g_off).powf(closed.clamp(0.0, 1.0))
+    }
+
+    fn present(&self, ctx: &StampContext) -> f64 {
+        let ramp = self.ramp.get();
+        let closed = match ctx.mode {
+            Mode::Dc { .. } => ramp.to,
+            Mode::Transient { .. } => ramp.at(ctx.time),
+        };
+        self.conductance(closed)
+    }
+}
+
+impl Device for SwitchDriver {
+    fn designator(&self) -> &str {
+        &self.name
+    }
+    fn stamp(&self, s: &mut Stamper, ctx: &StampContext) {
+        s.conductance(self.a, self.b, self.present(ctx));
+    }
+    fn stamp_ac(&self, s: &mut AcStamper, _ctx: &AcContext) {
+        s.conductance(self.a, self.b, self.conductance(self.ramp.get().to));
+    }
+    fn dc_paths(&self) -> Vec<(NodeId, NodeId)> {
+        vec![(self.a, self.b)]
+    }
+    /// Current from `a` through the switch to `b`.
+    fn current(&self, sol: &SolutionView) -> f64 {
+        self.conductance(self.ramp.get().to) * (sol.voltage(self.a) - sol.voltage(self.b))
+    }
+    fn next_breakpoint(&self, after: f64) -> Option<f64> {
+        let r = self.ramp.get();
+        [r.t0, r.t0 + r.edge]
+            .into_iter()
+            .find(|&t| t > after && r.from != r.to)
+    }
+    /// `level` is a logic voltage of the family: high closes the switch.
+    fn drive(&self, time: f64, level: f64) {
+        let f = &self.family;
+        let closed = ((level - f.vol) / (f.voh - f.vol)).clamp(0.0, 1.0);
+        let ramp = self.ramp.get();
+        if time.is_infinite() {
+            self.ramp.set(Ramp {
+                t0: 0.0,
+                from: closed,
+                to: closed,
+                edge: self.edge,
+            });
+        } else if closed != ramp.to {
+            self.ramp.set(Ramp {
+                t0: time,
+                from: ramp.at(time),
+                to: closed,
+                edge: self.edge,
+            });
+        }
+    }
+}
+
 /// Placeholder for a digital part in the analog device list, keeping device
 /// indices equal to netlist element indices. Its pins are handled by
 /// [`DigitalDriver`]s and input watches.
@@ -265,11 +418,13 @@ pub struct PartSpec {
     /// Index of the part in the netlist (and in the circuit's devices).
     pub element: usize,
     pub kind: ComponentKind,
-    pub input_nodes: Vec<NodeId>,
+    /// What each input reads.
+    pub inputs: Vec<InputSense>,
     /// Device index of the driver of each output.
     pub drivers: Vec<usize>,
-    /// Node each output drives.
-    pub output_nodes: Vec<NodeId>,
+    /// Net each output sets to its logic level, if it does (a switch
+    /// output does not).
+    pub output_nodes: Vec<Option<NodeId>>,
 }
 
 #[derive(Debug, Clone)]
@@ -294,6 +449,7 @@ impl Part {
             | ComponentKind::Inverter { delay }
             | ComponentKind::DFlipFlop { delay }
             | ComponentKind::Counter4 { delay } => delay.max(0.0),
+            ComponentKind::Timer555 => TIMER555_DELAY,
             _ => 0.0,
         }
     }
@@ -309,6 +465,8 @@ impl Part {
                 .collect(),
             ComponentKind::Clock { .. } => vec![Logic::from_bool(self.clock_high)],
             ComponentKind::LogicSwitch { high } => vec![Logic::from_bool(high)],
+            // Output high side, output low side, discharge.
+            ComponentKind::Timer555 => vec![self.flop, self.flop.invert(), self.flop.invert()],
             _ => Vec::new(),
         }
     }
@@ -329,9 +487,29 @@ impl Part {
             }
             _ => {}
         }
+        self.update_latch();
         true
     }
+
+    /// Level-sensitive state: the 555's set/reset latch. Its inputs are
+    /// [trigger, threshold, reset]: trigger active (high) sets it and wins
+    /// over threshold, which resets it; the RESET pin low clears it.
+    fn update_latch(&mut self) {
+        if let ComponentKind::Timer555 = self.spec.kind {
+            let [trigger, threshold, reset] = [self.inputs[0], self.inputs[1], self.inputs[2]];
+            if reset == Logic::Low {
+                self.flop = Logic::Low;
+            } else if trigger == Logic::High {
+                self.flop = Logic::High;
+            } else if threshold == Logic::High {
+                self.flop = Logic::Low;
+            }
+        }
+    }
 }
+
+/// Propagation delay of the 555 from a comparator to its outputs (s).
+pub const TIMER555_DELAY: f64 = 100e-9;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum EventKind {
@@ -384,7 +562,7 @@ impl DigitalSystem {
                 let n_out = spec.drivers.len();
                 let mut p = Part {
                     spec: spec.clone(),
-                    inputs: vec![Logic::X; spec.input_nodes.len()],
+                    inputs: vec![Logic::X; spec.inputs.len()],
                     outputs: vec![Logic::X; n_out],
                     scheduled: vec![Logic::X; n_out],
                     state: 0,
@@ -409,17 +587,17 @@ impl DigitalSystem {
         self.parts.is_empty()
     }
 
-    /// (part, input) of every digital input, with its node.
-    pub fn inputs(&self) -> Vec<(usize, usize, NodeId)> {
+    /// (part, input) of every digital input, with what it reads.
+    pub fn inputs(&self) -> Vec<(usize, usize, InputSense)> {
         self.parts
             .iter()
             .enumerate()
             .flat_map(|(p, part)| {
                 part.spec
-                    .input_nodes
+                    .inputs
                     .iter()
                     .enumerate()
-                    .map(move |(k, &n)| (p, k, n))
+                    .map(move |(k, &sense)| (p, k, sense))
             })
             .collect()
     }
@@ -482,10 +660,9 @@ impl DigitalSystem {
     /// Set every input's level from steady node voltages, without
     /// treating the change as a clock edge.
     pub fn sync_inputs(&mut self, voltage: impl Fn(NodeId) -> f64) {
-        let family = self.family;
         for part in &mut self.parts {
             for k in 0..part.inputs.len() {
-                part.inputs[k] = Logic::from_voltage(voltage(part.spec.input_nodes[k]), &family);
+                part.inputs[k] = part.spec.inputs[k].level(&voltage);
             }
         }
     }
@@ -549,19 +726,30 @@ impl DigitalSystem {
     /// loops such as ring oscillators, as a real power-up does. Returns
     /// true if any output changed.
     fn settle_static(&mut self, voltage: impl Fn(NodeId) -> f64) -> bool {
-        let family = self.family;
         let mut changed = false;
         for p in 0..self.parts.len() {
             for k in 0..self.parts[p].inputs.len() {
-                let node = self.parts[p].spec.input_nodes[k];
-                let driven = self.parts.iter().find_map(|q| {
-                    let i = q.spec.output_nodes.iter().position(|&n| n == node)?;
-                    Some(q.outputs[i]).filter(|l| *l != Logic::X)
-                });
+                let sense = self.parts[p].spec.inputs[k];
+                // A ground-referenced input on a net a logic output drives
+                // reads that output's level.
+                let driven = sense
+                    .n
+                    .is_ground()
+                    .then(|| {
+                        self.parts.iter().find_map(|q| {
+                            let i = q
+                                .spec
+                                .output_nodes
+                                .iter()
+                                .position(|&n| n == Some(sense.p))?;
+                            Some(q.outputs[i]).filter(|l| *l != Logic::X)
+                        })
+                    })
+                    .flatten();
                 // No clock edges at the operating point: set levels only.
-                self.parts[p].inputs[k] =
-                    driven.unwrap_or_else(|| Logic::from_voltage(voltage(node), &family));
+                self.parts[p].inputs[k] = driven.unwrap_or_else(|| sense.level(&voltage));
             }
+            self.parts[p].update_latch();
             let outs = self.parts[p].evaluate();
             if outs != self.parts[p].outputs {
                 changed = true;
@@ -679,9 +867,9 @@ mod tests {
         PartSpec {
             element: 0,
             kind,
-            input_nodes: vec![NodeId(1); inputs],
+            inputs: vec![InputSense::logic(NodeId(1), &CMOS_5V); inputs],
             drivers: (0..outputs).collect(),
-            output_nodes: vec![NodeId(2); outputs],
+            output_nodes: vec![Some(NodeId(2)); outputs],
         }
     }
 

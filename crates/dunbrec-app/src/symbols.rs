@@ -409,6 +409,41 @@ pub fn symbol_styled(kind: &ComponentKind, zener: bool) -> Symbol {
             p.push(text(0.0, 0.5, "328P", 0.6));
             label = pos2(0.0, -10.9);
         }
+        ComponentKind::OpAmp { .. } => {
+            // Triangle pointing right; inverting input on top.
+            p.push(line(&[(-2.0, -2.5), (2.0, 0.0), (-2.0, 2.5), (-2.0, -2.5)]));
+            p.push(line(&[(-3.0, -1.0), (-2.0, -1.0)]));
+            p.push(line(&[(-3.0, 1.0), (-2.0, 1.0)]));
+            p.push(line(&[(2.0, 0.0), (3.0, 0.0)]));
+            // Supply leads meet the slanted edges (y = ±1.25 at x = 0).
+            p.push(line(&[(0.0, -3.0), (0.0, -1.25)]));
+            p.push(line(&[(0.0, 3.0), (0.0, 1.25)]));
+            p.push(text(-1.45, -1.0, "−", 0.8));
+            p.push(text(-1.45, 1.0, "+", 0.8));
+            p.push(text(0.45, -2.2, "V+", 0.5));
+            p.push(text(0.45, 2.2, "V−", 0.5));
+            label = pos2(2.1, -2.3);
+        }
+        ComponentKind::Timer555 => {
+            p.push(rect(-3.0, -4.0, 3.0, 4.0));
+            for pin in kind.pins() {
+                let (x, y) = (pin.offset.x as f32, pin.offset.y as f32);
+                // Lead from the pin to the box edge, name just inside.
+                let (edge, name_at) = if x <= -5.0 {
+                    ((-3.0, y), (-2.0, y))
+                } else if x >= 5.0 {
+                    ((3.0, y), (2.15, y))
+                } else if y < 0.0 {
+                    ((x, -4.0), (x, -3.45))
+                } else {
+                    ((x, 4.0), (x, 3.45))
+                };
+                p.push(line(&[(x, y), edge]));
+                p.push(text(name_at.0, name_at.1, pin.name, 0.5));
+            }
+            p.push(text(0.2, 0.0, "555", 0.9));
+            label = pos2(2.6, -5.0);
+        }
         ComponentKind::Vcvs { .. }
         | ComponentKind::Vccs { .. }
         | ComponentKind::Ccvs { .. }

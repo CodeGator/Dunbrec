@@ -195,6 +195,28 @@ const MCU: &[PinDef] = &[
 ];
 const LOGIC_LED: &[PinDef] = &[din("A", -3, 0)];
 
+/// Op-amp pins in SPICE subcircuit order (in+, in-, V+, V-, out). The
+/// inverting input is on top, as in most textbook drawings.
+const OPAMP: &[PinDef] = &[
+    pin("in+", -3, 1),
+    pin("in-", -3, -1),
+    pin("V+", 0, -3),
+    pin("V-", 0, 3),
+    pin("out", 3, 0),
+];
+
+/// 555 timer pins in package order (pin 1 to pin 8).
+const TIMER555: &[PinDef] = &[
+    pin("GND", -1, 6),
+    pin("TRIG", -5, 2),
+    pin("OUT", 5, 0),
+    pin("RESET", 1, -6),
+    pin("CTRL", 1, 6),
+    pin("THR", -5, 0),
+    pin("DIS", -5, -2),
+    pin("VCC", -1, -6),
+];
+
 const CONTROLLED: &[PinDef] = &[
     pin("out+", 2, -2),
     pin("out-", 2, 2),
@@ -427,6 +449,16 @@ pub enum ComponentKind {
         gain: f64,
     },
 
+    // ---- Integrated circuits ----
+    /// Operational amplifier simulated by a built-in macromodel; `part`
+    /// names it (see [`OPAMP_PARTS`]).
+    OpAmp {
+        part: String,
+    },
+    /// NE555 timer: threshold and trigger comparators on an internal
+    /// divider, a set/reset latch, a discharge switch and an output stage.
+    Timer555,
+
     // ---- Digital parts (5 V CMOS-style logic) ----
     /// Two-input gate; output Y changes `delay` seconds after an input.
     Gate {
@@ -473,6 +505,59 @@ pub enum ComponentKind {
     },
 }
 
+/// Op-amps with a built-in macromodel, by part name.
+pub const OPAMP_PARTS: &[&str] = &["uA741"];
+
+/// SPICE subcircuit of a built-in op-amp model: (subcircuit name,
+/// definition). Ports: in+, in-, V+, V-, out. The simulator's own copy of
+/// each model (`dunbrec_sim::macromodel`) is a translation of this text.
+pub fn opamp_subckt(part: &str) -> Option<(&'static str, &'static str)> {
+    match part.to_ascii_lowercase().as_str() {
+        "ua741" | "741" | "lm741" => Some(("UA741", UA741_SUBCKT)),
+        _ => None,
+    }
+}
+
+/// The Boyle macromodel of the uA741, as in the PSpice library.
+const UA741_SUBCKT: &str = "\
+* uA741 operational amplifier (Boyle macromodel)
+* connections: in+ in- V+ V- out
+.subckt UA741 1 2 3 4 5
+c1 11 12 8.661E-12
+c2 6 7 30.00E-12
+dc 5 53 dx
+de 54 5 dx
+dlp 90 91 dx
+dln 92 90 dx
+dp 4 3 dx
+egnd 99 0 poly(2) (3,0) (4,0) 0 .5 .5
+fb 7 99 poly(5) vb vc ve vlp vln 0 10.61E6 -10E6 10E6 10E6 -10E6
+ga 6 0 11 12 188.5E-6
+gcm 0 6 10 99 5.961E-9
+iee 10 4 dc 15.16E-6
+hlim 90 0 vlim 1K
+q1 11 2 13 qx
+q2 12 1 14 qx
+r2 6 9 100.0E3
+rc1 3 11 5.305E3
+rc2 3 12 5.305E3
+re1 13 10 1.836E3
+re2 14 10 1.836E3
+ree 10 99 13.19E6
+ro1 8 5 50
+ro2 7 99 100
+rp 3 4 18.16E3
+vb 9 0 dc 0
+vc 3 53 dc 1
+ve 54 4 dc 1
+vlim 7 8 dc 0
+vlp 91 0 dc 40
+vln 0 92 dc 40
+.model dx D(Is=800.0E-18 Rs=1)
+.model qx NPN(Is=800.0E-18 Bf=93.75)
+.ends UA741
+";
+
 /// Clock of an Arduino Uno (Hz).
 pub const DEFAULT_MCU_CLOCK: f64 = 16e6;
 
@@ -505,6 +590,8 @@ impl ComponentKind {
             ComponentKind::Clock { .. } | ComponentKind::LogicSwitch { .. } => LOGIC_SOURCE,
             ComponentKind::LogicLed => LOGIC_LED,
             ComponentKind::Mcu { .. } => MCU,
+            ComponentKind::OpAmp { .. } => OPAMP,
+            ComponentKind::Timer555 => TIMER555,
         }
     }
 
@@ -530,7 +617,9 @@ impl ComponentKind {
             | ComponentKind::Inverter { .. }
             | ComponentKind::DFlipFlop { .. }
             | ComponentKind::Counter4 { .. }
-            | ComponentKind::Mcu { .. } => "U",
+            | ComponentKind::Mcu { .. }
+            | ComponentKind::OpAmp { .. }
+            | ComponentKind::Timer555 => "U",
             ComponentKind::Clock { .. } => "CLK",
             ComponentKind::LogicSwitch { .. } => "SW",
             ComponentKind::LogicLed => "LED",

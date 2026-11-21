@@ -217,20 +217,20 @@ impl Transient {
         };
         let h_min = span * 1e-14;
 
-        // Digital inputs watch their nets: up through VIH, down through VIL.
+        // Digital inputs watch what they read: up through the rising
+        // threshold, down through the falling one (VIH and VIL for logic).
         let mut watches = Vec::new();
         let mut watch_targets = Vec::new();
         if let Some(sys) = &mut digital {
             sys.sync_inputs(|n| sol.voltage(n));
-            let f = sys.family;
-            for (part, input, node) in sys.inputs() {
+            for (part, input, sense) in sys.inputs() {
                 for (level, edge, value) in [
-                    (f.vih, Edge::Rising, Logic::High),
-                    (f.vil, Edge::Falling, Logic::Low),
+                    (sense.rise, Edge::Rising, Logic::High),
+                    (sense.fall, Edge::Falling, Logic::Low),
                 ] {
                     watches.push(Watch {
-                        p: node,
-                        n: NodeId::GROUND,
+                        p: sense.p,
+                        n: sense.n,
                         level,
                         edge,
                     });

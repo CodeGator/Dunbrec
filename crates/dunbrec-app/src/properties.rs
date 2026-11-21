@@ -217,6 +217,47 @@ impl Properties {
                         r
                     }
                     ComponentKind::LogicLed => false,
+                    ComponentKind::OpAmp { part } => {
+                        ui.label("Part");
+                        let before = part.clone();
+                        egui::ComboBox::from_id_salt(("opamp", id))
+                            .selected_text(part.as_str())
+                            .show_ui(ui, |ui| {
+                                for p in dunbrec_core::OPAMP_PARTS {
+                                    ui.selectable_value(part, p.to_string(), *p);
+                                }
+                            });
+                        ui.end_row();
+                        ui.label("");
+                        ui.label(
+                            egui::RichText::new(
+                                "Boyle macromodel: input transistors, 1 MHz gain-bandwidth, \
+                                 0.5 V/µs slew rate, output current limit, and an output \
+                                 that stops about 1–2 V short of the supplies. Connect V+ \
+                                 and V− to a supply (e.g. ±15 V).",
+                            )
+                            .small()
+                            .weak(),
+                        );
+                        ui.end_row();
+                        *part != before
+                    }
+                    ComponentKind::Timer555 => {
+                        ui.label("");
+                        ui.label(
+                            egui::RichText::new(
+                                "Bipolar NE555, 4.5–16 V. Output goes high (VCC − 1.4 V) \
+                                 when TRIG falls below 1/3 VCC, and low when THR rises \
+                                 above CTRL (2/3 VCC); DIS is shorted to GND while the \
+                                 output is low. RESET below 0.7 V forces the output low. \
+                                 Tie RESET to VCC if unused.",
+                            )
+                            .small()
+                            .weak(),
+                        );
+                        ui.end_row();
+                        false
+                    }
                     ComponentKind::Mcu { firmware, clock } => {
                         let mut changed = false;
                         if let Some(f) =
@@ -654,6 +695,8 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
         ComponentKind::LogicSwitch { .. } => "Logic switch",
         ComponentKind::LogicLed => "Logic LED",
         ComponentKind::Mcu { .. } => "Microcontroller (ATmega328P)",
+        ComponentKind::OpAmp { .. } => "Operational amplifier",
+        ComponentKind::Timer555 => "555 timer",
     }
 }
 

@@ -3,11 +3,12 @@
 State of the project for whoever picks it up next. User-facing documentation is in
 [README.md](README.md); this file covers status, decisions and open work.
 
-*Last updated: 2026-11-20, after commit `c854872` (Phase 11).*
+*Last updated: 2026-11-21, Phase 12 (integrated circuits).*
 
 ## Status
 
-All eleven planned phases are done and committed on `main` (one commit per phase, "Phase N: …").
+All eleven planned phases are done and committed on `main` (one commit per phase, "Phase N: …"),
+plus Phase 12 (integrated circuits) and a fix for probes failing after opening a document.
 Version is `0.1.0`; nothing has been released or pushed by this work.
 
 | Phase | Content |
@@ -19,15 +20,16 @@ Version is `0.1.0`; nothing has been released or pushed by this work.
 | 9 | Parts library, examples, clipboard, settings, icon, MSI installer |
 | 10 | Event-driven digital logic mixed with analog; logic analyser |
 | 11 | ATmega328P emulation with `.hex` firmware; serial monitor; Arduino examples |
+| 12 | Composite parts; 741 op-amp (Boyle macromodel); 555 timer; examples 12–14 |
 
-Health at handoff: `cargo test --workspace` 216 passed, 0 failed (1 ignored: an emulator speed
+Health at handoff: `cargo test --workspace` 229 passed, 0 failed (1 ignored: an emulator speed
 benchmark); `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --check`
 clean. Toolchain: Rust 1.99 (edition 2024, MSRV 1.90), Windows 11.
 
 ## Building and checking
 
 ```sh
-cargo run --release -p dunbrec-app -- --example 11   # examples 1–11, see File → Open example
+cargo run --release -p dunbrec-app -- --example 12   # examples 1–14, see File → Open example
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
@@ -60,6 +62,20 @@ Key mechanisms worth knowing before changing the engine:
   - An input crossing before that point discards the clone, replays the committed chip to the
     crossing, then applies the input. Timing is cycle-exact.
   - Sync points that are not pin changes do not reset integration (`kink = false`).
+- **Integrated circuits** (`macromodel.rs`):
+  - A `MacroModel` is a small netlist, like a SPICE `.subckt`. A `Composite` device builds its
+    elements as ordinary devices and presents them as one device, with internal nodes named
+    `U1#<net>` (and `U1#<part>.<suffix>` for a part's own internal nodes). Device indices still
+    match netlist elements.
+  - The 741 is the PSpice-library Boyle macromodel. Its linear POLY sources are sums of plain
+    controlled sources. `dunbrec_core::opamp_subckt` holds the SPICE original, which SPICE export
+    writes out; keep the two in step. Adding an op-amp means adding its macromodel plus an entry
+    in `OPAMP_PARTS` and `opamp_subckt`.
+  - The 555 is mixed-signal. Its analog half (divider, output-high drop, supply current) is a
+    composite. Its comparators, latch and switches are a digital part (`circuit.rs`,
+    `timer555_logic`). Inputs are `InputSense` comparators (`V(p) − V(n)` against thresholds),
+    and outputs are `SwitchDriver`s: resistive switches that ramp geometrically over 100 ns.
+  - Tests in `ic_tests.rs` check data-sheet behaviour: gain, GBW, slew, swing, 555 timing.
 - **Live edits** go through `Transient::update_element`. Returning `Ok(false)` means "restart
   needed", which is what an MCU firmware or clock change does.
 
@@ -95,7 +111,12 @@ Key mechanisms worth knowing before changing the engine:
    - Pressing Run and watching the serial monitor in the window has not been done.
 4. **Stale text:** the Simulate menu still says "Transient & instruments: coming in phase 6"
    (`crates/dunbrec-app/src/app.rs`).
-5. **Not yet supported:**
+5. **More chips.**
+   - Op-amps such as the LM358 and TL072, and a comparator such as the LM393, would reuse the
+     composite machinery.
+   - A CMOS 555 (TLC555) would need different output levels.
+   - The ngspice cross-check (item 1) can now also cover the exported 741 subcircuit.
+6. **Not yet supported:**
    - MCU: SPI, I²C, EEPROM, watchdog, serial receive and other chips.
    - Simulation: a fixed temperature of 27 °C, MOSFET level 1 only, and a single logic family.
    - Import: KiCad hierarchical sheets, SPICE `.param` expressions and EXP/SFFM sources.

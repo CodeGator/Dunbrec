@@ -188,6 +188,18 @@ pub fn palette() -> &'static [PaletteEntry] {
             },
         },
         PaletteEntry {
+            name: "741 op-amp",
+            group: "Integrated circuits",
+            make: || ComponentKind::OpAmp {
+                part: "uA741".into(),
+            },
+        },
+        PaletteEntry {
+            name: "555 timer",
+            group: "Integrated circuits",
+            make: || ComponentKind::Timer555,
+        },
+        PaletteEntry {
             name: "AND gate",
             group: "Digital",
             make: || ComponentKind::Gate {

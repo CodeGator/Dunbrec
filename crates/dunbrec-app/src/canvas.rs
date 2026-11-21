@@ -635,6 +635,8 @@ pub fn value_text(kind: &ComponentKind) -> String {
         ComponentKind::Clock { frequency, .. } => format_value(*frequency, "Hz"),
         ComponentKind::LogicSwitch { high } => (if *high { "high" } else { "low" }).into(),
         ComponentKind::Mcu { firmware, .. } => firmware_label(firmware),
+        ComponentKind::OpAmp { part } => part.clone(),
+        ComponentKind::Timer555 => "NE555".into(),
     }
 }
 

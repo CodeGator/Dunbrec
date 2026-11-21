@@ -9,9 +9,12 @@ use crate::device::{
     Capacitor, Cccs, Ccvs, ControlledPins, CurrentSource, Device, Inductor, Potentiometer,
     Resistor, Vccs, Vcvs, VoltageSource,
 };
-use crate::digital::{CMOS_5V, DigitalDriver, NullDevice, PartSpec};
+use crate::digital::{CMOS_5V, DigitalDriver, InputSense, NullDevice, PartSpec, SwitchDriver};
 use crate::error::{SimError, SimWarning};
 use crate::linalg::{DenseMatrix, LinearSolver};
+use crate::macromodel::{
+    Composite, TIMER555_EDGE, TIMER555_PORTS, TIMER555_R_OFF, TIMER555_R_ON, opamp, timer555,
+};
 use crate::mcu::{McuPin, McuSpec};
 use crate::semiconductor::{Bjt, BjtParams, Diode, DiodeParams, Mosfet, MosfetParams};
 use crate::stamp::{BranchId, Stamper, node_rows};
@@ -89,6 +92,21 @@ impl Circuit {
         let mut digital = Vec::new();
         let mut mcus = Vec::new();
         for (index, element) in netlist.elements.iter().enumerate() {
+            if let ComponentKind::Timer555 = element.kind {
+                let (spec, switches) = timer555_logic(
+                    index,
+                    element,
+                    devices[index].as_ref(),
+                    slots[index],
+                    devices.len(),
+                );
+                for switch in switches {
+                    devices.push(Box::new(switch));
+                    slots.push((None, None));
+                }
+                digital.push(spec);
+                continue;
+            }
             if !element.kind.is_digital() {
                 continue;
             }
@@ -111,15 +129,17 @@ impl Circuit {
                 });
                 continue;
             }
-            let mut input_nodes = Vec::new();
+            let mut inputs = Vec::new();
             let mut drivers = Vec::new();
             let mut output_nodes = Vec::new();
             for (pin, &node) in element.kind.pins().iter().zip(&element.nodes) {
                 match pin.domain {
-                    dunbrec_core::PinDomain::DigitalIn => input_nodes.push(node),
+                    dunbrec_core::PinDomain::DigitalIn => {
+                        inputs.push(InputSense::logic(node, &CMOS_5V))
+                    }
                     dunbrec_core::PinDomain::DigitalOut => {
                         drivers.push(devices.len());
-                        output_nodes.push(node);
+                        output_nodes.push(Some(node));
                         devices.push(Box::new(DigitalDriver::new(
                             format!("{}:{}", element.designator, pin.name),
                             node,
@@ -133,7 +153,7 @@ impl Circuit {
             digital.push(PartSpec {
                 element: index,
                 kind: element.kind.clone(),
-                input_nodes,
+                inputs,
                 drivers,
                 output_nodes,
             });
@@ -315,6 +335,81 @@ impl Circuit {
     }
 }
 
+/// Comparator hysteresis of the 555's threshold and trigger inputs (V).
+const TIMER555_HYSTERESIS: f64 = 1e-3;
+/// The 555's RESET pin clears it below about 0.7 V (rising and falling
+/// switching points, V).
+const TIMER555_RESET: (f64, f64) = (0.8, 0.6);
+
+/// The logic half of a 555 placed as element `index`, whose analog half is
+/// `device` (a [`Composite`] of [`timer555`]): the trigger comparator (high
+/// while TRIG is below the 1/3 VCC tap), the threshold comparator (high while
+/// THR is above CTRL, 2/3 VCC), the RESET input, and three switches — output
+/// to the high-side supply, output to GND, and DIS to GND. The switches are
+/// returned for the caller to add to the circuit, in that order, starting at
+/// device index `first_driver` (the present device count).
+fn timer555_logic(
+    index: usize,
+    element: &Element,
+    device: &dyn Device,
+    (_, first_internal): (Option<BranchId>, Option<NodeId>),
+    first_driver: usize,
+) -> (PartSpec, Vec<SwitchDriver>) {
+    let pin = |name: &str| {
+        let i = TIMER555_PORTS
+            .iter()
+            .position(|&p| p == name)
+            .expect("555 pin");
+        element.nodes[i]
+    };
+    let internal = |name: &str| {
+        let k = device
+            .internal_nodes()
+            .iter()
+            .position(|n| n == name)
+            .expect("555 internal net");
+        NodeId(first_internal.expect("555 has internal nets").0 + k)
+    };
+    let (gnd, out) = (pin("GND"), pin("OUT"));
+    let inputs = vec![
+        InputSense::comparator(internal("mid"), pin("TRIG"), TIMER555_HYSTERESIS),
+        InputSense::comparator(pin("THR"), pin("CTRL"), TIMER555_HYSTERESIS),
+        InputSense {
+            p: pin("RESET"),
+            n: gnd,
+            rise: TIMER555_RESET.0,
+            fall: TIMER555_RESET.1,
+        },
+    ];
+    let paths = [
+        ("out-high", internal("high"), out),
+        ("out-low", out, gnd),
+        ("discharge", pin("DIS"), gnd),
+    ];
+    let switches: Vec<SwitchDriver> = paths
+        .iter()
+        .zip(TIMER555_R_ON)
+        .map(|(&(what, a, b), r_on)| {
+            SwitchDriver::new(
+                format!("{}:{what}", element.designator),
+                (a, b),
+                (r_on, TIMER555_R_OFF),
+                TIMER555_EDGE,
+                CMOS_5V,
+            )
+        })
+        .collect();
+    let spec = PartSpec {
+        element: index,
+        kind: element.kind.clone(),
+        inputs,
+        drivers: (first_driver..first_driver + switches.len()).collect(),
+        // Only the high side reads as the output's logic level.
+        output_nodes: vec![Some(out), None, None],
+    };
+    (spec, switches)
+}
+
 fn invalid(e: &Element, message: impl Into<String>) -> SimError {
     SimError::InvalidParameter {
         designator: e.designator.clone(),
@@ -347,7 +442,7 @@ fn controlled_pins(e: &Element) -> ControlledPins {
     }
 }
 
-fn make_device(e: &Element, models: &ModelLibrary) -> Result<Box<dyn Device>, SimError> {
+pub(crate) fn make_device(e: &Element, models: &ModelLibrary) -> Result<Box<dyn Device>, SimError> {
     let name = e.designator.clone();
     let node = |i: usize| e.nodes[i];
     Ok(match &e.kind {
@@ -371,6 +466,19 @@ fn make_device(e: &Element, models: &ModelLibrary) -> Result<Box<dyn Device>, Si
             check_positive(e, "clock frequency", *clock)?;
             Box::new(NullDevice { name })
         }
+        ComponentKind::OpAmp { part } => {
+            let model = opamp(part).ok_or_else(|| {
+                invalid(
+                    e,
+                    format!(
+                        "no built-in op-amp model '{part}' (available: {})",
+                        dunbrec_core::OPAMP_PARTS.join(", ")
+                    ),
+                )
+            })?;
+            Box::new(Composite::new(name, model, &e.nodes)?)
+        }
+        ComponentKind::Timer555 => Box::new(Composite::new(name, timer555(), &e.nodes)?),
         ComponentKind::Resistor { resistance } => {
             let r = check_finite(e, "resistance", *resistance)?;
             if r == 0.0 {

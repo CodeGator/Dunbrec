@@ -19,5 +19,5 @@ pub use netlist::{
 };
 pub use schematic::{
     Component, ComponentId, ComponentKind, DEFAULT_LOGIC_DELAY, DEFAULT_MCU_CLOCK, GateOp, LabelId,
-    NetLabel, PinDomain, Point, Polarity, Rotation, Schematic, Waveform, Wire, WireId,
+    NetLabel, OPAMP_PARTS, PinDomain, Point, Polarity, Rotation, Schematic, Waveform, Wire, WireId,
 };

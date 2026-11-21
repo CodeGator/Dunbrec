@@ -24,7 +24,8 @@ pub enum ExportError {
     #[error("the schematic has problems that must be fixed before exporting: {0:?}")]
     Netlist(Vec<String>),
     #[error(
-        "logic parts and microcontrollers cannot be written as a plain SPICE netlist: {}",
+        "logic parts, microcontrollers and 555 timers cannot be written as a plain SPICE \
+         netlist: {}",
         .0.join(", ")
     )]
     Digital(Vec<String>),
@@ -125,7 +126,7 @@ pub fn export(
     let digital: Vec<String> = netlist
         .elements
         .iter()
-        .filter(|e| e.kind.is_digital())
+        .filter(|e| e.kind.is_digital() || matches!(e.kind, K::Timer555))
         .map(|e| e.designator.clone())
         .collect();
     if !digital.is_empty() {
@@ -158,6 +159,8 @@ fn write_netlist(
         }
     );
     let _ = writeln!(out, "* Exported by Dunbrec {}", env!("CARGO_PKG_VERSION"));
+    // Subcircuits the netlist uses, written once each after the elements.
+    let mut subckts: Vec<&'static str> = Vec::new();
 
     for e in &netlist.elements {
         let n: Vec<String> = e.nodes.iter().map(|&id| node(id)).collect();
@@ -172,7 +175,17 @@ fn write_netlist(
             | K::Clock { .. }
             | K::LogicSwitch { .. }
             | K::LogicLed
-            | K::Mcu { .. } => continue,
+            | K::Mcu { .. }
+            | K::Timer555 => continue,
+            K::OpAmp { part } => match dunbrec_core::schematic::opamp_subckt(part) {
+                Some((name, text)) => {
+                    if !subckts.contains(&text) {
+                        subckts.push(text);
+                    }
+                    format!("{} {} {name}", element_name('X', d), n.join(" "))
+                }
+                None => format!("* {d}: no SPICE model for op-amp '{part}'"),
+            },
             K::Resistor { resistance } => {
                 format!(
                     "{} {} {} {}",
@@ -326,6 +339,10 @@ fn write_netlist(
         let _ = writeln!(out, "{line}");
     }
 
+    for text in subckts {
+        out.push_str(text);
+    }
+
     for m in schematic.models.iter() {
         let params: Vec<String> = m
             .params
@@ -354,6 +371,80 @@ fn write_netlist(
 mod tests {
     use super::*;
     use crate::spice::import;
+    use dunbrec_core::Point;
+
+    /// A part with every pin on its own labelled net, plus a ground.
+    fn lone_part(kind: K, names: &[&str]) -> Schematic {
+        let mut s = Schematic::new();
+        let id = s.add_component(kind, Point::new(0, 0));
+        let pins: Vec<Point> = s
+            .component(id)
+            .unwrap()
+            .pin_positions()
+            .map(|(_, p)| p)
+            .collect();
+        for (name, p) in names.iter().zip(pins) {
+            s.add_label(*name, p);
+        }
+        s.add_component(K::Ground, Point::new(20, 20));
+        s.add_label(names[0], Point::new(20, 20));
+        s
+    }
+
+    #[test]
+    fn opamps_export_as_subcircuits() {
+        let mut s = lone_part(
+            K::OpAmp {
+                part: "uA741".into(),
+            },
+            &["gnd", "inv", "vp", "vn", "out"],
+        );
+        // A second 741 shares the one definition.
+        let id = s.add_component(
+            K::OpAmp {
+                part: "uA741".into(),
+            },
+            Point::new(0, 10),
+        );
+        let pins: Vec<Point> = s
+            .component(id)
+            .unwrap()
+            .pin_positions()
+            .map(|(_, p)| p)
+            .collect();
+        for (name, p) in ["gnd", "inv", "vp", "vn", "out2"].iter().zip(pins) {
+            s.add_label(*name, p);
+        }
+        let text = export(&s, "op-amps", &[]).unwrap();
+        assert!(
+            text.contains(
+                "XU1 0 inv vp vn out UA741
+"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "XU2 0 inv vp vn out2 UA741
+"
+            ),
+            "{text}"
+        );
+        assert_eq!(text.matches(".subckt UA741 1 2 3 4 5").count(), 1, "{text}");
+        assert!(text.contains(".ends UA741"));
+    }
+
+    #[test]
+    fn timers_are_not_exported() {
+        let s = lone_part(
+            K::Timer555,
+            &["gnd", "trig", "out", "reset", "ctrl", "thr", "dis", "vcc"],
+        );
+        match export(&s, "", &[]) {
+            Err(ExportError::Digital(parts)) => assert_eq!(parts, vec!["U1".to_string()]),
+            other => panic!("{other:?}"),
+        }
+    }
 
     const DECK: &str = "round trip\n\
         V1 vcc 0 DC 12\n\

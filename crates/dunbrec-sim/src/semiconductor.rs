@@ -407,9 +407,9 @@ impl Device for Diode {
         let (_, c) = self.charge(vd);
         s.admittance(self.anode_int, self.cathode, C64::new(gd, ctx.omega * c));
     }
-    fn internal_nodes(&self) -> Vec<&'static str> {
+    fn internal_nodes(&self) -> Vec<String> {
         if self.p.rs > 0.0 {
-            vec!["a"]
+            vec!["a".into()]
         } else {
             Vec::new()
         }
@@ -453,8 +453,9 @@ impl Device for Diode {
             stamp_charge(s, &self.charge, (a, k), (q, c, vd), 1.0, ctx);
         }
     }
+    /// Through the series resistance (if any) and the junction.
     fn dc_paths(&self) -> Vec<(NodeId, NodeId)> {
-        vec![(self.anode, self.cathode)]
+        vec![(self.anode, self.anode_int), (self.anode_int, self.cathode)]
     }
     /// Junction current plus charging current, into the anode.
     fn current(&self, sol: &SolutionView) -> f64 {
@@ -732,16 +733,16 @@ impl Device for Bjt {
         s.capacitance(b, e, cbe, ctx.omega);
         s.capacitance(b, c, cbc, ctx.omega);
     }
-    fn internal_nodes(&self) -> Vec<&'static str> {
+    fn internal_nodes(&self) -> Vec<String> {
         let mut names = Vec::new();
         if self.p.rc > 0.0 {
-            names.push("c");
+            names.push("c".into());
         }
         if self.p.rb > 0.0 {
-            names.push("b");
+            names.push("b".into());
         }
         if self.p.re > 0.0 {
-            names.push("e");
+            names.push("e".into());
         }
         names
     }
@@ -808,11 +809,16 @@ impl Device for Bjt {
             stamp_charge(s, &self.charge_bc, (b, c), (qbc, cbc, vbc), t, ctx);
         }
     }
+    /// Through the terminal resistances (if any) and between the internal
+    /// terminals.
     fn dc_paths(&self) -> Vec<(NodeId, NodeId)> {
         vec![
-            (self.base, self.emitter),
-            (self.base, self.collector),
-            (self.collector, self.emitter),
+            (self.collector, self.c_int),
+            (self.base, self.b_int),
+            (self.emitter, self.e_int),
+            (self.b_int, self.e_int),
+            (self.b_int, self.c_int),
+            (self.c_int, self.e_int),
         ]
     }
     /// Collector current (into the collector pin), including the current
@@ -1041,13 +1047,13 @@ impl Device for Mosfet {
         s.capacitance(g, d, cgd, ctx.omega);
         s.capacitance(src, d, cbd, ctx.omega);
     }
-    fn internal_nodes(&self) -> Vec<&'static str> {
+    fn internal_nodes(&self) -> Vec<String> {
         let mut names = Vec::new();
         if self.p.rd > 0.0 {
-            names.push("d");
+            names.push("d".into());
         }
         if self.p.rs > 0.0 {
-            names.push("s");
+            names.push("s".into());
         }
         names
     }
@@ -1116,8 +1122,13 @@ impl Device for Mosfet {
             }
         }
     }
+    /// Through the drain and source resistances (if any) and the channel.
     fn dc_paths(&self) -> Vec<(NodeId, NodeId)> {
-        vec![(self.drain, self.source)]
+        vec![
+            (self.drain, self.d_int),
+            (self.source, self.s_int),
+            (self.d_int, self.s_int),
+        ]
     }
     /// Drain current (into the drain pin), including currents charging the
     /// gate-drain and bulk-drain capacitances.

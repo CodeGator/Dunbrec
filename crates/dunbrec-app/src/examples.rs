@@ -57,7 +57,158 @@ pub fn examples() -> &'static [Example] {
             name: "Arduino pot, PWM and serial",
             build: arduino_pot_serial,
         },
+        Example {
+            name: "Op-amp inverting amplifier",
+            build: opamp_inverting,
+        },
+        Example {
+            name: "555 LED blinker",
+            build: timer555_blinker,
+        },
+        Example {
+            name: "555 one-shot",
+            build: timer555_one_shot,
+        },
     ]
+}
+
+/// DC supply `volts` at (x, -6) with its - pin (or + pin, if `negative`)
+/// grounded below and the other pin wired up to a `label` at (x, -10).
+fn supply(s: &mut Schematic, x: i32, volts: f64, negative: bool, label: &str) {
+    let rotation = if negative {
+        Rotation::R180
+    } else {
+        Rotation::R0
+    };
+    let source = K::VoltageSource {
+        waveform: Waveform::Dc(volts),
+    };
+    place(s, source, x, -6, rotation); // (x,-8) and (x,-4)
+    place(s, K::Ground, x, -3, Rotation::R0);
+    wire(s, &[(x, -4), (x, -3)]);
+    // Longer than the stubs on the op-amp, so the voltage tag shows here.
+    wire(s, &[(x, -8), (x, -10)]);
+    s.add_label(label, Point::new(x, -10));
+}
+
+/// A 741 with gain -10 (10 kΩ in, 100 kΩ feedback) on ±15 V: the 0.5 V,
+/// 1 kHz input comes out inverted at 5 V. Scope VIN and VOUT; raise the
+/// input past 1.4 V to see the output clip near the supplies.
+pub fn opamp_inverting() -> Schematic {
+    let mut s = Schematic::new();
+    let opamp = K::OpAmp {
+        part: "uA741".into(),
+    };
+    // in+ (-3,1), in- (-3,-1), V+ (0,-3), V- (0,3), out (3,0).
+    place(&mut s, opamp, 0, 0, Rotation::R0);
+    place(&mut s, sine(0.5, 1e3), -12, 1, Rotation::R0); // (-12,-1) (-12,3)
+    place(&mut s, K::Ground, -12, 4, Rotation::R0);
+    place(&mut s, r(10e3), -7, -1, Rotation::R0); // (-9,-1) (-5,-1)
+    place(&mut s, r(100e3), 0, -6, Rotation::R0); // (-2,-6) (2,-6)
+    place(&mut s, K::Ground, -3, 2, Rotation::R0);
+    place(&mut s, r(10e3), 6, 3, Rotation::R90); // (6,1) (6,5)
+    place(&mut s, K::Ground, 6, 6, Rotation::R0);
+    wire(&mut s, &[(-12, -1), (-9, -1)]);
+    wire(&mut s, &[(-12, 3), (-12, 4)]);
+    wire(&mut s, &[(-5, -1), (-3, -1)]);
+    wire(&mut s, &[(-3, 1), (-3, 2)]);
+    // Feedback from the output over the top to the inverting input.
+    wire(&mut s, &[(-4, -1), (-4, -6), (-2, -6)]);
+    wire(&mut s, &[(2, -6), (5, -6), (5, 0)]);
+    wire(&mut s, &[(3, 0), (6, 0), (6, 1)]);
+    wire(&mut s, &[(6, 5), (6, 6)]);
+    // Supplies by name: short stubs on V+ and V-.
+    wire(&mut s, &[(0, -3), (0, -4)]);
+    wire(&mut s, &[(0, 3), (0, 4)]);
+    s.add_label("+15V", Point::new(0, -4));
+    s.add_label("-15V", Point::new(0, 4));
+    supply(&mut s, 12, 15.0, false, "+15V");
+    supply(&mut s, 19, 15.0, true, "-15V");
+    s.add_label("VIN", Point::new(-10, -1));
+    s.add_label("VOUT", Point::new(4, 0));
+    s
+}
+
+/// 555 pins with the chip at the origin: GND (-1,6), TRIG (-5,2),
+/// OUT (5,0), RESET (1,-6), CTRL (1,6), THR (-5,0), DIS (-5,-2), VCC (-1,-6).
+/// Places the chip, a 9 V supply at x = -16, a VCC rail at y = -8 and a
+/// ground rail at y = 10 (both reaching `right`), VCC and RESET tied to the
+/// rail, the 10 nF CTRL decoupling capacitor, and a logic LED on OUT.
+fn timer555_frame(s: &mut Schematic, right: i32) {
+    place(s, K::Timer555, 0, 0, Rotation::R0);
+    let source = K::VoltageSource {
+        waveform: Waveform::Dc(9.0),
+    };
+    place(s, source, -16, 1, Rotation::R0); // (-16,-1) (-16,3)
+    place(s, K::Ground, -16, 11, Rotation::R0);
+    wire(s, &[(-16, -1), (-16, -8), (right, -8)]);
+    wire(s, &[(-16, 3), (-16, 10), (right, 10)]);
+    wire(s, &[(-16, 10), (-16, 11)]);
+    wire(s, &[(-1, -6), (-1, -8)]);
+    wire(s, &[(1, -6), (1, -8)]);
+    wire(s, &[(-1, 6), (-1, 10)]);
+    place(s, c(10e-9), 1, 8, Rotation::R90); // (1,6) (1,10) on the rail
+    place(s, K::LogicLed, 10, 0, Rotation::R0); // input (7,0)
+    wire(s, &[(5, 0), (7, 0)]);
+    s.add_label("OUT", Point::new(6, 0));
+}
+
+/// A 555 astable: RA = 1 kΩ, RB = 68 kΩ, C = 10 µF blink the LED at about
+/// 1 Hz (f = 1.44 / ((RA + 2 RB) C)), high 50.4 % of the time. Run at real
+/// time to watch it; scope TIMING to see the capacitor swing between 3 V
+/// and 6 V (1/3 and 2/3 of the supply).
+pub fn timer555_blinker() -> Schematic {
+    let mut s = Schematic::new();
+    timer555_frame(&mut s, 2);
+    place(&mut s, r(1e3), -10, -5, Rotation::R90); // RA (-10,-7) (-10,-3)
+    place(&mut s, r(68e3), -10, 1, Rotation::R90); // RB (-10,-1) (-10,3)
+    let timing = K::Capacitor {
+        capacitance: 10e-6,
+        initial_voltage: Some(0.0),
+    };
+    place(&mut s, timing, -6, 8, Rotation::R90); // (-6,6) (-6,10)
+    wire(&mut s, &[(-10, -8), (-10, -7)]);
+    wire(&mut s, &[(-10, -3), (-10, -2), (-5, -2)]);
+    wire(&mut s, &[(-10, -2), (-10, -1)]);
+    // THR and TRIG both watch the capacitor.
+    wire(&mut s, &[(-10, 3), (-10, 4), (-6, 4)]);
+    wire(&mut s, &[(-5, 0), (-6, 0), (-6, 6)]);
+    wire(&mut s, &[(-5, 2), (-6, 2)]);
+    s.add_label("DIS", Point::new(-8, -2));
+    s.add_label("TIMING", Point::new(-6, 5));
+    s
+}
+
+/// A 555 monostable: closing the switch pulls TRIG low and the output goes
+/// high for 1.1 RC = 1.1 s (100 kΩ, 10 µF), then low again. Double-click
+/// the switch to close it and again to open it — a quick press and
+/// release. Held closed, the output stays high until it is released.
+pub fn timer555_one_shot() -> Schematic {
+    let mut s = Schematic::new();
+    timer555_frame(&mut s, 16);
+    // Timing resistor from VCC; DIS and THR on the capacitor.
+    place(&mut s, r(100e3), -10, -5, Rotation::R90); // (-10,-7) (-10,-3)
+    place(&mut s, c(10e-6), -10, 8, Rotation::R90); // (-10,6) (-10,10)
+    wire(&mut s, &[(-10, -8), (-10, -7)]);
+    wire(&mut s, &[(-10, -3), (-10, 6)]);
+    wire(&mut s, &[(-5, -2), (-10, -2)]);
+    wire(&mut s, &[(-5, 0), (-10, 0)]);
+    // TRIG: 10 kΩ pull-up and a switch to ground, joined by the TRIG label.
+    wire(&mut s, &[(-5, 2), (-7, 2)]);
+    place(&mut s, r(10e3), 16, -5, Rotation::R90); // (16,-7) (16,-3)
+    let button = K::Switch {
+        closed: false,
+        r_on: 0.1,
+        r_off: 1e9,
+    };
+    place(&mut s, button, 16, 1, Rotation::R90); // (16,-1) (16,3)
+    wire(&mut s, &[(16, -8), (16, -7)]);
+    wire(&mut s, &[(16, -3), (16, -1)]);
+    wire(&mut s, &[(16, 3), (16, 10)]);
+    s.add_label("TRIG", Point::new(-6, 2));
+    s.add_label("TRIG", Point::new(16, -2));
+    s.add_label("TIMING", Point::new(-8, 0));
+    s
 }
 
 fn mcu(program: &str) -> K {
@@ -491,6 +642,12 @@ mod tests {
                     assert!(!high("AND") && high("OR") && high("XOR"));
                     continue;
                 }
+                // Astable: no steady state to check; see `timer555_examples_run`.
+                "555 LED blinker" => continue,
+                "555 one-shot" => {
+                    assert!(!high("OUT"), "waits for a trigger");
+                    continue;
+                }
                 "Binary counter" => {
                     assert!(
                         ["Q0", "Q1", "Q2", "Q3"].iter().all(|q| !high(q)),
@@ -510,7 +667,49 @@ mod tests {
                 }
                 "Zener regulator" => assert!(vout > 4.4 && vout < 4.9, "VOUT = {vout}"),
                 "CMOS inverter" => assert!(vout > 0.0 && vout < 5.0, "VOUT = {vout}"),
+                // Sine input at 0 V: only the input offset shows.
+                "Op-amp inverting amplifier" => assert!(vout.abs() < 0.05, "VOUT = {vout}"),
                 other => panic!("no expectation for {other}"),
+            }
+        }
+    }
+
+    /// Times at which `v` crosses `level` upwards.
+    fn rising(times: &[f64], v: &[f64], level: f64) -> Vec<f64> {
+        (1..v.len())
+            .filter(|&i| v[i - 1] < level && v[i] >= level)
+            .map(|i| times[i])
+            .collect()
+    }
+
+    #[test]
+    fn timer555_examples_run() {
+        use dunbrec_sim::{TransientOptions, transient};
+        let s = timer555_blinker();
+        let netlist = build_netlist(&s);
+        let circuit = Circuit::from_netlist(&netlist, &s.models).unwrap();
+        let res = transient(circuit, TransientOptions::new(3.5).with_max_step(2e-3)).unwrap();
+        let out = res.voltage("OUT").unwrap();
+        let rises = rising(&res.times, out, 4.5);
+        assert!(rises.len() >= 3, "{rises:?}");
+        // Steady cycles (after the first, which starts from 0 V).
+        let period = rises[2] - rises[1];
+        let expected = std::f64::consts::LN_2 * (1e3 + 2.0 * 68e3) * 10e-6;
+        assert!((period / expected - 1.0).abs() < 0.02, "period {period}");
+
+        // The op-amp example amplifies by -10: 5 V peak out. With 1 MHz
+        // gain-bandwidth the closed-loop bandwidth is ~90 kHz, so at 1 kHz
+        // the output lags by ~0.6°, up to ~60 mV from an exact -10 x VIN.
+        let s = opamp_inverting();
+        let netlist = build_netlist(&s);
+        let circuit = Circuit::from_netlist(&netlist, &s.models).unwrap();
+        let res = transient(circuit, TransientOptions::new(3e-3).with_max_step(10e-6)).unwrap();
+        let (vin, vout) = (res.voltage("VIN").unwrap(), res.voltage("VOUT").unwrap());
+        let peak = vout.iter().cloned().fold(f64::MIN, f64::max);
+        assert!((peak - 5.0).abs() < 0.05, "peak {peak}");
+        for (i, t) in res.times.iter().enumerate() {
+            if *t > 1e-3 {
+                assert!((vout[i] + 10.0 * vin[i]).abs() < 0.1, "t = {t}");
             }
         }
     }

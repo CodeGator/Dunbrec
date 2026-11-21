@@ -4,9 +4,10 @@ A desktop electronics workbench written in Rust: draw or import a schematic, sim
 watch any node live with virtual instruments — oscilloscope, multimeter, function generator,
 Bode plotter and curve tracer.
 
-Circuits can mix analog parts (discrete components, sources, diodes, transistors), digital
-logic (gates, flip-flops, counters, clocks) and microcontrollers running real firmware (an
-ATmega328P, as on the Arduino Uno) in one simulation.
+Circuits can mix analog parts (discrete components, sources, diodes, transistors),
+integrated circuits (a 741 op-amp and a 555 timer), digital logic (gates, flip-flops, counters,
+clocks) and microcontrollers running real firmware (an ATmega328P, as on the Arduino Uno) in
+one simulation.
 
 ## Installing
 
@@ -21,7 +22,7 @@ Files, adds a Start-menu shortcut and opens `.dbr` files with Dunbrec. Or run fr
 
 ```sh
 cargo run --release -p dunbrec-app                     # empty schematic
-cargo run --release -p dunbrec-app -- --example 2      # an example (1–11, see File → Open example)
+cargo run --release -p dunbrec-app -- --example 2      # an example (1–14, see File → Open example)
 cargo run --release -p dunbrec-app -- my.dbr           # open a file
 cargo run --release -p dunbrec-app -- amp.cir          # import a SPICE netlist
 cargo run --release -p dunbrec-app -- board.kicad_sch  # import a KiCad schematic
@@ -66,6 +67,23 @@ through 50 Ω with a 5 ns edge, inputs switch at 3.5 V rising and 1.5 V falling.
 drive a capacitor, an analog signal can clock a counter, and the scope works on any net. Try
 File → Open example → Logic gates or Binary counter (run with Speed at real time).
 
+**Integrated circuits.** The palette's *Integrated circuits* group has two classic chips:
+
+- **741 op-amp** — the standard Boyle macromodel of the uA741 (as in the PSpice library):
+  two input transistors, about 200 000 open-loop gain, 1 MHz gain-bandwidth, 0.5 V/µs slew
+  rate, an output current limit, and an output that stops 1–2 V short of the supplies. Pins:
+  in+, in− (on top), V+, V−, out; power it from a supply such as ±15 V.
+- **555 timer** — the bipolar NE555. Its 5 kΩ divider sets the references (CTRL at 2/3 VCC,
+  and 1/3 VCC for the trigger); the output goes high (about VCC − 1.4 V) when TRIG falls below
+  1/3 VCC and low when THR rises above CTRL, DIS shorts to GND while the output is low, and
+  RESET below 0.7 V forces the output low. Astable and monostable circuits time to the usual
+  formulas.
+
+Try File → Open example → Op-amp inverting amplifier, 555 LED blinker or 555 one-shot (run the
+555 examples at real-time speed). Each chip is a *composite part*: one symbol that simulates as
+a small built-in circuit of ordinary devices, so more op-amps and similar chips can be added as
+data.
+
 **Microcontrollers.** The palette's *Microcontrollers* group has an ATmega328P with the Arduino
 pin names (D0–D13, A0–A5) and an implicit 5 V supply. It runs real compiled firmware cycle by
 cycle: digital I/O with pull-ups, pin-change and external interrupts, timers 0/1/2 (so
@@ -88,7 +106,8 @@ voltage). Any part's model can be switched to a library model in the properties 
 (R, C, L, V/I with DC/SIN/PULSE/PWL, D, Q, M, E/F/G/H, `.model`, `.subckt`) and KiCad 6+
 schematics (top sheet; `Device`, `Simulation_SPICE`, `Switch` and `power` libraries plus
 `Sim.*` fields). Imported parts are connected with net labels; anything that could not be
-imported is listed. File → Export SPICE netlist writes a netlist ngspice can run.
+imported is listed. File → Export SPICE netlist writes a netlist ngspice can run; a 741 is
+written as a subcircuit call with its `.subckt` definition included.
 
 ## Workspace
 
@@ -114,9 +133,11 @@ imported is listed. File → Export SPICE netlist writes a netlist ngspice can r
 9. Polish: parts library, examples, copy/paste, settings, icon, installer ✅
 10. Digital logic: gates, flip-flops, counters, clocks, logic analyser ✅
 11. Microcontrollers: ATmega328P emulation, `.hex` firmware, GPIO/timers/PWM/ADC/serial ✅
+12. Integrated circuits: composite parts, 741 op-amp (Boyle macromodel), 555 timer ✅
 
 Known limits: fixed temperature (27 °C); MOSFETs are level 1 only; one logic family (5 V
-CMOS-style); logic parts and microcontrollers are not exported to SPICE; the ATmega328P has no
+CMOS-style); logic parts, microcontrollers and 555 timers are not exported to SPICE; the 555
+has no input bias currents and switches its outputs rather than modelling its transistors; the ATmega328P has no
 SPI, I²C, EEPROM, watchdog, serial receive or sleep-mode power differences yet, and only the
 ATmega328P is available; KiCad hierarchical sheets, SPICE `.param`
 expressions and EXP/SFFM sources are not supported yet.
