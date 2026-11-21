@@ -20,6 +20,8 @@ pub enum Pane {
     Properties,
     Checks,
     Values,
+    /// The firmware source editor.
+    Code,
     /// A panel an older build could dock (the instruments). Layouts saved by
     /// those builds still load; these tabs are dropped on the way in.
     #[serde(other)]
@@ -28,8 +30,13 @@ pub enum Pane {
 
 impl Pane {
     /// The panels the user can bring back from View → Panels.
-    pub const SIDE_PANELS: [Pane; 4] =
-        [Pane::Palette, Pane::Properties, Pane::Checks, Pane::Values];
+    pub const SIDE_PANELS: [Pane; 5] = [
+        Pane::Palette,
+        Pane::Properties,
+        Pane::Checks,
+        Pane::Values,
+        Pane::Code,
+    ];
 
     pub fn title(self) -> &'static str {
         match self {
@@ -38,6 +45,7 @@ impl Pane {
             Pane::Properties => "Properties",
             Pane::Checks => "Checks",
             Pane::Values => "Values",
+            Pane::Code => "Code",
             Pane::Retired => "",
         }
     }
@@ -101,6 +109,12 @@ pub fn open(dock: &mut DockState<Pane>, pane: Pane) {
             if !join(dock, &[Pane::Checks, Pane::Values], pane) {
                 dock.main_surface_mut()
                     .split_below(NodeIndex::root(), UPPER_SHARE, vec![pane]);
+            }
+        }
+        // The editor is a tab beside the schematic, like an editor in an IDE.
+        Pane::Code => {
+            if !join(dock, &[Pane::Schematic], pane) {
+                dock.push_to_first_leaf(pane);
             }
         }
         Pane::Retired => {}
@@ -251,12 +265,14 @@ mod tests {
             assert!(is_open(&dock, p), "{p:?}");
         }
         assert_eq!(leaf_of(&dock, Pane::Checks), leaf_of(&dock, Pane::Values));
-        assert_eq!(panes(&dock).len(), 5);
+        // The code editor is a tab beside the schematic.
+        assert_eq!(leaf_of(&dock, Pane::Code), leaf_of(&dock, Pane::Schematic));
+        assert_eq!(panes(&dock).len(), 6);
         // Opening one that is already open leaves it alone.
         let before = leaf_of(&dock, Pane::Palette);
         open(&mut dock, Pane::Palette);
         assert_eq!(leaf_of(&dock, Pane::Palette), before);
-        assert_eq!(panes(&dock).len(), 5);
+        assert_eq!(panes(&dock).len(), 6);
     }
 
     #[test]

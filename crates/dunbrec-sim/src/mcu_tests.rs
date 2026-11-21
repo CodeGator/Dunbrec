@@ -451,3 +451,192 @@ fn an_input_edge_during_a_step_does_not_make_it_run_two_instructions() {
         }
     }
 }
+
+/// A circuit whose MCU runs the schematic's own source file `main`.
+fn circuit_with_source(
+    source: &str,
+    language: dunbrec_core::SourceLanguage,
+) -> Result<Circuit, SimError> {
+    let b = NetlistBuilder::new().element("R1", r(1e3), &["D13", "0"]);
+    let mut netlist = with_mcu(b, "source:main").build();
+    netlist.sources.insert(
+        "main".into(),
+        dunbrec_core::SourceFile {
+            language,
+            text: source.into(),
+        },
+    );
+    Circuit::from_netlist(&netlist, &ModelLibrary::new())
+}
+
+#[test]
+fn firmware_can_be_assembly_text_stored_with_the_schematic() {
+    let circuit = circuit_with_source(
+        "
+        sbi DDRB, PB5     ; D13 is an output
+        sbi PORTB, PB5    ; and high
+loop:   rjmp loop
+",
+        dunbrec_core::SourceLanguage::Asm,
+    )
+    .unwrap();
+    let res = transient(circuit, TransientOptions::new(1e-3)).unwrap();
+    let v = res.at(res.voltage("D13").unwrap(), 0.5e-3);
+    assert!((v - 5.0 * 1e3 / (1e3 + MCU_R_OUT)).abs() < 1e-3, "{v}");
+}
+
+#[test]
+fn a_source_file_with_errors_reports_them_by_line() {
+    let circuit = circuit_with_source(
+        "nop\nldi r16, nothing\n\nbogus r1\n",
+        dunbrec_core::SourceLanguage::Asm,
+    )
+    .unwrap();
+    let err = transient(circuit, TransientOptions::new(1e-3)).unwrap_err();
+    let text = err.to_string();
+    assert!(text.contains("U1"), "{text}");
+    assert!(
+        text.contains("main:2:10: 'nothing' is not defined"),
+        "{text}"
+    );
+    assert!(text.contains("main:4:1:"), "{text}");
+}
+
+#[test]
+fn a_missing_source_file_or_a_cpp_sketch_is_explained() {
+    let b = NetlistBuilder::new().element("R1", r(1e3), &["D13", "0"]);
+    let netlist = with_mcu(b, "source:gone").build();
+    let circuit = Circuit::from_netlist(&netlist, &ModelLibrary::new()).unwrap();
+    let err = transient(circuit, TransientOptions::new(1e-3)).unwrap_err();
+    assert!(
+        err.to_string().contains("no source file called 'gone'"),
+        "{err}"
+    );
+
+    let circuit =
+        circuit_with_source("void setup() {}", dunbrec_core::SourceLanguage::Cpp).unwrap();
+    let err = transient(circuit, TransientOptions::new(1e-3)).unwrap_err();
+    assert!(err.to_string().contains("C++ sketch"), "{err}");
+}
+
+#[test]
+fn an_arduino_sketch_built_by_the_real_toolchain_blinks_the_led_in_the_circuit() {
+    let Some(cli) = dunbrec_mcu::arduino::find_cli(None) else {
+        eprintln!("arduino-cli not installed: skipped");
+        return;
+    };
+    let sketch = "void setup() { pinMode(LED_BUILTIN, OUTPUT); }\n\
+                  void loop() { digitalWrite(LED_BUILTIN, HIGH); delay(250); \
+                  digitalWrite(LED_BUILTIN, LOW); delay(250); }\n";
+    // Not built yet: the circuit says so.
+    let circuit = circuit_with_source(sketch, dunbrec_core::SourceLanguage::Cpp).unwrap();
+    let err = transient(circuit, TransientOptions::new(1e-3)).unwrap_err();
+    assert!(err.to_string().contains("press Build"), "{err}");
+    // Build it, and the same circuit runs the compiled program.
+    let built = dunbrec_mcu::arduino::build(&cli, "blink", sketch).expect("builds");
+    dunbrec_mcu::arduino::remember(sketch, built.image);
+    let circuit = circuit_with_source(sketch, dunbrec_core::SourceLanguage::Cpp).unwrap();
+    let res = transient(circuit, TransientOptions::new(1.1)).unwrap();
+    let ups = rising(&res, "D13", 2.5);
+    // delay(250) high, delay(250) low: a rising edge every half second.
+    assert!(ups.len() >= 2, "{ups:?}");
+    let period = ups[1] - ups[0];
+    assert!((period - 0.5).abs() < 0.02, "period {period}");
+}
+
+// ---- Real Arduino sketches, compiled by the real toolchain ---------------
+//
+// These are the most valuable checks of the emulator: firmware not written
+// by us, built by avr-gcc against the real Arduino core. Each does nothing
+// on a machine without arduino-cli.
+
+/// Build `sketch` with the real toolchain and remember the image, so a
+/// circuit can run it as source file `main`. False if there is no tool.
+fn build_real_sketch(sketch: &str) -> bool {
+    let Some(cli) = dunbrec_mcu::arduino::find_cli(None) else {
+        eprintln!("arduino-cli not installed: skipped");
+        return false;
+    };
+    let built = dunbrec_mcu::arduino::build(&cli, "main", sketch)
+        .unwrap_or_else(|e| panic!("the sketch should build:\n{e:?}"));
+    dunbrec_mcu::arduino::remember(sketch, built.image);
+    true
+}
+
+/// A circuit with the chip running sketch `main` plus whatever `wire` adds.
+fn sketch_circuit(sketch: &str, wire: impl FnOnce(NetlistBuilder) -> NetlistBuilder) -> Circuit {
+    let mut netlist = with_mcu(wire(NetlistBuilder::new()), "source:main").build();
+    netlist.sources.insert(
+        "main".into(),
+        dunbrec_core::SourceFile {
+            language: dunbrec_core::SourceLanguage::Cpp,
+            text: sketch.into(),
+        },
+    );
+    Circuit::from_netlist(&netlist, &ModelLibrary::new()).unwrap()
+}
+
+fn serial_text(res: &TransientResult) -> String {
+    res.serial.iter().map(|b| b.byte as char).collect()
+}
+
+#[test]
+fn sketch_analog_write_gives_the_right_duty_cycle() {
+    let sketch = "void setup() { pinMode(6, OUTPUT); analogWrite(6, 64); }\nvoid loop() {}\n";
+    if !build_real_sketch(sketch) {
+        return;
+    }
+    // D6 through 10 kΩ / 10 µF (τ = 0.1 s): the average of the PWM.
+    let circuit = sketch_circuit(sketch, |b| {
+        b.element("R1", r(10e3), &["D6", "f"])
+            .element("C1", c(10e-6), &["f", "0"])
+    });
+    let res = transient(circuit, TransientOptions::new(0.8)).unwrap();
+    let v = *res.voltage("f").unwrap().last().unwrap();
+    // Fast PWM: (64 + 1) / 256 of 5 V.
+    let expect = 5.0 * 65.0 / 256.0;
+    assert!((v - expect).abs() < 0.05, "{v} vs {expect}");
+}
+
+#[test]
+fn sketch_analog_read_and_serial_print() {
+    let sketch = "void setup() { Serial.begin(9600); }\n\
+                  void loop() { Serial.println(analogRead(A0)); delay(100); }\n";
+    if !build_real_sketch(sketch) {
+        return;
+    }
+    let circuit = sketch_circuit(sketch, |b| b.element("V1", dc(2.5), &["A0", "0"]));
+    let res = transient(circuit, TransientOptions::new(0.55)).unwrap();
+    let text = serial_text(&res);
+    let readings: Vec<i32> = text.lines().filter_map(|l| l.trim().parse().ok()).collect();
+    assert!(readings.len() >= 4, "{text:?}");
+    // 2.5 V of 5 V on a 10-bit converter: 511 or 512.
+    for v in &readings {
+        assert!((510..=513).contains(v), "{readings:?}");
+    }
+    assert!(text.ends_with("\r\n") || text.contains("\r\n"), "{text:?}");
+}
+
+#[test]
+fn sketch_millis_counts_real_milliseconds() {
+    let sketch = "void setup() { Serial.begin(9600); }\n\
+                  void loop() { Serial.println(millis()); delay(100); }\n";
+    if !build_real_sketch(sketch) {
+        return;
+    }
+    let circuit = sketch_circuit(sketch, |b| b.element("R1", r(1e3), &["D13", "0"]));
+    let res = transient(circuit, TransientOptions::new(0.65)).unwrap();
+    let text = serial_text(&res);
+    let times: Vec<i64> = text.lines().filter_map(|l| l.trim().parse().ok()).collect();
+    assert!(times.len() >= 5, "{text:?}");
+    // Arduino's millis() ticks in 1.024 ms steps and corrects them, so a
+    // reading may be a millisecond off, but the loops stay 100 ms apart on
+    // average (the print is buffered and costs no time).
+    for pair in times.windows(2) {
+        let gap = pair[1] - pair[0];
+        assert!((99..=101).contains(&gap), "{times:?}");
+    }
+    let span = times[times.len() - 1] - times[0];
+    let expect = 100 * (times.len() as i64 - 1);
+    assert!((span - expect).abs() <= 1, "{times:?}");
+}

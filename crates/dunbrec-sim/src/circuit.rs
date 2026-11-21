@@ -41,6 +41,8 @@ pub struct Circuit {
     pub(crate) mcus: Vec<McuSpec>,
     /// Folder relative firmware paths are resolved against.
     pub(crate) firmware_dir: Option<std::path::PathBuf>,
+    /// Firmware source files of the schematic (for `source:` firmware).
+    pub(crate) sources: std::collections::BTreeMap<String, dunbrec_core::SourceFile>,
     pub(crate) warnings: Vec<SimWarning>,
 }
 
@@ -169,6 +171,7 @@ impl Circuit {
             digital,
             mcus,
             firmware_dir: None,
+            sources: netlist.sources.clone(),
         };
         circuit.check_topology()?;
         Ok(circuit)

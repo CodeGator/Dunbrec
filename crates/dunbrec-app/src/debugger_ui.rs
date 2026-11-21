@@ -9,8 +9,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use dunbrec_core::{ComponentKind, Netlist, units::format_value};
+use dunbrec_core::{ComponentKind, Netlist, SOURCE_PREFIX, SourceLanguage, units::format_value};
 use dunbrec_mcu::CpuSnapshot;
+use dunbrec_mcu::asm_text::{Assembled, assemble};
 use dunbrec_mcu::disasm::{Line, disassemble};
 use dunbrec_sim::{HaltReason, McuHalt, McuInfo};
 use egui::{Color32, RichText, ScrollArea, Sense, Ui, vec2};
@@ -26,12 +27,48 @@ pub enum Action {
     StartPaused,
 }
 
+/// The source text a program was built from, so the listing can show the
+/// line each instruction came from.
+struct SourceMap {
+    name: String,
+    /// The source, one entry per line.
+    text: Vec<String>,
+    /// Source line (from 1) of the statement at each word address.
+    built: Assembled,
+}
+
+impl SourceMap {
+    /// The source line of the instruction at word address `address`: its
+    /// number and its text.
+    fn at(&self, address: usize) -> Option<(usize, &str)> {
+        let line = self.built.line_for_address(address)?;
+        Some((line, self.text.get(line - 1)?.as_str()))
+    }
+}
+
+/// Build the source file a `source:<name>` firmware reference names, for
+/// the listing. None for any other firmware, or one that does not build.
+fn source_map(firmware: &str, netlist: &Netlist) -> Option<SourceMap> {
+    let name = firmware.trim().strip_prefix(SOURCE_PREFIX)?.trim();
+    let file = netlist.sources.get(name)?;
+    if file.language != SourceLanguage::Asm {
+        return None;
+    }
+    Some(SourceMap {
+        name: name.to_string(),
+        text: file.text.lines().map(str::to_string).collect(),
+        built: assemble(&file.text).ok()?,
+    })
+}
+
 /// A microcontroller of the circuit and its program.
 struct Mcu {
     designator: String,
     clock: f64,
     /// Disassembly of the firmware, by address.
     lines: Vec<Line>,
+    /// Where the instructions came from, for firmware built from source.
+    source: Option<SourceMap>,
     /// Why the firmware could not be loaded, if it could not.
     error: Option<String>,
 }
@@ -42,6 +79,14 @@ struct Stopped {
     /// The snapshot before it, to show what changed.
     previous: Option<CpuSnapshot>,
     reason: Option<HaltReason>,
+}
+
+/// What the debugger knows about a source file, by line.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct SourceMarks {
+    pub breakpoints: BTreeSet<usize>,
+    /// The line the program counter is on, while the circuit is paused.
+    pub pc_line: Option<usize>,
 }
 
 #[derive(Default)]
@@ -139,8 +184,9 @@ impl Debugger {
         self.mcus = parts
             .into_iter()
             .map(|(designator, firmware, clock)| {
-                match dunbrec_mcu::firmware::load(&firmware, firmware_dir) {
+                match dunbrec_sim::load_firmware(&firmware, firmware_dir, &netlist.sources) {
                     Ok(image) => Mcu {
+                        source: source_map(&firmware, netlist),
                         designator,
                         clock,
                         lines: program_lines(&words(&image)),
@@ -150,6 +196,7 @@ impl Debugger {
                         designator,
                         clock,
                         lines: Vec::new(),
+                        source: None,
                         error: Some(e),
                     },
                 }
@@ -283,6 +330,67 @@ impl Debugger {
         if let (Some(part), Some(live)) = (self.part(live), live.as_mut()) {
             live.send(Command::SetBreakpoints { part, words });
         }
+    }
+
+    // ----------------------------------------------- source file marks ---
+
+    /// The microcontroller whose program was built from exactly this text of
+    /// source file `name`. (After an edit the listing is out of date until
+    /// the app reloads it; nothing matches meanwhile.)
+    fn source_mcu(&self, name: &str, text: &str) -> Option<usize> {
+        self.mcus.iter().position(|m| {
+            m.source.as_ref().is_some_and(|s| {
+                s.name == name && s.text.iter().map(String::as_str).eq(text.lines())
+            })
+        })
+    }
+
+    /// Breakpoints and the current instruction of source file `name`, as
+    /// line numbers, for the code panel's gutter.
+    pub fn source_marks(&self, name: &str, text: &str, live: &Option<LiveSim>) -> SourceMarks {
+        let mut marks = SourceMarks::default();
+        let Some(index) = self.source_mcu(name, text) else {
+            return marks;
+        };
+        let mcu = &self.mcus[index];
+        let map = mcu.source.as_ref().expect("matched on its source");
+        if let Some(set) = self.breakpoints.get(&mcu.designator) {
+            marks.breakpoints = set
+                .iter()
+                .filter_map(|&word| map.built.line_for_address(word))
+                .collect();
+        }
+        if index == self.selected
+            && live.as_ref().is_some_and(|l| l.paused)
+            && let Some(stopped) = &self.stopped
+        {
+            marks.pc_line = map.built.line_for_address(stopped.snapshot.pc);
+        }
+        marks
+    }
+
+    /// Set or clear the breakpoint on `line` of source file `name`. False
+    /// if the line has no instruction (or the listing is out of date).
+    pub fn toggle_source_line(
+        &mut self,
+        live: &mut Option<LiveSim>,
+        name: &str,
+        text: &str,
+        line: usize,
+    ) -> bool {
+        let Some(index) = self.source_mcu(name, text) else {
+            return false;
+        };
+        let map = self.mcus[index]
+            .source
+            .as_ref()
+            .expect("matched on its source");
+        let Some(&(word, _)) = map.built.lines.iter().find(|(_, l)| *l == line) else {
+            return false;
+        };
+        self.selected = index;
+        self.toggle_breakpoint(live, word);
+        true
     }
 
     // ------------------------------------------------------------ window ---
@@ -532,13 +640,19 @@ impl Debugger {
                         toggled = Some(line.address);
                     }
                     let hex: Vec<String> = line.words.iter().map(|w| format!("{w:04X}")).collect();
-                    let text = format!(
+                    let mut text = format!(
                         "{} 0x{:04X}  {:<9} {}",
                         if here { "▶" } else { " " },
                         line.byte_address(),
                         hex.join(" "),
                         line.text()
                     );
+                    // Firmware built from source: say which line this is.
+                    if let Some(map) = &mcu.source
+                        && let Some((n, source)) = map.at(line.address)
+                    {
+                        text = format!("{text:<44} ; {}:{n}  {}", map.name, source.trim());
+                    }
                     let text = RichText::new(text).monospace();
                     ui.label(if here {
                         text.strong().background_color(CHANGED.gamma_multiply(0.45))
@@ -613,6 +727,78 @@ mod tests {
             );
         }
         b.build()
+    }
+
+    #[test]
+    fn firmware_built_from_source_shows_its_lines() {
+        let mut nl = netlist(&["source:main", "builtin:blink", "source:gone"]);
+        nl.sources.insert(
+            "main".into(),
+            dunbrec_core::SourceFile {
+                language: SourceLanguage::Asm,
+                text: "; start
+  sbi DDRB, 5
+loop: rjmp loop
+"
+                .into(),
+            },
+        );
+        let map = source_map("source:main", &nl).expect("builds");
+        assert_eq!(map.at(0), Some((2, "  sbi DDRB, 5")));
+        assert_eq!(map.at(1), Some((3, "loop: rjmp loop")));
+        assert_eq!(map.at(2), None);
+        assert!(source_map("builtin:blink", &nl).is_none());
+        assert!(source_map("source:gone", &nl).is_none());
+
+        // The debugger lists the program and remembers where it came from.
+        let mut dbg = Debugger::default();
+        dbg.load(&nl, None);
+        assert_eq!(dbg.mcus[0].lines.len(), 2);
+        assert!(dbg.mcus[0].source.is_some());
+        assert!(dbg.mcus[1].source.is_none());
+        assert!(dbg.mcus[2].error.as_deref().unwrap().contains("gone"));
+    }
+
+    #[test]
+    fn breakpoints_can_be_set_and_shown_by_source_line() {
+        let text = "; start\n  sbi DDRB, 5\nloop: rjmp loop\n";
+        let mut nl = netlist(&["source:main"]);
+        nl.sources.insert(
+            "main".into(),
+            dunbrec_core::SourceFile {
+                language: SourceLanguage::Asm,
+                text: text.into(),
+            },
+        );
+        let mut dbg = Debugger::default();
+        dbg.load(&nl, None);
+        let mut live = None;
+        assert_eq!(
+            dbg.source_marks("main", text, &live),
+            SourceMarks::default()
+        );
+        // Line 3 is `rjmp`, at word 1; a comment line has no instruction.
+        assert!(dbg.toggle_source_line(&mut live, "main", text, 3));
+        assert!(!dbg.toggle_source_line(&mut live, "main", text, 1));
+        assert_eq!(dbg.breakpoints["U1"], BTreeSet::from([1]));
+        assert_eq!(
+            dbg.source_marks("main", text, &live).breakpoints,
+            BTreeSet::from([3])
+        );
+        // The listing's own gutter and the source gutter share breakpoints.
+        dbg.toggle_breakpoint(&mut live, 0);
+        assert_eq!(
+            dbg.source_marks("main", text, &live).breakpoints,
+            BTreeSet::from([2, 3])
+        );
+        assert!(dbg.toggle_source_line(&mut live, "main", text, 3));
+        // After an edit the old listing no longer matches the text.
+        let edited = format!("{text}nop\n");
+        assert!(!dbg.toggle_source_line(&mut live, "main", &edited, 2));
+        assert_eq!(
+            dbg.source_marks("main", &edited, &live),
+            SourceMarks::default()
+        );
     }
 
     #[test]

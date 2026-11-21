@@ -109,7 +109,11 @@ Key mechanisms worth knowing before changing the engine:
     project became GPL-3.0; the in-house emulator stays).
   - ATmega328P first.
   - Firmware is a `.hex` path stored in the schematic (relative to the `.dbr`), reloaded on
-    every Run, plus `builtin:<name>` demo programs.
+    every Run, plus `builtin:<name>` demo programs and `source:<name>` (assembly text kept in
+    the schematic, built on every Run).
+  - File format: `Schematic.sources` (a map of name to `{ language, text }`) was added with
+    `#[serde(default)]`, so older `.dbr` files load unchanged and the version number was not
+    bumped. An older Dunbrec opening a file that has sources ignores them.
 - The user wants technical options explained in plain terms, with a recommendation, and
   confirmed before they become plans.
 - Don't drive the user's mouse or keyboard for UI testing without asking. Window screenshots
@@ -121,12 +125,10 @@ Key mechanisms worth knowing before changing the engine:
    - Needs ngspice installed.
    - Plan: store reference results for fixture circuits and compare within tolerance: about
      0.1 % for DC, bounded RMS error for transients.
-2. **Real Arduino firmware tests.**
-   - No AVR toolchain is installed, so every MCU test program was assembled in-house
-     (`dunbrec_mcu::asm`).
-   - Install Arduino IDE or arduino-cli, build a few sketches (blink, `analogWrite`,
-     `analogRead`, `Serial.print`, `millis`) and add them as golden tests. This is the most
-     valuable remaining check of the emulator.
+2. **Real Arduino firmware tests.** Done for blink, `analogWrite`, `analogRead`, `Serial.print`
+   and `millis` (see `mcu_tests.rs`, "Real Arduino sketches"). They need `arduino-cli` with the
+   `arduino:avr` core and skip without it. Not covered: timer interrupts through `attachInterrupt`
+   and `Timer1`-style libraries, `tone()`, `pulseIn`, `shiftOut`.
 3. **UI verification of phase 11 in the running app.**
    - Covered so far by worker-thread tests and a screenshot of the schematic.
    - Pressing Run and watching the serial monitor in the window has not been done.
@@ -137,13 +139,33 @@ Key mechanisms worth knowing before changing the engine:
      composite machinery.
    - A CMOS 555 (TLC555) would need different output levels.
    - The ngspice cross-check (item 1) can now also cover the exported 741 subcircuit.
-6. **MCU firmware development** (debugger, assembly text, Arduino C++ builds): designed, not
-   built. See [docs/mcu-firmware-development.md](docs/mcu-firmware-development.md); start with
-   phase A (the debugger).
+6. **MCU firmware development** (debugger, assembly text, Arduino C++ builds): phases A and B
+   and C (Arduino C++ via arduino-cli) built; D (more chips) is not. See
+   [docs/mcu-firmware-development.md](docs/mcu-firmware-development.md). None of the new
+   windows (debugger, code panel) has been looked at on screen yet.
 7. **Not yet supported:**
    - MCU: SPI, I²C, EEPROM, watchdog, serial receive and other chips.
    - Simulation: a fixed temperature of 27 °C, MOSFET level 1 only, and a single logic family.
    - Import: KiCad hierarchical sheets, SPICE `.param` expressions and EXP/SFFM sources.
+8. **Project folders** (requested 2026-11-21): create a project folder and keep every file of a
+   project together in it. It matters more once Arduino C++ sketches can have several files
+   (design doc, Phase C open question 2: today it is one source file per microcontroller
+   reference). Not designed yet; questions to settle first, with plain-language options and a
+   recommendation, before anything is built:
+   - Where source text lives. Today it is embedded in the `.dbr` (`Schematic.sources`). In a
+     project folder it could be real files (`.ino`, `.cpp`, `.h`, `.asm`) beside the `.dbr`, so
+     other editors, version control and `arduino-cli` see them as they are. Embedded text
+     would then become an import step for old files.
+   - What a project is: a folder with one `.dbr` and its sources, or a small project file
+     listing schematics, sources and settings (several schematics per project?).
+   - File → New project, Open project, a file tree in the Code panel (add, rename, delete files),
+     and the firmware reference (`source:<name>` today) becoming a path or a project-relative
+     name. Renaming a file must keep the microcontrollers pointing at it.
+   - Multi-file C++ builds: build the whole sketch folder, per-file errors in the list, and a
+     per-project build cache. The `.hex` files and build output belong in a subfolder that
+     version control can ignore.
+   - Recent-files list and "Open example" on projects; relative paths already resolve against
+     the `.dbr`'s folder.
 
 ## Gotchas
 

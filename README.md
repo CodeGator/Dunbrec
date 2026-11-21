@@ -121,6 +121,23 @@ time, the 32 registers (changed ones highlighted), and a view of data memory. It
 the circuit has seen at the stop, not a live view of a running chip. Breakpoints are kept per
 part for the session; *Clear all breakpoints* removes them all.
 
+**Writing firmware in assembly.** View → Panels → *Code* opens an editor tab beside the
+schematic for AVR assembly kept inside the schematic file. Create a file with *New…* (or pick
+*Source file → New assembly file…* in a microcontroller's properties, which also points the part
+at it); the first one starts as a blink program for D13. The dialect is Atmel's: `ldi r16, 0xFF`,
+`sbi PORTB, PB5`, labels, `.equ`, `.def`, `.org`, `.db`, `.dw`, expressions with `low()` and
+`high()`, and the register, bit and vector names from `m328Pdef.inc`. Text is coloured as you
+type and built on every change: mistakes are underlined, listed under the editor (click one to
+jump to it), and reported by line when the circuit runs. The part's firmware reads
+`source:<name>`. Click a line number to set or clear a breakpoint on it (red dot; an arrow marks the current instruction while the circuit is paused), and the debugger listing shows the source line beside each instruction.
+Macros, `.include` and data or EEPROM segments are not supported yet.
+
+**Writing Arduino C++.** *New…* in the Code panel can also create an Arduino C++ sketch. Sketches
+are built by the Arduino command-line tool, which Dunbrec finds but does not include: install it
+(`winget install ArduinoSA.CLI` on Windows), then run `arduino-cli core install arduino:avr`.
+Press **Build**; compile errors are underlined on their lines and listed under the editor. The
+circuit runs the last build of exactly the text in the file, so build again after a change.
+
 **Parts library.** Besides generic parts, the palette has real ones: the 2N3904 and 2N3906
 transistors and the 1N4148 and 1N750 (4.7 V zener) diodes, using the published manufacturer
 SPICE models. They sit in the group for what they are (Transistors, Diodes), after the generic

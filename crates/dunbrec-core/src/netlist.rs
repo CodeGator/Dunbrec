@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, HashMap};
 use serde::{Deserialize, Serialize};
 
 use crate::models::ModelKind;
-use crate::schematic::{ComponentId, ComponentKind, Point, Polarity, Schematic};
+use crate::schematic::{ComponentId, ComponentKind, Point, Polarity, Schematic, SourceFile};
 
 /// Index of a node. Node 0 is always ground.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -99,6 +99,10 @@ pub struct Netlist {
     pub nodes: Vec<Node>,
     pub elements: Vec<Element>,
     pub diagnostics: Vec<Diagnostic>,
+    /// The schematic's firmware source files, so a `source:<name>`
+    /// firmware reference can be built from the netlist alone.
+    #[serde(default)]
+    pub sources: BTreeMap<String, SourceFile>,
 }
 
 impl Netlist {
@@ -461,6 +465,7 @@ pub fn build_netlist(schematic: &Schematic) -> Netlist {
         nodes,
         elements,
         diagnostics,
+        sources: schematic.sources.clone(),
     }
 }
 

@@ -14,7 +14,9 @@ use crate::canvas::{
     Annotation, Canvas, Item, Marker, NodeMap, PartDrag, TagPlace, Tool, delete_items,
     node_tag_positions, transform_components,
 };
+use crate::code_ui::CodeEditor;
 use crate::debugger_ui::{Action as DebugAction, Debugger};
+use crate::dialog::{self, Dialog, Message};
 use crate::dock::{self, LAYOUT_KEY, Pane};
 use crate::document::Document;
 use crate::examples::examples;
@@ -84,6 +86,7 @@ pub struct DunbrecApp {
     doc: Document,
     canvas: Canvas,
     properties: Properties,
+    code: CodeEditor,
     netlist: (u64, Netlist),
     dc: Option<DcResults>,
     live_dc: bool,
@@ -91,9 +94,10 @@ pub struct DunbrecApp {
     pending: Option<Pending>,
     allow_close: bool,
     label_name: String,
-    message: Option<String>,
+    message: Option<Message>,
     title: String,
-    show_about: bool,
+    pub(crate) show_about: bool,
+    pub(crate) about: crate::about::AboutState,
     show_shortcuts: bool,
     settings: Settings,
 
@@ -206,6 +210,7 @@ impl DunbrecApp {
             doc,
             canvas: Canvas::default(),
             properties: Properties::default(),
+            code: CodeEditor::default(),
             dc: None,
             live_dc: true,
             show_voltages: true,
@@ -215,6 +220,7 @@ impl DunbrecApp {
             message: None,
             title: String::new(),
             show_about: false,
+            about: Default::default(),
             show_shortcuts: false,
             settings,
         }
@@ -272,7 +278,7 @@ impl DunbrecApp {
         let text = match std::fs::read_to_string(&path) {
             Ok(t) => t,
             Err(e) => {
-                self.message = Some(format!("Could not read {}:\n{e}", path.display()));
+                self.message = Some(Message::file_error("Could not read the file", &path, e));
                 return;
             }
         };
@@ -302,21 +308,30 @@ impl DunbrecApp {
                 let name = path
                     .file_name()
                     .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
-                let mut msg = format!(
-                    "Imported {name}. Parts are connected by net labels; rearrange them as you like."
+                let mut message = Message::info(
+                    "Import complete",
+                    format!(
+                        "Imported “{name}”. Parts are connected by net labels; rearrange \
+                         them as you like."
+                    ),
                 );
                 if !notes.is_empty() {
-                    msg.push_str("\n\nNotes:\n");
+                    let mut detail = String::new();
                     for n in notes.iter().take(30) {
-                        msg.push_str(&format!("• {n}\n"));
+                        detail.push_str(&format!("• {n}\n"));
                     }
                     if notes.len() > 30 {
-                        msg.push_str(&format!("… and {} more\n", notes.len() - 30));
+                        detail.push_str(&format!("… and {} more\n", notes.len() - 30));
                     }
+                    // Caveats from the conversion deserve a second look.
+                    message.kind = dialog::Kind::Warning;
+                    message = message.with_detail(detail);
                 }
-                self.message = Some(msg);
+                self.message = Some(message);
             }
-            Err(e) => self.message = Some(format!("Could not import {}:\n{e}", path.display())),
+            Err(e) => {
+                self.message = Some(Message::file_error("Could not import the file", &path, e))
+            }
         }
     }
 
@@ -339,7 +354,7 @@ impl DunbrecApp {
             .map_err(|_| "Fix the problems listed under Checks first.".to_string())
             .and_then(|text| std::fs::write(&path, text).map_err(|e| e.to_string()));
         if let Err(e) = result {
-            self.message = Some(format!("Could not export {}:\n{e}", path.display()));
+            self.message = Some(Message::file_error("Could not export the file", &path, e));
         }
     }
 
@@ -353,7 +368,7 @@ impl DunbrecApp {
             }
             Err(e) => {
                 self.settings.forget(&path);
-                self.message = Some(format!("Could not open {}:\n{e}", path.display()));
+                self.message = Some(Message::file_error("Could not open the file", &path, e));
             }
         }
     }
@@ -389,7 +404,7 @@ impl DunbrecApp {
                 true
             }
             Err(e) => {
-                self.message = Some(format!("Could not save {}:\n{e}", path.display()));
+                self.message = Some(Message::file_error("Could not save the file", &path, e));
                 false
             }
         }
@@ -813,9 +828,31 @@ impl DunbrecApp {
                 ui.toggle_value(&mut self.bench.show_scope, "📈 Oscilloscope");
                 ui.toggle_value(&mut self.bench.show_meter, "🔢 Multimeter");
                 ui.toggle_value(&mut self.analyses.show_fgen, "〰 Function gen");
-                if let Some(e) = &self.live_error {
+                if let Some(e) = self.live_error.clone() {
                     ui.separator();
-                    ui.label(RichText::new(e).color(Color32::from_rgb(225, 70, 70)));
+                    let first = e.lines().next().unwrap_or_default();
+                    let short = if first.chars().count() > 70 || e.lines().count() > 1 {
+                        format!("{}…", first.chars().take(70).collect::<String>())
+                    } else {
+                        first.to_string()
+                    };
+                    let label = ui
+                        .add(
+                            egui::Label::new(
+                                RichText::new(format!("⚠ {short}"))
+                                    .color(Color32::from_rgb(225, 70, 70)),
+                            )
+                            .sense(egui::Sense::click()),
+                        )
+                        .on_hover_text("Click for the full message")
+                        .on_hover_cursor(egui::CursorIcon::PointingHand);
+                    if label.clicked() {
+                        self.message = Some(Message::error(
+                            "The simulation could not run",
+                            first.to_string(),
+                        )
+                        .with_detail(e.lines().skip(1).collect::<Vec<_>>().join("\n")));
+                    }
                 } else if let Some(h) = &self.probe_hint {
                     ui.separator();
                     ui.label(RichText::new(h).color(Color32::from_rgb(230, 150, 40)));
@@ -866,7 +903,9 @@ impl DunbrecApp {
         }
 
         // The debugger lists the firmware of the circuit as it is now.
-        if self.debugger.show && self.debug_loaded != Some(self.netlist.0) {
+        if (self.debugger.show || dock::is_open(&self.dock, Pane::Code))
+            && self.debug_loaded != Some(self.netlist.0)
+        {
             let dir = self.firmware_dir();
             self.debugger.load(&self.netlist.1, dir.as_deref());
             self.debug_loaded = Some(self.netlist.0);
@@ -910,15 +949,19 @@ impl DunbrecApp {
         let markers = self.bench.markers(self.doc.schematic());
         let lit = self.lit_leds();
 
+        let running = self.live.is_some();
         let mut viewer = PaneViewer {
             doc: &mut self.doc,
             canvas: &mut self.canvas,
             properties: &mut self.properties,
+            code: &mut self.code,
+            debugger: &mut self.debugger,
+            live: &mut self.live,
             palette_search: &mut self.palette_search,
             netlist: &self.netlist.1,
             dc: &self.dc,
             latest: &self.latest,
-            running: self.live.is_some(),
+            running,
             annotations,
             markers: &markers,
             lit: &lit,
@@ -926,6 +969,14 @@ impl DunbrecApp {
         DockArea::new(&mut self.dock)
             .style(egui_dock::Style::from_egui(ctx.style().as_ref()))
             .show(ctx, &mut viewer);
+        // "Edit" on a microcontroller's source file opens it in the editor.
+        if let Some(name) = self.properties.open_code.take() {
+            dock::open(&mut self.dock, Pane::Code);
+            if let Some(at) = self.dock.find_tab(&Pane::Code) {
+                self.dock.set_active_tab(at);
+            }
+            self.code.select(&name);
+        }
     }
 
     // ---------------------------------------------------------- UI ---
@@ -1143,81 +1194,71 @@ impl DunbrecApp {
 
     fn dialogs(&mut self, ctx: &egui::Context) {
         if let Some(action) = self.pending.clone() {
-            egui::Modal::new(egui::Id::new("confirm")).show(ctx, |ui| {
-                ui.heading("Unsaved changes");
-                ui.label(format!(
-                    "Save changes to {} first?",
-                    self.doc.display_name()
-                ));
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Save").clicked() && self.save(false) {
-                        self.pending = None;
-                        self.perform(action.clone());
-                    }
-                    if ui.button("Discard").clicked() {
-                        self.pending = None;
-                        self.perform(action.clone());
-                    }
-                    if ui.button("Cancel").clicked() {
-                        self.pending = None;
-                    }
-                });
+            let name = self.doc.display_name();
+            let answer = Dialog {
+                id: "confirm",
+                kind: dialog::Kind::Question,
+                title: "Unsaved changes",
+                buttons: &["Save", "Discard", "Cancel"],
+                default: 0,
+                cancel: Some(2),
+            }
+            .show(ctx, |ui| {
+                dialog::paragraph(ui, &format!("Save changes to “{name}” before continuing?"));
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new("Discarding loses every change since the last save.").weak(),
+                );
             });
+            match answer {
+                Some(0) if self.save(false) => {
+                    self.pending = None;
+                    self.perform(action);
+                }
+                Some(1) => {
+                    self.pending = None;
+                    self.perform(action);
+                }
+                Some(2) => self.pending = None,
+                _ => {}
+            }
         }
 
         if self.canvas.has_label_request() {
-            let mut done = None;
-            egui::Modal::new(egui::Id::new("label")).show(ctx, |ui| {
-                ui.heading("Net label");
-                let r =
-                    ui.add(egui::TextEdit::singleline(&mut self.label_name).hint_text("e.g. VOUT"));
+            let answer = Dialog {
+                id: "label",
+                kind: dialog::Kind::Question,
+                title: "Net label",
+                buttons: &["OK", "Cancel"],
+                default: 0,
+                cancel: Some(1),
+            }
+            .show(ctx, |ui| {
+                dialog::paragraph(ui, "Name this net. Nets with the same name are connected.");
+                ui.add_space(8.0);
+                let r = ui.add(
+                    egui::TextEdit::singleline(&mut self.label_name)
+                        .hint_text("e.g. VOUT")
+                        .desired_width(f32::INFINITY),
+                );
                 r.request_focus();
-                ui.horizontal(|ui| {
-                    let enter = ui.input(|i| i.key_pressed(Key::Enter));
-                    if ui.button("OK").clicked() || enter {
-                        done = Some(true);
-                    }
-                    if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
-                        done = Some(false);
-                    }
-                });
             });
-            if let Some(ok) = done {
+            if let Some(choice) = answer {
                 let at = self.canvas.take_label_request();
                 let name = std::mem::take(&mut self.label_name).trim().to_string();
-                if let (true, Some(at), false) = (ok, at, name.is_empty()) {
+                if let (0, Some(at), false) = (choice, at, name.is_empty()) {
                     self.doc.edit(|s| s.add_label(name, at));
                 }
             }
         }
 
-        if let Some(msg) = self.message.clone() {
-            egui::Modal::new(egui::Id::new("message")).show(ctx, |ui| {
-                ui.label(msg);
-                if ui.button("OK").clicked() {
-                    self.message = None;
-                }
-            });
+        if let Some(message) = &self.message
+            && dialog::show_message(ctx, message)
+        {
+            self.message = None;
         }
 
-        if self.show_about {
-            egui::Modal::new(egui::Id::new("about")).show(ctx, |ui| {
-                ui.heading("Dunbrec");
-                ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
-                ui.label("Schematic capture and circuit simulation with virtual instruments.");
-                ui.add_space(4.0);
-                ui.label(
-                    RichText::new(
-                        "Analyses: DC operating point, DC sweep, AC small-signal, transient.",
-                    )
-                    .weak(),
-                );
-                if ui.button("Close").clicked() {
-                    self.show_about = false;
-                }
-            });
-        }
+        self.about_window(ctx);
 
         if self.show_shortcuts {
             let mut open = true;
@@ -1502,6 +1543,9 @@ struct PaneViewer<'a> {
     doc: &'a mut Document,
     canvas: &'a mut Canvas,
     properties: &'a mut Properties,
+    code: &'a mut CodeEditor,
+    debugger: &'a mut Debugger,
+    live: &'a mut Option<LiveSim>,
     palette_search: &'a mut String,
     netlist: &'a Netlist,
     dc: &'a Option<DcResults>,
@@ -1538,6 +1582,7 @@ impl TabViewer for PaneViewer<'_> {
             }
             Pane::Checks => checks_ui(ui, self.netlist, self.doc.schematic()),
             Pane::Values => values_ui(ui, self.netlist, self.running, self.latest, self.dc),
+            Pane::Code => self.code.show(ui, self.doc, self.debugger, self.live),
             Pane::Retired => {}
         }
     }
