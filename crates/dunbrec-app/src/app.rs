@@ -831,17 +831,39 @@ impl DunbrecApp {
                     }
                 }
                 if self.live.is_some() {
-                    ui.label(RichText::new(format!("t = {}", format_value(self.live_time, "s"))).monospace());
-                    if self.live_keeping_up < 0.95 {
-                        ui.label(
-                            RichText::new(format!(
-                                "running at {:.0}% of the chosen speed",
-                                self.live_keeping_up * 100.0
-                            ))
-                            .color(Color32::from_rgb(230, 150, 40)),
-                        )
-                        .on_hover_text("The circuit takes longer to simulate than the speed allows. Choose a slower speed or a longer time/div.");
-                    }
+                    // Fixed-width slots: the text changes every frame, and
+                    // a label that grows or shrinks would shove everything
+                    // after it sideways.
+                    let height = ui.spacing().interact_size.y;
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(130.0, height),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            ui.label(
+                                RichText::new(format!("t = {}", format_value(self.live_time, "s")))
+                                    .monospace(),
+                            );
+                        },
+                    );
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(96.0, height),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            if self.live_keeping_up < 0.95 {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "⚠ {:.0}% speed",
+                                        self.live_keeping_up * 100.0
+                                    ))
+                                    .color(Color32::from_rgb(230, 150, 40)),
+                                )
+                                .on_hover_text(format!(
+                                    "Running at {:.0}% of the chosen speed: the circuit takes longer to simulate than the speed allows. Choose a slower speed or a longer time/div.",
+                                    self.live_keeping_up * 100.0
+                                ));
+                            }
+                        },
+                    );
                 }
                 ui.separator();
                 let probing = self.canvas.tool == Tool::Probe;
