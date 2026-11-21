@@ -34,6 +34,10 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("Ctrl+A", "Select everything"),
     ("Del", "Delete the selection"),
     ("R / X", "Rotate / mirror (selection or part being placed)"),
+    (
+        "Right-click a part",
+        "Rotate it once (the whole selection, if it is selected)",
+    ),
     ("S", "Select tool"),
     ("W", "Wire tool"),
     ("L", "Net label tool"),

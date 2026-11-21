@@ -612,6 +612,16 @@ pub fn delete_items(s: &mut Schematic, items: &BTreeSet<Item>) {
     s.labels.retain(|l| !items.contains(&Item::Label(l.id)));
 }
 
+/// What a right-click on component `id` rotates: the whole selection if the
+/// part is in it, otherwise just that part.
+fn rotation_targets(selection: &BTreeSet<Item>, id: ComponentId) -> BTreeSet<Item> {
+    if selection.contains(&Item::Component(id)) {
+        selection.clone()
+    } else {
+        BTreeSet::from([Item::Component(id)])
+    }
+}
+
 /// Rotate (or mirror) selected components in place.
 pub fn transform_components(s: &mut Schematic, items: &BTreeSet<Item>, mirror: bool) {
     for c in &mut s.components {
@@ -1182,6 +1192,15 @@ impl Canvas {
         snapped: Option<Point>,
     ) {
         let shift = response.ctx.input(|i| i.modifiers.shift);
+        // Right-click rotates the part under the pointer, once per click. If
+        // it is part of the selection, the whole selection turns, as with R.
+        if response.clicked_by(PointerButton::Secondary)
+            && let Some(Item::Component(id)) =
+                grid_pointer.and_then(|p| hit_test(doc.schematic(), p))
+        {
+            let items = rotation_targets(&self.selection, id);
+            doc.edit(|s| transform_components(s, &items, false));
+        }
         if response.drag_started_by(PointerButton::Primary) {
             let press = response
                 .ctx
@@ -1303,6 +1322,32 @@ impl Canvas {
 mod tests {
     use super::*;
     use crate::examples::voltage_divider;
+
+    #[test]
+    fn right_click_rotates_the_part_or_the_selection_it_belongs_to() {
+        let mut s = voltage_divider();
+        let ids: Vec<ComponentId> = s.components.iter().map(|c| c.id).collect();
+        let (a, b) = (ids[0], ids[1]);
+        let turns = |s: &Schematic, id| s.component(id).unwrap().rotation;
+        let before = (turns(&s, a), turns(&s, b));
+
+        // Not selected: only that part turns, one quarter-turn.
+        let items = rotation_targets(&BTreeSet::new(), a);
+        transform_components(&mut s, &items, false);
+        assert_eq!(turns(&s, a), before.0.rotated_ccw());
+        assert_eq!(turns(&s, b), before.1);
+
+        // In a selection: the whole selection turns.
+        let selection = BTreeSet::from([Item::Component(a), Item::Component(b)]);
+        let items = rotation_targets(&selection, a);
+        transform_components(&mut s, &items, false);
+        assert_eq!(turns(&s, a), before.0.rotated_ccw().rotated_ccw());
+        assert_eq!(turns(&s, b), before.1.rotated_ccw());
+
+        // Selected elsewhere: the part under the pointer turns alone.
+        let items = rotation_targets(&BTreeSet::from([Item::Component(b)]), a);
+        assert_eq!(items, BTreeSet::from([Item::Component(a)]));
+    }
 
     #[test]
     fn focusing_a_label_finds_its_whole_net() {
