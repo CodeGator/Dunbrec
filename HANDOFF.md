@@ -9,8 +9,10 @@ State of the project for whoever picks it up next. User-facing documentation is 
 
 All eleven planned phases are done and committed on `main` (one commit per phase, "Phase N: …"),
 plus Phase 12 (integrated circuits) and a fix for probes failing after opening a document.
-Version 0.1.0 was released on 2026-11-21 (tag `v0.1.0`, merged to `main`). Work branches are
-named after the application version and merged into `main`; this one is `0.2.0`.
+Version 0.2.0 was released on 2026-11-21 (tag `v0.2.0`, merged to `main`; 0.1.0 was released the
+same day). Work branches are named after the application version and merged into `main`; this one
+is `0.3.0`. A release is cut by merging the branch into `main` and pushing `main:release`, which
+drafts the GitHub release (see `.github/workflows/release.yml`).
 
 | Phase | Content |
 |---|---|
