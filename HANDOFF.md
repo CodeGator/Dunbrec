@@ -1,0 +1,109 @@
+# Dunbrec — handoff
+
+State of the project for whoever picks it up next. User-facing documentation is in
+[README.md](README.md); this file covers status, decisions and open work.
+
+*Last updated: 2026-11-20, after commit `c854872` (Phase 11).*
+
+## Status
+
+All eleven planned phases are done and committed on `main` (one commit per phase, "Phase N: …").
+Version is `0.1.0`; nothing has been released or pushed by this work.
+
+| Phase | Content |
+|---|---|
+| 1–3 | Workspace, data model, netlister, `.dbr` format; linear DC (MNA); transient + scheduler |
+| 4 | Diode/BJT/MOSFET models, Newton-Raphson, junction capacitances, ringing control |
+| 5–6 | egui schematic editor; live simulation with oscilloscope and multimeter |
+| 7–8 | SPICE/KiCad import, SPICE export; DC sweep, AC, Bode plotter, curve tracer, function generator |
+| 9 | Parts library, examples, clipboard, settings, icon, MSI installer |
+| 10 | Event-driven digital logic mixed with analog; logic analyser |
+| 11 | ATmega328P emulation with `.hex` firmware; serial monitor; Arduino examples |
+
+Health at handoff: `cargo test --workspace` 216 passed, 0 failed (1 ignored: an emulator speed
+benchmark); `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --check`
+clean. Toolchain: Rust 1.99 (edition 2024, MSRV 1.90), Windows 11.
+
+## Building and checking
+
+```sh
+cargo run --release -p dunbrec-app -- --example 11   # examples 1–11, see File → Open example
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all
+cargo test -p dunbrec-mcu --release speed -- --ignored --nocapture   # emulator speed (~139 MHz equiv.)
+powershell -ExecutionPolicy Bypass -File tools\build-installer.ps1   # MSI; needs WiX (dotnet tool)
+```
+
+## Architecture in brief
+
+| Crate | Role |
+|---|---|
+| `dunbrec-core` | Schematic, `ComponentKind`, pins/domains, units, models, netlister + diagnostics |
+| `dunbrec-sim` | MNA solver, devices, DC/sweep/AC/transient; `digital.rs` (logic), `mcu.rs` (MCU glue) |
+| `dunbrec-mcu` | Standalone ATmega328P emulator, Intel HEX, firmware loading, assembler, demo programs |
+| `dunbrec-io` | `.dbr` (RON), SPICE import/export, KiCad import, auto layout |
+| `dunbrec-instruments` | Scope/meter signal processing |
+| `dunbrec-app` | eframe app; `live.rs` runs the transient on a worker thread |
+
+Key mechanisms worth knowing before changing the engine:
+
+- **The transient scheduler owns time** (`transient.rs`). It lands steps exactly on
+  breakpoints, and cuts steps at watched threshold crossings. Digital inputs and MCU pins are
+  just watches on analog nets.
+- **Logic parts** (`digital.rs`) are event-driven. Outputs are Norton drivers with a ramp;
+  inputs use VIH/VIL hysteresis.
+- **Microcontrollers** (`mcu.rs`):
+  - Each pin is an `McuPin` Norton device: 25 Ω output, 35 kΩ pull-up, 1 GΩ floating.
+  - The chip runs ahead on a clone until its next event (pin change, ADC sample or horizon).
+    The analog solver steps exactly there and the clone is adopted.
+  - An input crossing before that point discards the clone, replays the committed chip to the
+    crossing, then applies the input. Timing is cycle-exact.
+  - Sync points that are not pin changes do not reset integration (`kink = false`).
+- **Live edits** go through `Transient::update_element`. Returning `Ok(false)` means "restart
+  needed", which is what an MCU firmware or clock change does.
+
+## Decisions (agreed with the user)
+
+- GUI egui/eframe; own Rust simulation engine. ngspice is a dev-time reference only and is
+  never shipped.
+- Publisher CodeGator; MIT licence; version stays 0.1.0 for now.
+- Microcontrollers:
+  - Own AVR emulator; simavr was rejected because it is GPL.
+  - ATmega328P first.
+  - Firmware is a `.hex` path stored in the schematic (relative to the `.dbr`), reloaded on
+    every Run, plus `builtin:<name>` demo programs.
+- The user wants technical options explained in plain terms, with a recommendation, and
+  confirmed before they become plans.
+- Don't drive the user's mouse or keyboard for UI testing without asking. Window screenshots
+  are fine.
+
+## Open items
+
+1. **ngspice golden cross-check** (from phase 4).
+   - Needs ngspice installed.
+   - Plan: store reference results for fixture circuits and compare within tolerance: about
+     0.1 % for DC, bounded RMS error for transients.
+2. **Real Arduino firmware tests.**
+   - No AVR toolchain is installed, so every MCU test program was assembled in-house
+     (`dunbrec_mcu::asm`).
+   - Install Arduino IDE or arduino-cli, build a few sketches (blink, `analogWrite`,
+     `analogRead`, `Serial.print`, `millis`) and add them as golden tests. This is the most
+     valuable remaining check of the emulator.
+3. **UI verification of phase 11 in the running app.**
+   - Covered so far by worker-thread tests and a screenshot of the schematic.
+   - Pressing Run and watching the serial monitor in the window has not been done.
+4. **Stale text:** the Simulate menu still says "Transient & instruments: coming in phase 6"
+   (`crates/dunbrec-app/src/app.rs`).
+5. **Not yet supported:**
+   - MCU: SPI, I²C, EEPROM, watchdog, serial receive and other chips.
+   - Simulation: a fixed temperature of 27 °C, MOSFET level 1 only, and a single logic family.
+   - Import: KiCad hierarchical sheets, SPICE `.param` expressions and EXP/SFFM sources.
+
+## Gotchas
+
+- Running the release exe locks `target\release\dunbrec.exe`. Close the app before rebuilding.
+- At 2.5 V an ADC input reads 511 or 512 depending on source impedance (pin leakage). Tests
+  accept both.
+- When scripting file edits from Git Bash, heredocs can turn `\r\n` and `\` line
+  continuations into literal characters. Prefer direct file edits for strings with escapes.
