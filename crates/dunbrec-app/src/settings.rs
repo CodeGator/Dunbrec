@@ -32,6 +32,10 @@ pub struct Settings {
     pub theme: Theme,
     /// Most recent first.
     pub recent: Vec<PathBuf>,
+    /// Project folders, most recent first.
+    pub recent_projects: Vec<PathBuf>,
+    /// The project that was open when the app last closed.
+    pub project: Option<PathBuf>,
 }
 
 impl Settings {
@@ -44,6 +48,31 @@ impl Settings {
 
     pub fn forget(&mut self, path: &Path) {
         self.recent.retain(|p| p != path);
+    }
+
+    /// Put the project folder `path` at the top of the recent projects.
+    pub fn remember_project(&mut self, path: &Path) {
+        self.recent_projects.retain(|p| p != path);
+        self.recent_projects.insert(0, path.to_path_buf());
+        self.recent_projects.truncate(RECENT_LIMIT);
+        self.project = Some(path.to_path_buf());
+    }
+
+    /// Empty the recent-files list.
+    pub fn clear_recent(&mut self) {
+        self.recent.clear();
+    }
+
+    /// Empty the recent-projects list (the open project stays open).
+    pub fn clear_recent_projects(&mut self) {
+        self.recent_projects.clear();
+    }
+
+    pub fn forget_project(&mut self, path: &Path) {
+        self.recent_projects.retain(|p| p != path);
+        if self.project.as_deref() == Some(path) {
+            self.project = None;
+        }
     }
 }
 
@@ -69,6 +98,25 @@ mod tests {
         );
         s.forget(Path::new("f5.dbr"));
         assert!(!s.recent.contains(&PathBuf::from("f5.dbr")));
+    }
+
+    #[test]
+    fn recent_projects_are_remembered_and_forgotten() {
+        let mut s = Settings::default();
+        s.remember_project(Path::new("a"));
+        s.remember_project(Path::new("b"));
+        s.remember_project(Path::new("a"));
+        assert_eq!(s.recent_projects, [PathBuf::from("a"), PathBuf::from("b")]);
+        assert_eq!(s.project, Some(PathBuf::from("a")));
+        s.forget_project(Path::new("a"));
+        assert_eq!(s.recent_projects, [PathBuf::from("b")]);
+        assert_eq!(s.project, None);
+        s.remember_project(Path::new("c"));
+        s.clear_recent_projects();
+        assert!(s.recent_projects.is_empty());
+        s.remember(Path::new("f.dbr"));
+        s.clear_recent();
+        assert!(s.recent.is_empty());
     }
 
     #[test]

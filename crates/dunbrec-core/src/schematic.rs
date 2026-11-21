@@ -127,6 +127,7 @@ const CURRENT_SOURCE: &[PinDef] = &[pin("in", 0, 2), pin("out", 0, -2)];
 const DIODE: &[PinDef] = &[pin("A", -2, 0), pin("K", 2, 0)];
 const BJT: &[PinDef] = &[pin("C", 2, -2), pin("B", -2, 0), pin("E", 2, 2)];
 const MOSFET: &[PinDef] = &[pin("D", 2, -2), pin("G", -2, 0), pin("S", 2, 2)];
+const JUNCTION: &[PinDef] = &[pin("j", 0, 0)];
 const GROUND: &[PinDef] = &[pin("gnd", 0, 0)];
 const SPDT: &[PinDef] = &[pin("C", -2, 0), pin("1", 2, -1), pin("2", 2, 1)];
 const DPST: &[PinDef] = &[
@@ -433,6 +434,10 @@ impl Waveform {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ComponentKind {
     Ground,
+    /// Joins every wire that passes through its point, so two crossing
+    /// wires become one net. It has no electrical effect of its own and no
+    /// designator; drawn as a dot.
+    Junction,
     Resistor {
         resistance: f64,
     },
@@ -670,6 +675,7 @@ impl ComponentKind {
     pub fn pins(&self) -> &'static [PinDef] {
         match self {
             ComponentKind::Ground => GROUND,
+            ComponentKind::Junction => JUNCTION,
             ComponentKind::Resistor { .. }
             | ComponentKind::Capacitor { .. }
             | ComponentKind::Inductor { .. }
@@ -705,7 +711,7 @@ impl ComponentKind {
     /// Conventional designator prefix ("R", "C", "Q", ...). Ground has none.
     pub fn designator_prefix(&self) -> &'static str {
         match self {
-            ComponentKind::Ground => "",
+            ComponentKind::Ground | ComponentKind::Junction => "",
             ComponentKind::Resistor { .. } => "R",
             ComponentKind::Capacitor { .. } => "C",
             ComponentKind::Inductor { .. } => "L",
@@ -850,6 +856,21 @@ pub struct SourceFile {
 /// Prefix of a firmware reference that names a [`SourceFile`] of the
 /// schematic.
 pub const SOURCE_PREFIX: &str = "source:";
+
+/// The language of a firmware source file from its name, if the name is
+/// one: `.asm` and `.s` are assembly, `.ino` and `.cpp` Arduino C++.
+///
+/// A source whose name is one of these is a *file*: its text lives in a
+/// file of that (relative) path beside the schematic rather than inside it,
+/// and a microcontroller refers to it by that path.
+pub fn source_language_of(name: &str) -> Option<SourceLanguage> {
+    let ext = name.trim().rsplit_once('.')?.1.to_ascii_lowercase();
+    match ext.as_str() {
+        "asm" | "s" => Some(SourceLanguage::Asm),
+        "ino" | "cpp" => Some(SourceLanguage::Cpp),
+        _ => None,
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct Schematic {

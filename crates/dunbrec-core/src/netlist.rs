@@ -7,6 +7,8 @@
 //! * pins, wire endpoints and labels connect to anything at the same point;
 //! * a pin, wire endpoint or label on the interior of a wire joins that wire
 //!   (T-junction); wires that only cross are not connected;
+//! * a junction part joins the wires that pass through its point, which is
+//!   how two crossing wires are connected;
 //! * labels with the same name are connected;
 //! * every ground symbol pin is node 0.
 
@@ -37,7 +39,8 @@ pub struct Node {
     pub labelled: bool,
 }
 
-/// One simulated element. Ground symbols do not produce elements.
+/// One simulated element. Ground symbols and junctions do not produce
+/// elements.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Element {
     pub component: ComponentId,
@@ -356,6 +359,10 @@ pub fn build_netlist(schematic: &Schematic) -> Netlist {
     let mut elements = Vec::new();
 
     for (c, entries) in schematic.components.iter().zip(&pin_entries) {
+        // A junction only joins wires (done above); it is not a pin on a net.
+        if matches!(c.kind, ComponentKind::Junction) {
+            continue;
+        }
         let mut element_nodes = Vec::with_capacity(entries.len());
         for &entry in entries {
             let root = dsu.find(entry);
@@ -552,6 +559,57 @@ mod tests {
             r1.nodes[1],
             NodeId::GROUND,
             "crossing wires must not connect"
+        );
+    }
+
+    #[test]
+    fn a_junction_connects_crossing_wires() {
+        let mut s = Schematic::new();
+        s.add_component(ComponentKind::Ground, Point::new(0, 10));
+        s.add_component(res(1.0), Point::new(-7, 0)); // pins (-9,0) (-5,0)
+        let r2 = s.add_component(res(1.0), Point::new(0, -7));
+        s.component_mut(r2).unwrap().rotation = Rotation::R90; // pins (0,-9) (0,-5)
+        s.add_wire(Point::new(-5, 0), Point::new(5, 0));
+        s.add_wire(Point::new(0, -5), Point::new(0, 10));
+        // A junction away from the crossing changes nothing.
+        let j = s.add_component(ComponentKind::Junction, Point::new(3, 0));
+        let n = build_netlist(&s);
+        assert_ne!(n.element("R1").unwrap().nodes[1], NodeId::GROUND);
+        // Moved onto the crossing, it joins the two wires.
+        s.component_mut(j).unwrap().position = Point::new(0, 0);
+        let n = build_netlist(&s);
+        assert_eq!(n.element("R1").unwrap().nodes[1], NodeId::GROUND);
+        assert_eq!(n.element("R2").unwrap().nodes[1], NodeId::GROUND);
+        // It is not an element, has no designator, and raises no warnings
+        // about itself.
+        assert!(n.elements.iter().all(|e| !e.designator.is_empty()));
+        assert_eq!(n.elements.len(), 2);
+        assert!(
+            n.diagnostics.iter().all(
+                |d| !matches!(d, Diagnostic::UnconnectedPin { component, .. } if *component == j)
+            ),
+            "{:?}",
+            n.diagnostics
+        );
+    }
+
+    #[test]
+    fn a_junction_does_not_hide_a_dangling_pin() {
+        let mut s = Schematic::new();
+        s.add_component(ComponentKind::Ground, Point::new(0, 4));
+        s.add_component(res(1.0), Point::new(0, 0)); // pins (-2,0) (2,0)
+        s.add_wire(Point::new(2, 0), Point::new(6, 0));
+        s.add_wire(Point::new(-2, 0), Point::new(-2, 2));
+        s.add_wire(Point::new(-2, 2), Point::new(0, 4));
+        s.add_component(ComponentKind::Junction, Point::new(4, 0));
+        let n = build_netlist(&s);
+        // R1's right pin only reaches a wire with a junction on it: still unconnected.
+        assert!(
+            n.diagnostics
+                .iter()
+                .any(|d| matches!(d, Diagnostic::UnconnectedPin { pin, .. } if pin == "n")),
+            "{:?}",
+            n.diagnostics
         );
     }
 

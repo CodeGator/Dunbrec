@@ -22,12 +22,29 @@ mod library;
 mod live;
 mod logic_ui;
 mod plot;
+mod project;
+mod project_ui;
 mod properties;
 mod serial_ui;
 mod settings;
 mod symbols;
 
 use std::path::PathBuf;
+
+/// A project file given on the command line (or by double-clicking one).
+fn initial_project() -> Option<PathBuf> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.as_slice() {
+        [path]
+            if path
+                .to_ascii_lowercase()
+                .ends_with(&format!(".{}", project::EXTENSION)) =>
+        {
+            Some(PathBuf::from(path))
+        }
+        _ => None,
+    }
+}
 
 fn initial_document() -> Option<(dunbrec_core::Schematic, Option<PathBuf>)> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -36,6 +53,10 @@ fn initial_document() -> Option<(dunbrec_core::Schematic, Option<PathBuf>)> {
             let i: usize = n.parse().ok()?;
             let ex = examples::examples().get(i.checked_sub(1)?)?;
             Some(((ex.build)(), None))
+        }
+        [path] if initial_project().is_some() => {
+            let _ = path;
+            None
         }
         [path] => {
             let path = PathBuf::from(path);
@@ -71,6 +92,7 @@ fn initial_document() -> Option<(dunbrec_core::Schematic, Option<PathBuf>)> {
 
 fn main() -> eframe::Result {
     let initial = initial_document();
+    let initial_project = initial_project();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Dunbrec")
@@ -85,6 +107,6 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "Dunbrec",
         options,
-        Box::new(|cc| Ok(Box::new(app::DunbrecApp::new(cc, initial)))),
+        Box::new(|cc| Ok(Box::new(app::DunbrecApp::new(cc, initial, initial_project)))),
     )
 }

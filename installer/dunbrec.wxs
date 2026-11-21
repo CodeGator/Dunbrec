@@ -33,6 +33,12 @@
               <Verb Id="open" Command="Open" TargetFile="DunbrecExe" Argument="&quot;%1&quot;" />
             </Extension>
           </ProgId>
+          <!-- Double-clicking a .dbrproj project file opens the project. -->
+          <ProgId Id="Dunbrec.Project" Description="Dunbrec project" Icon="DunbrecIconFile">
+            <Extension Id="dbrproj" ContentType="application/x-dunbrec-project">
+              <Verb Id="open" Command="Open" TargetFile="DunbrecExe" Argument="&quot;%1&quot;" />
+            </Extension>
+          </ProgId>
         </Component>
         <Component Id="Readme">
           <File Id="ReadmeFile" Source="$(var.RootDir)\README.md" />

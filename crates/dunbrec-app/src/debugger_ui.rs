@@ -46,10 +46,15 @@ impl SourceMap {
     }
 }
 
-/// Build the source file a `source:<name>` firmware reference names, for
-/// the listing. None for any other firmware, or one that does not build.
+/// Build the source file a `source:<name>` firmware reference, or a source
+/// file's path, names, for the listing. None for any other firmware, or one
+/// that does not build.
 fn source_map(firmware: &str, netlist: &Netlist) -> Option<SourceMap> {
-    let name = firmware.trim().strip_prefix(SOURCE_PREFIX)?.trim();
+    let reference = firmware.trim();
+    let name = reference
+        .strip_prefix(SOURCE_PREFIX)
+        .unwrap_or(reference)
+        .trim();
     let file = netlist.sources.get(name)?;
     if file.language != SourceLanguage::Asm {
         return None;

@@ -272,25 +272,44 @@ impl Part {
 const MAX_BUILD_ERRORS: usize = 5;
 
 /// Load the flash image a firmware reference names: `builtin:<name>`, a
-/// `.hex` file, or `source:<name>`, a source file of the schematic built
-/// here. Build errors come back as one message, a line each, as
-/// `<name>:<line>:<column>: <problem>`.
+/// `.hex` file, `source:<name>`, a source file stored inside the schematic,
+/// or the path of a source file (`main.asm`, `fw/blink.ino`; see
+/// [`dunbrec_core::source_language_of`]), which is built here. A file that
+/// is open in the schematic (`sources`) is built from that text, and
+/// otherwise it is read from disk, relative to `base_dir`. Build errors
+/// come back as one message, a line each, as `<name>:<line>:<column>:
+/// <problem>`.
 pub fn load_firmware(
     reference: &str,
     base_dir: Option<&Path>,
     sources: &BTreeMap<String, SourceFile>,
 ) -> Result<Vec<u8>, String> {
-    let Some(name) = reference.trim().strip_prefix(SOURCE_PREFIX) else {
-        return dunbrec_mcu::firmware::load(reference, base_dir);
-    };
-    let name = name.trim();
-    let file = sources.get(name).ok_or_else(|| {
-        if name.is_empty() {
-            "no source file selected for this microcontroller".to_string()
-        } else {
-            format!("this schematic has no source file called '{name}'")
+    let trimmed = reference.trim();
+    if let Some(name) = trimmed.strip_prefix(SOURCE_PREFIX) {
+        let name = name.trim();
+        let file = sources.get(name).ok_or_else(|| {
+            if name.is_empty() {
+                "no source file selected for this microcontroller".to_string()
+            } else {
+                format!("this schematic has no source file called '{name}'")
+            }
+        })?;
+        return build_source(name, file);
+    }
+    if let Some(language) = dunbrec_core::source_language_of(trimmed) {
+        if let Some(file) = sources.get(trimmed) {
+            return build_source(trimmed, file);
         }
-    })?;
+        let path = dunbrec_mcu::firmware::resolve(trimmed, base_dir).expect("not a built-in");
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        return build_source(trimmed, &SourceFile { language, text });
+    }
+    dunbrec_mcu::firmware::load(reference, base_dir)
+}
+
+/// Build a source file into a flash image.
+fn build_source(name: &str, file: &SourceFile) -> Result<Vec<u8>, String> {
     match file.language {
         SourceLanguage::Asm => dunbrec_mcu::asm_text::assemble(&file.text)
             .map(|built| built.image)

@@ -515,7 +515,9 @@ pub(crate) fn make_device(e: &Element, models: &ModelLibrary) -> Result<Box<dyn 
     let name = e.designator.clone();
     let node = |i: usize| e.nodes[i];
     Ok(match &e.kind {
-        ComponentKind::Ground => unreachable!("ground symbols do not produce netlist elements"),
+        ComponentKind::Ground | ComponentKind::Junction => {
+            unreachable!("ground symbols and junctions do not produce netlist elements")
+        }
         kind @ (ComponentKind::Gate { .. }
         | ComponentKind::Inverter { .. }
         | ComponentKind::DFlipFlop { .. }

@@ -18,7 +18,7 @@ powershell -ExecutionPolicy Bypass -File tools\build-installer.ps1
 ```
 
 This produces `target\installer\Dunbrec-<version>-x64.msi`, which installs Dunbrec to Program
-Files, adds a Start-menu shortcut and opens `.dbr` files with Dunbrec. Or run from source:
+Files, adds a Start-menu shortcut and opens `.dbr` and `.dbrproj` files with Dunbrec. Or run from source:
 
 ```sh
 cargo run --release -p dunbrec-app                     # empty schematic
@@ -42,6 +42,13 @@ net labels — labels with the same name are connected. Drag to move (attached w
 drag empty space to box-select, Del deletes, Ctrl+C / X / V / D copy, cut, paste and
 duplicate, Ctrl+Z / Y undo and redo. Wheel zooms, middle-drag pans. Values accept engineering
 notation (`4k7`, `10u`, `2.2M`). Help → Keyboard shortcuts lists everything.
+
+**Crossing wires.** Wires that cross are *not* connected, and are drawn with a small hop in the
+horizontal wire to show it. To connect two crossing wires, place a **Junction** (palette group
+*Wiring*, or press J and click) on the crossing: it joins every wire through its point, is drawn as a dot, and has no
+other effect (no designator, nothing in the simulation or the SPICE export). A wire that ends on
+another wire, or a pin on a wire, is connected without one and gets a dot where three or more
+connections meet.
 
 **Panels.** The schematic, palette, properties, checks and live values are tabs you can drag.
 Drop one on the edge of another panel to split the window, on the middle of one to stack it as
@@ -128,15 +135,42 @@ time, the 32 registers (changed ones highlighted), and a view of data memory. It
 the circuit has seen at the stop, not a live view of a running chip. Breakpoints are kept per
 part for the session; *Clear all breakpoints* removes them all.
 
+**Projects.** A project is a small file (`My amp.dbrproj`) that lists a design's circuits and
+firmware source files, so they are kept together. You make it wherever you like; the files it
+lists can be in its folder, in subfolders, or anywhere else, and anything else in that folder is
+simply not part of the project and is never shown. The files are ordinary files (`.dbr` circuits,
+`.asm` and `.ino` sources) that other editors, Git and `arduino-cli` see as they are. File → *New
+project…* is a Save dialog: pick or make a folder and name the project; it creates the project
+file and a first circuit, `Circuit 1`, beside it. *Open project…* (and *Open recent project*)
+opens a `.dbrproj` (double-clicking one does too, once installed), and the app reopens the last
+project at start. A project can be taken off the recent list (✕ beside it) or the whole list
+cleared.
+
+The **Project** panel (View → Panels; it opens beside the palette) shows the project's name and
+the files it lists, in folders as they are on disk. Circuits are listed by name, sources with
+their extension. Double-click a circuit to open it, or a source file to open it in the Code
+panel. Right-click the project's name, a folder or empty space to add: a new circuit, assembly
+file, Arduino sketch or folder (made on disk and listed), or *Add existing file…* for files that
+are already there (the ＋ Add button does the same). Right-click a file or folder to rename it
+(circuits that use a renamed source are updated, a folder rename included), to **Remove from
+project** (the file stays on disk), or to **Delete from disk**. A listed file that has gone from
+the disk shows in red with a ⚠. New source files made from the Code panel are added to the project
+when the schematic is saved. Coming back to the window re-reads the project file and takes up
+edits made to the sources in other programs, unless the open schematic has unsaved changes.
+Schematics saved by older versions keep their sources inside the `.dbr`; the panel offers *Move
+to files in this folder* for those.
+
 **Writing firmware in assembly.** View → Panels → *Code* opens an editor tab beside the
-schematic for AVR assembly kept inside the schematic file. Create a file with *New…* (or pick
-*Source file → New assembly file…* in a microcontroller's properties, which also points the part
-at it); the first one starts as a blink program for D13. The dialect is Atmel's: `ldi r16, 0xFF`,
+schematic for AVR assembly. A source is a file beside the schematic (`main.asm`, or in a
+subfolder `fw/main.asm`); the schematic itself stores only the name, and Save writes the
+files. Create one with *New…* (or *Source file → New assembly file…* in a microcontroller's
+properties, which also points the part at it; or from the Project panel); the first one starts as
+a blink program for D13. The dialect is Atmel's: `ldi r16, 0xFF`,
 `sbi PORTB, PB5`, labels, `.equ`, `.def`, `.org`, `.db`, `.dw`, expressions with `low()` and
 `high()`, and the register, bit and vector names from `m328Pdef.inc`. Text is coloured as you
 type and built on every change: mistakes are underlined, listed under the editor (click one to
-jump to it), and reported by line when the circuit runs. The part's firmware reads
-`source:<name>`. Click a line number to set or clear a breakpoint on it (red dot; an arrow marks the current instruction while the circuit is paused), and the debugger listing shows the source line beside each instruction.
+jump to it), and reported by line when the circuit runs. The part's firmware reads the
+file's path, relative to the schematic (`main.asm`; older files say `source:<name>`). Click a line number to set or clear a breakpoint on it (red dot; an arrow marks the current instruction while the circuit is paused), and the debugger listing shows the source line beside each instruction.
 Macros, `.include` and data or EEPROM segments are not supported yet.
 
 **Writing Arduino C++.** *New…* in the Code panel can also create an Arduino C++ sketch. Sketches

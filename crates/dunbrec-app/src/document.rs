@@ -124,6 +124,12 @@ impl Document {
         self.path.as_deref()
     }
 
+    /// Change where the document is saved without touching what counts as
+    /// saved (its file was renamed or moved).
+    pub fn set_path(&mut self, path: PathBuf) {
+        self.path = Some(path);
+    }
+
     pub fn mark_saved(&mut self, path: PathBuf) {
         self.path = Some(path);
         self.saved_state_id = self.state_id;

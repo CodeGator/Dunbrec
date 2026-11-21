@@ -60,15 +60,46 @@ void loop() {
 }
 ";
 
-/// A name for a new source file that no file of the schematic has.
-pub fn unused_name(sources: &BTreeMap<String, SourceFile>, base: &str) -> String {
-    if !sources.contains_key(base) {
-        return base.to_string();
+/// A name for a new source *file* that no source of the schematic has:
+/// `main.asm`, then `main2.asm`, and so on.
+pub fn unused_file_name(
+    sources: &BTreeMap<String, SourceFile>,
+    base: &str,
+    extension: &str,
+) -> String {
+    let first = format!("{base}.{extension}");
+    if !sources.contains_key(&first) {
+        return first;
     }
     (2..)
-        .map(|n| format!("{base}{n}"))
+        .map(|n| format!("{base}{n}.{extension}"))
         .find(|name| !sources.contains_key(name))
         .expect("some number is free")
+}
+
+/// The name a new source gets for what was typed: the typed name if it
+/// already says what kind of file it is, otherwise with the extension of
+/// the chosen language added. Returns the name and its language.
+pub fn file_key(typed: &str, chosen: SourceLanguage) -> (String, SourceLanguage) {
+    let typed = typed.trim();
+    match dunbrec_core::source_language_of(typed) {
+        Some(language) => (typed.to_string(), language),
+        None => {
+            let ext = match chosen {
+                SourceLanguage::Asm => "asm",
+                SourceLanguage::Cpp => "ino",
+            };
+            (format!("{typed}.{ext}"), chosen)
+        }
+    }
+}
+
+/// The name Arduino's tool should give the sketch built from the source
+/// called `name`: the file's own name without its extension.
+fn sketch_name(name: &str) -> String {
+    std::path::Path::new(name)
+        .file_stem()
+        .map_or_else(|| name.to_string(), |s| s.to_string_lossy().into_owned())
 }
 
 /// A new Arduino C++ sketch.
@@ -458,7 +489,7 @@ impl CodeEditor {
         let (tx, rx) = std::sync::mpsc::channel();
         let (sketch, source, ctx) = (name.to_string(), text.to_string(), ctx.clone());
         std::thread::spawn(move || {
-            let _ = tx.send(arduino::build(&cli, &sketch, &source));
+            let _ = tx.send(arduino::build(&cli, &sketch_name(&sketch), &source));
             ctx.request_repaint();
         });
         self.building = Some(Building {
@@ -514,8 +545,10 @@ impl CodeEditor {
             ui.label("This schematic has no firmware source files yet.");
             ui.label(
                 RichText::new(
-                    "A source file is AVR assembly that Dunbrec builds each time the circuit \
-                     runs. Point a microcontroller's firmware at it as source:<name>.",
+                    "A source file is AVR assembly (.asm) or an Arduino sketch (.ino) kept as \
+                     a file beside the schematic. Dunbrec builds it each time the circuit \
+                     runs when a microcontroller's firmware is set to it. Open one from the \
+                     Project panel, or create one here.",
                 )
                 .weak(),
             );
@@ -620,8 +653,14 @@ impl CodeEditor {
                         ui.selectable_value(&mut self.new_cpp, true, "Arduino C++");
                     });
                 let name = typed.trim().to_string();
-                let taken = names.contains(&name);
-                let ok = !name.is_empty() && !taken;
+                let chosen = if self.new_cpp {
+                    SourceLanguage::Cpp
+                } else {
+                    SourceLanguage::Asm
+                };
+                let (key, _) = file_key(&name, chosen);
+                let taken = names.contains(&key);
+                let ok = !name.is_empty() && crate::project::valid_name(&name) && !taken;
                 let enter = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 let create =
                     ui.add_enabled(ok, egui::Button::new("Create")).clicked() || (enter && ok);
@@ -630,12 +669,7 @@ impl CodeEditor {
                 }
                 if create {
                     self.new_name = None;
-                    let language = if self.new_cpp {
-                        SourceLanguage::Cpp
-                    } else {
-                        SourceLanguage::Asm
-                    };
-                    self.create_as(doc, &name, language);
+                    self.create_as(doc, &name, chosen);
                 } else if ui.button("Cancel").clicked() {
                     self.new_name = None;
                 }
@@ -658,12 +692,19 @@ impl CodeEditor {
                 .on_hover_text("Add another source file to this schematic")
                 .clicked()
             {
-                self.new_name = Some(unused_name(&doc.schematic().sources, "main"));
+                let free = unused_file_name(&doc.schematic().sources, "main", "asm");
+                self.new_name = Some(free.trim_end_matches(".asm").to_string());
             }
             if let Some(name) = self.selected.clone() {
+                let is_file = crate::project::is_file_source(&name);
                 if ui
-                    .button("Delete")
-                    .on_hover_text("Remove this file (Ctrl+Z brings it back)")
+                    .button(if is_file { "Close" } else { "Delete" })
+                    .on_hover_text(if is_file {
+                        "Stop showing this file here. It stays on disk; delete it in the \
+                         Project panel. (Ctrl+Z brings it back)"
+                    } else {
+                        "Remove this file (Ctrl+Z brings it back)"
+                    })
                     .clicked()
                 {
                     doc.edit(|s| s.sources.remove(&name));
@@ -763,13 +804,26 @@ impl CodeEditor {
         self.create_as(doc, name, SourceLanguage::Asm);
     }
 
-    fn create_as(&mut self, doc: &mut Document, name: &str, language: SourceLanguage) {
+    /// Add a source file called `typed` (an extension is added if it has
+    /// none). A file of that name already on disk is opened, not replaced.
+    fn create_as(&mut self, doc: &mut Document, typed: &str, language: SourceLanguage) {
+        let (key, language) = file_key(typed, language);
+        let dir = doc.path().and_then(|p| p.parent()).map(|d| d.to_path_buf());
+        let on_disk = dir.as_ref().is_some_and(|d| d.join(&key).is_file());
+        if on_disk
+            && let Some(dir) = &dir
+            && crate::project::attach(doc.schematic_mut(), dir, &key).is_ok()
+        {
+            self.selected = Some(key);
+            self.typing = false;
+            return;
+        }
         let file = match language {
-            SourceLanguage::Asm => new_file(&doc.schematic().sources, name),
+            SourceLanguage::Asm => new_file(&doc.schematic().sources, &key),
             SourceLanguage::Cpp => new_sketch(),
         };
-        doc.edit(|s| s.sources.insert(name.to_string(), file));
-        self.selected = Some(name.to_string());
+        doc.edit(|s| s.sources.insert(key.clone(), file));
+        self.selected = Some(key);
         self.typing = false;
     }
 
@@ -972,15 +1026,53 @@ mod tests {
     }
 
     #[test]
-    fn names_for_new_files_are_unique() {
+    fn names_for_new_files_are_unique_and_say_what_they_are() {
         let mut sources = BTreeMap::new();
-        assert_eq!(unused_name(&sources, "main"), "main");
-        sources.insert("main".to_string(), new_file(&sources, "main"));
-        assert_eq!(sources["main"].text, STARTER);
-        assert_eq!(unused_name(&sources, "main"), "main2");
-        assert_eq!(new_file(&sources, "main2").text, "; main2\n");
-        sources.insert("main2".to_string(), new_file(&sources, "main2"));
-        assert_eq!(unused_name(&sources, "main"), "main3");
+        assert_eq!(unused_file_name(&sources, "main", "asm"), "main.asm");
+        sources.insert("main.asm".to_string(), new_file(&sources, "main.asm"));
+        assert_eq!(sources["main.asm"].text, STARTER);
+        assert_eq!(unused_file_name(&sources, "main", "asm"), "main2.asm");
+        assert_eq!(new_file(&sources, "main2.asm").text, "; main2.asm\n");
+        sources.insert("main2.asm".to_string(), new_file(&sources, "main2.asm"));
+        assert_eq!(unused_file_name(&sources, "main", "asm"), "main3.asm");
+        // What is typed decides the file name and, if it has an extension,
+        // the language.
+        assert_eq!(
+            file_key("blink", SourceLanguage::Asm),
+            ("blink.asm".into(), SourceLanguage::Asm)
+        );
+        assert_eq!(
+            file_key(" fade ", SourceLanguage::Cpp),
+            ("fade.ino".into(), SourceLanguage::Cpp)
+        );
+        assert_eq!(
+            file_key("x.cpp", SourceLanguage::Asm),
+            ("x.cpp".into(), SourceLanguage::Cpp)
+        );
+        assert_eq!(
+            file_key("x.S", SourceLanguage::Cpp),
+            ("x.S".into(), SourceLanguage::Asm)
+        );
+        assert_eq!(sketch_name("fw/blink.ino"), "blink");
+    }
+
+    #[test]
+    fn a_new_file_never_replaces_one_on_disk() {
+        let dir = std::env::temp_dir().join(format!("dunbrec-code-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("main.asm"), "nop\nnop\n").unwrap();
+        let mut doc = Document::default();
+        doc.mark_saved(dir.join("x.dbr"));
+        let mut editor = CodeEditor::default();
+        editor.create(&mut doc, "main");
+        // The file that was there is opened as it is.
+        assert_eq!(doc.schematic().sources["main.asm"].text, "nop\nnop\n");
+        assert!(!doc.can_undo(), "opening a file is not an edit");
+        // A name nothing has yet starts a new one, kept in memory until saved.
+        editor.create(&mut doc, "fresh");
+        assert_eq!(doc.schematic().sources["fresh.asm"].text, "; fresh.asm\n");
+        assert!(!dir.join("fresh.asm").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -1025,22 +1117,25 @@ mod tests {
         // No files: the empty state draws.
         frame(&mut doc, &mut editor);
         editor.create(&mut doc, "main");
-        assert!(doc.schematic().sources.contains_key("main"));
+        assert!(doc.schematic().sources.contains_key("main.asm"));
         assert!(doc.can_undo());
         // A file with a mistake draws, with its error list.
-        doc.schematic_mut().sources.get_mut("main").unwrap().text =
-            "nop\nldi r16, nothing\n".into();
+        doc.schematic_mut()
+            .sources
+            .get_mut("main.asm")
+            .unwrap()
+            .text = "nop\nldi r16, nothing\n".into();
         frame(&mut doc, &mut editor);
         frame(&mut doc, &mut editor);
         let built = editor.built.as_ref().unwrap();
         assert_eq!(built.result.as_ref().unwrap_err()[0].line, 2);
         // Deleting goes back to the empty state, and undo restores the file.
-        editor.selected = Some("main".into());
-        doc.edit(|s| s.sources.remove("main"));
+        editor.selected = Some("main.asm".into());
+        doc.edit(|s| s.sources.remove("main.asm"));
         frame(&mut doc, &mut editor);
         assert!(doc.undo());
         frame(&mut doc, &mut editor);
-        assert_eq!(editor.selected.as_deref(), Some("main"));
+        assert_eq!(editor.selected.as_deref(), Some("main.asm"));
     }
 
     #[test]
@@ -1053,9 +1148,9 @@ mod tests {
         let mut editor = CodeEditor::default();
         let mut doc = Document::default();
         editor.create_as(&mut doc, "main", SourceLanguage::Cpp);
-        let text = doc.schematic().sources["main"].text.clone();
+        let text = doc.schematic().sources["main.ino"].text.clone();
         assert_eq!(text, STARTER_SKETCH);
-        editor.start_build(&ctx, "main", &text);
+        editor.start_build(&ctx, "main.ino", &text);
         assert!(editor.building.is_some());
         let started = std::time::Instant::now();
         while editor.building.is_some() {
@@ -1073,7 +1168,7 @@ mod tests {
         let bad = "void setup() {}
 void loop() { oops(); }
 ";
-        editor.start_build(&ctx, "main", bad);
+        editor.start_build(&ctx, "main.ino", bad);
         while editor.building.is_some() {
             std::thread::sleep(std::time::Duration::from_millis(50));
             editor.poll_build(&ctx);

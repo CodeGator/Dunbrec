@@ -123,6 +123,11 @@ pub fn palette() -> &'static [PaletteEntry] {
             },
         },
         PaletteEntry {
+            name: "Junction (connect crossing wires)",
+            group: "Wiring",
+            make: || ComponentKind::Junction,
+        },
+        PaletteEntry {
             name: "Ground",
             group: "Sources",
             make: || ComponentKind::Ground,

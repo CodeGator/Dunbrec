@@ -101,7 +101,7 @@ impl Properties {
             .num_columns(2)
             .spacing([8.0, 6.0])
             .show(ui, |ui| {
-                if !matches!(c.kind, ComponentKind::Ground)
+                if !matches!(c.kind, ComponentKind::Ground | ComponentKind::Junction)
                     && let Some(d) =
                         self.text_field(ui, &key(id, "des"), "Designator", &c.designator)
                 {
@@ -120,7 +120,7 @@ impl Properties {
                 // along with the firmware change.
                 let mut new_source: Option<String> = None;
                 let changed = match &mut k {
-                    ComponentKind::Ground => false,
+                    ComponentKind::Ground | ComponentKind::Junction => false,
                     ComponentKind::Resistor { resistance } => {
                         self.value(ui, id, "Resistance", "Ω", resistance)
                     }
@@ -343,7 +343,7 @@ impl Properties {
                                 .selected_text("Source file")
                                 .show_ui(ui, |ui| {
                                     for name in schematic.sources.keys() {
-                                        let reference = format!("{SOURCE_PREFIX}{name}");
+                                        let reference = source_reference(name);
                                         if ui
                                             .selectable_label(*firmware == reference, name)
                                             .clicked()
@@ -354,21 +354,24 @@ impl Properties {
                                     }
                                     if ui.selectable_label(false, "New assembly file…").clicked()
                                     {
-                                        let name =
-                                            crate::code_ui::unused_name(&schematic.sources, "main");
-                                        *firmware = format!("{SOURCE_PREFIX}{name}");
+                                        let name = crate::code_ui::unused_file_name(
+                                            &schematic.sources,
+                                            "main",
+                                            "asm",
+                                        );
+                                        *firmware = source_reference(&name);
                                         self.open_code = Some(name.clone());
                                         new_source = Some(name);
                                         changed = true;
                                     }
                                 });
-                            if let Some(name) = firmware.trim().strip_prefix(SOURCE_PREFIX)
+                            if let Some(name) = source_name(firmware)
                                 && ui
                                     .button("Edit")
                                     .on_hover_text("Open this source file in the Code panel")
                                     .clicked()
                             {
-                                self.open_code = Some(name.trim().to_string());
+                                self.open_code = Some(name);
                             }
                         });
                         ui.end_row();
@@ -376,8 +379,9 @@ impl Properties {
                         ui.label("");
                         ui.label(
                             egui::RichText::new(
-                                "A source file is assembly kept in this schematic and built \
-                                 each time the simulation starts. For a compiled program: \
+                                "A source file (.asm, .ino) is a file beside this schematic, \
+                                 built each time the simulation starts; the Project panel \
+                                 lists the files of a project. For a compiled program: \
                                  Arduino IDE, Sketch → Export Compiled Binary, then pick the \
                                  .hex without \"with_bootloader\"; it is reloaded each time \
                                  too.",
@@ -749,9 +753,29 @@ fn parse_pwl(text: &str) -> Option<Vec<(f64, f64)>> {
     (!points.is_empty() && rising).then_some(points)
 }
 
+/// The firmware reference that selects the source called `name`: its path,
+/// for a file, and `source:<name>` for a source kept inside the schematic.
+fn source_reference(name: &str) -> String {
+    if crate::project::is_file_source(name) {
+        name.to_string()
+    } else {
+        format!("{SOURCE_PREFIX}{name}")
+    }
+}
+
+/// The name of the source a firmware reference selects, if it selects one.
+fn source_name(firmware: &str) -> Option<String> {
+    let reference = firmware.trim();
+    match reference.strip_prefix(SOURCE_PREFIX) {
+        Some(name) => Some(name.trim().to_string()),
+        None => crate::project::is_file_source(reference).then(|| reference.to_string()),
+    }
+}
+
 pub fn kind_name(kind: &ComponentKind) -> &'static str {
     match kind {
         ComponentKind::Ground => "Ground",
+        ComponentKind::Junction => "Junction",
         ComponentKind::Resistor { .. } => "Resistor",
         ComponentKind::Capacitor { .. } => "Capacitor",
         ComponentKind::Inductor { .. } => "Inductor",
