@@ -11,8 +11,8 @@ use egui_dock::{DockArea, DockState, TabViewer};
 
 use crate::analyses_ui::{Analyses, Inputs};
 use crate::canvas::{
-    Annotation, Canvas, Item, Marker, NodeMap, TagPlace, Tool, delete_items, node_tag_positions,
-    transform_components,
+    Annotation, Canvas, Item, Marker, NodeMap, PartDrag, TagPlace, Tool, delete_items,
+    node_tag_positions, transform_components,
 };
 use crate::dock::{self, LAYOUT_KEY, Pane};
 use crate::document::Document;
@@ -37,6 +37,10 @@ const SHORTCUTS: &[(&str, &str)] = &[
     (
         "Right-click a part",
         "Rotate it once (the whole selection, if it is selected)",
+    ),
+    (
+        "Drag a part from the palette",
+        "Drop it on the canvas to place it and start wiring",
     ),
     ("S", "Select tool"),
     ("W", "Wire tool"),
@@ -1188,9 +1192,9 @@ impl DunbrecApp {
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 let hint = match &self.canvas.tool {
-                    Tool::Select => "Click to select · drag to move · drag empty space to box-select · R rotate · X mirror · Del delete",
+                    Tool::Select => "Click to select · click a pin to start a wire · drag a wire corner to reshape it · drag to move · drag empty space to box-select · R rotate · X mirror · Del delete",
                     Tool::Place { .. } => "Click to place · R rotate · X mirror · Esc or right-click to stop",
-                    Tool::Wire => "Click to start, click to bend · ends on a pin or wire · double-click, Esc or right-click to stop",
+                    Tool::Wire => "Click to start a wire (a part's body selects it instead), click to bend · ends on a pin or wire, not inside a part · double-click, Esc or right-click to stop",
                     Tool::Label => "Click on a wire or pin to name that net",
                     Tool::Probe => "Click a wire or pin to connect the chosen instrument input (a part, for current) · Esc to stop",
                 };
@@ -1317,8 +1321,18 @@ fn palette_ui(ui: &mut egui::Ui, canvas: &mut Canvas, search: &mut String) {
             for entry in entries {
                 let kind = (entry.make)();
                 let active = matches!(&canvas.tool, Tool::Place { kind: k, .. } if *k == kind);
-                if ui.selectable_label(active, entry.name).clicked() {
+                // Click to pick the part and place copies; drag it onto the
+                // canvas to place one and start wiring it.
+                let part = ui.add(
+                    egui::Button::selectable(active, entry.name)
+                        .sense(egui::Sense::click_and_drag()),
+                );
+                if part.clicked() {
                     canvas.tool = place_tool(entry);
+                }
+                part.dnd_set_drag_payload(PartDrag { kind });
+                if part.dragged() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
                 }
             }
         };

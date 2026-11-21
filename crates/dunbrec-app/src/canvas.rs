@@ -90,6 +90,8 @@ enum Drag {
     Move { last: Point, started: bool },
     /// Rubber-band selection from a screen position.
     Rubber { start: Pos2 },
+    /// Dragging a wire corner or free end, which is now at `at`.
+    Vertex { at: Point, started: bool },
 }
 
 /// Text placed on the canvas by an analysis, e.g. node voltages.
@@ -612,6 +614,124 @@ pub fn delete_items(s: &mut Schematic, items: &BTreeSet<Item>) {
     s.labels.retain(|l| !items.contains(&Item::Label(l.id)));
 }
 
+/// Drag-and-drop payload: a part dragged from the palette onto the canvas.
+pub struct PartDrag {
+    pub kind: ComponentKind,
+}
+
+/// Add a part to the schematic (with its device model, if it needs one).
+fn add_part(
+    s: &mut Schematic,
+    kind: ComponentKind,
+    at: Point,
+    rotation: Rotation,
+    mirrored: bool,
+) -> ComponentId {
+    ensure_model(s, &kind);
+    let id = s.add_component(kind, at);
+    let c = s.component_mut(id).expect("just added");
+    c.rotation = rotation;
+    c.mirrored = mirrored;
+    id
+}
+
+/// What a press does in the wire tool.
+#[derive(Debug, PartialEq, Eq)]
+enum WirePress {
+    /// Switch to Select and select this part: a wire cannot start in the
+    /// middle of a part.
+    Grab(ComponentId),
+    /// A click inside a part's body while a wire is being drawn does
+    /// nothing: the part has no connection there.
+    Ignore,
+    /// Start, bend or end a wire.
+    Wire,
+}
+
+/// Classify a press at grid position `p` in the wire tool. Only a part's body
+/// (not one of its pins) counts; a pin, a wire, a label or empty canvas all
+/// mean wiring.
+fn classify_wire_press(wire_in_progress: bool, s: &Schematic, p: Pos2) -> WirePress {
+    let body = match hit_test(s, p) {
+        Some(Item::Component(id)) => s
+            .component(id)
+            .filter(|c| {
+                let at = snap(p);
+                !c.pin_positions().any(|(_, pin)| pin == at)
+            })
+            .map(|c| c.id),
+        _ => None,
+    };
+    match body {
+        Some(id) if !wire_in_progress => WirePress::Grab(id),
+        Some(_) => WirePress::Ignore,
+        None => WirePress::Wire,
+    }
+}
+
+/// The pin a click at grid position `p` lands on: the click snaps to a pin
+/// of some part. A wire already ending there does not matter.
+fn pin_at(s: &Schematic, p: Pos2) -> Option<Point> {
+    let at = snap(p);
+    s.components
+        .iter()
+        .any(|c| c.pin_positions().any(|(_, pin)| pin == at))
+        .then_some(at)
+}
+
+/// Wire corners and free ends that can be dragged: every wire end that is
+/// not on a part's pin (those belong to the part). Sorted, without repeats.
+fn draggable_vertices(s: &Schematic) -> Vec<Point> {
+    let pins: HashSet<Point> = s
+        .components
+        .iter()
+        .flat_map(|c| c.pin_positions().map(|(_, p)| p))
+        .collect();
+    let mut ends: Vec<Point> = s
+        .wires
+        .iter()
+        .flat_map(|w| [w.a, w.b])
+        .filter(|p| !pins.contains(p))
+        .collect();
+    ends.sort();
+    ends.dedup();
+    ends
+}
+
+/// The draggable wire end nearest to grid position `p`, if within `radius`
+/// grid units.
+fn vertex_near(s: &Schematic, p: Pos2, radius: f32) -> Option<Point> {
+    draggable_vertices(s)
+        .into_iter()
+        .map(|v| (v, to_pos(v).distance(p)))
+        .filter(|(_, d)| *d <= radius)
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(v, _)| v)
+}
+
+/// Move the point `from` to `to`: every wire end there, and every net label
+/// there, so what was connected stays connected.
+fn move_vertex(s: &mut Schematic, from: Point, to: Point) {
+    for w in &mut s.wires {
+        if w.a == from {
+            w.a = to;
+        }
+        if w.b == from {
+            w.b = to;
+        }
+    }
+    for l in &mut s.labels {
+        if l.position == from {
+            l.position = to;
+        }
+    }
+}
+
+/// How close (grid units) a press must be to a wire corner to grab it.
+const CORNER_GRAB: f32 = 0.5;
+/// How close (grid units) the pointer must be for a corner's handle to show.
+const CORNER_SHOW: f32 = 0.8;
+
 /// What a right-click on component `id` rotates: the whole selection if the
 /// part is in it, otherwise just that part.
 fn rotation_targets(selection: &BTreeSet<Item>, id: ComponentId) -> BTreeSet<Item> {
@@ -834,6 +954,13 @@ impl Canvas {
         let pointer = response.hover_pos().or(response.interact_pointer_pos());
         let grid_pointer = pointer.map(|p| self.camera.to_grid(origin, p));
         let snapped = grid_pointer.map(snap);
+        // A part being dragged in from the palette. No widget counts as
+        // hovered during a drag, so read the pointer directly.
+        let part_drag = response.dnd_hover_payload::<PartDrag>();
+        let drag_at = part_drag
+            .as_ref()
+            .and_then(|_| ui.input(|i| i.pointer.latest_pos()))
+            .map(|p| snap(self.camera.to_grid(origin, p)));
 
         // ---- navigation: zoom with the wheel, pan with middle drag ----
         if response.hovered() {
@@ -865,19 +992,34 @@ impl Canvas {
                 if response.clicked()
                     && let Some(at) = snapped
                 {
-                    doc.edit(|s| {
-                        ensure_model(s, &kind);
-                        let id = s.add_component(kind.clone(), at);
-                        let c = s.component_mut(id).expect("just added");
-                        c.rotation = rotation;
-                        c.mirrored = mirrored;
-                    });
+                    doc.edit(|s| add_part(s, kind.clone(), at, rotation, mirrored));
                 }
                 if response.clicked_by(PointerButton::Secondary) {
                     self.cancel();
                 }
             }
-            Tool::Wire => self.wire_tool(&response, doc, snapped),
+            Tool::Wire => {
+                let press = if response.drag_started_by(PointerButton::Primary) {
+                    ui.input(|i| i.pointer.press_origin())
+                        .map(|p| self.camera.to_grid(origin, p))
+                } else if response.clicked() {
+                    grid_pointer
+                } else {
+                    None
+                };
+                let kind = press
+                    .map(|p| classify_wire_press(self.wire_start.is_some(), doc.schematic(), p));
+                match kind {
+                    Some(WirePress::Grab(_)) => {
+                        // Carry the press into the Select tool: it selects
+                        // the part, and a drag moves it.
+                        self.tool = Tool::Select;
+                        self.select_tool(&response, doc, origin, grid_pointer, snapped);
+                    }
+                    Some(WirePress::Ignore) => {}
+                    _ => self.wire_tool(&response, doc, snapped),
+                }
+            }
             Tool::Label => {
                 if response.clicked() {
                     self.label_request = snapped;
@@ -900,6 +1042,13 @@ impl Canvas {
                     self.cancel();
                 }
             }
+        }
+
+        // Dropped from the palette: place it and start wiring.
+        if let Some(drag) = response.dnd_release_payload::<PartDrag>()
+            && let Some(at) = drag_at
+        {
+            self.drop_part(doc, drag.kind.clone(), at);
         }
 
         // ---- drawing ----
@@ -946,6 +1095,16 @@ impl Canvas {
                 p.screen(to_pos(j)),
                 (self.camera.scale * 0.25).max(2.5),
                 colors.wire,
+            );
+        }
+        if self.tool == Tool::Select {
+            self.draw_corner_handles(
+                ui,
+                &p,
+                &response,
+                grid_pointer,
+                s,
+                [colors.selected, colors.ghost],
             );
         }
         for c in &s.components {
@@ -1088,6 +1247,17 @@ impl Canvas {
             }
             Tool::Select => {}
         }
+        if let (Some(drag), Some(at)) = (&part_drag, drag_at) {
+            let ghost = dunbrec_core::Component {
+                id: ComponentId(u32::MAX),
+                designator: String::new(),
+                kind: drag.kind.clone(),
+                position: at,
+                rotation: Rotation::R0,
+                mirrored: false,
+            };
+            p.component(&ghost, &doc.schematic().models, colors.ghost, None);
+        }
         for m in markers {
             let at = p.screen(to_pos(m.at));
             let tip = at + vec2(-10.0, -18.0);
@@ -1201,7 +1371,18 @@ impl Canvas {
             let items = rotation_targets(&self.selection, id);
             doc.edit(|s| transform_components(s, &items, false));
         }
-        if response.drag_started_by(PointerButton::Primary) {
+        let corner_press = if response.drag_started_by(PointerButton::Primary) {
+            response
+                .ctx
+                .input(|i| i.pointer.press_origin())
+                .map(|p| self.camera.to_grid(origin, p))
+                .and_then(|p| vertex_near(doc.schematic(), p, CORNER_GRAB))
+        } else {
+            None
+        };
+        if let Some(at) = corner_press {
+            self.drag = Some(Drag::Vertex { at, started: false });
+        } else if response.drag_started_by(PointerButton::Primary) {
             let press = response
                 .ctx
                 .input(|i| i.pointer.press_origin())
@@ -1242,6 +1423,17 @@ impl Canvas {
                 *last = now;
             }
         }
+        if response.dragged_by(PointerButton::Primary)
+            && let (Some(Drag::Vertex { at, started }), Some(now)) = (&mut self.drag, snapped)
+            && now != *at
+        {
+            if !*started {
+                doc.checkpoint();
+                *started = true;
+            }
+            move_vertex(doc.schematic_mut(), *at, now);
+            *at = now;
+        }
         if response.drag_stopped() {
             if let Some(Drag::Rubber { start }) = self.drag.take()
                 && let Some(end) = response.interact_pointer_pos().or(response.hover_pos())
@@ -1255,19 +1447,31 @@ impl Canvas {
             self.drag = None;
         }
         if response.clicked() {
-            match grid_pointer.and_then(|p| hit_test(doc.schematic(), p)) {
-                Some(item) => {
-                    if shift {
-                        if !self.selection.remove(&item) {
+            // A plain click on a pin starts a wire from it; dragging from a
+            // pin still moves the part.
+            let pin = if shift {
+                None
+            } else {
+                grid_pointer.and_then(|p| pin_at(doc.schematic(), p))
+            };
+            if let Some(at) = pin {
+                self.tool = Tool::Wire;
+                self.wire_start = Some(at);
+            } else {
+                match grid_pointer.and_then(|p| hit_test(doc.schematic(), p)) {
+                    Some(item) => {
+                        if shift {
+                            if !self.selection.remove(&item) {
+                                self.selection.insert(item);
+                            }
+                        } else {
+                            self.selection.clear();
                             self.selection.insert(item);
                         }
-                    } else {
-                        self.selection.clear();
-                        self.selection.insert(item);
                     }
+                    None if !shift => self.selection.clear(),
+                    None => {}
                 }
-                None if !shift => self.selection.clear(),
-                None => {}
             }
         }
         if response.double_clicked()
@@ -1280,6 +1484,98 @@ impl Canvas {
         {
             doc.edit(|s| toggle_switch(s, id));
         }
+    }
+
+    /// Handles on wire corners and free ends (the Select tool): on the one
+    /// the pointer is near, on the ends of selected wires, and on the one
+    /// being dragged. While dragging, guide lines through the far end of each
+    /// attached wire show where it would be straight.
+    fn draw_corner_handles(
+        &self,
+        ui: &Ui,
+        p: &Painter,
+        response: &egui::Response,
+        grid_pointer: Option<Pos2>,
+        s: &Schematic,
+        [accent, guide]: [Color32; 2],
+    ) {
+        let dragged = match &self.drag {
+            Some(Drag::Vertex { at, .. }) => Some(*at),
+            _ => None,
+        };
+        let size = (self.camera.scale * 0.3).max(4.0);
+        let mut hovering = false;
+        for v in draggable_vertices(s) {
+            let near = response.hovered()
+                && self.drag.is_none()
+                && grid_pointer.is_some_and(|g| to_pos(v).distance(g) < CORNER_SHOW);
+            let on_selected = s
+                .wires
+                .iter()
+                .any(|w| (w.a == v || w.b == v) && self.selection.contains(&Item::Wire(w.id)));
+            let active = dragged == Some(v);
+            if !(near || on_selected || active) {
+                continue;
+            }
+            hovering |= near;
+            let square = Rect::from_center_size(p.screen(to_pos(v)), vec2(size * 2.0, size * 2.0));
+            if active {
+                p.painter.rect_filled(square, 1.0, accent);
+            }
+            p.painter.rect_stroke(
+                square,
+                1.0,
+                Stroke::new(1.5_f32, accent),
+                StrokeKind::Middle,
+            );
+        }
+        if dragged.is_some() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        } else if hovering {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+        }
+        if let Some(at) = dragged {
+            let area = response.rect;
+            for w in &s.wires {
+                let other = if w.a == at {
+                    w.b
+                } else if w.b == at {
+                    w.a
+                } else {
+                    continue;
+                };
+                let o = p.screen(to_pos(other));
+                let lines = [
+                    (
+                        other.y == at.y,
+                        pos2(area.left(), o.y),
+                        pos2(area.right(), o.y),
+                    ),
+                    (
+                        other.x == at.x,
+                        pos2(o.x, area.top()),
+                        pos2(o.x, area.bottom()),
+                    ),
+                ];
+                for (straight, a, b) in lines {
+                    let stroke = if straight {
+                        Stroke::new(1.5_f32, accent)
+                    } else {
+                        Stroke::new(1.0_f32, guide.gamma_multiply(0.6))
+                    };
+                    p.painter.line_segment([a, b], stroke);
+                }
+            }
+        }
+    }
+
+    /// A part dropped from the palette at `at`: place it, keep it selected
+    /// (so R, X and the properties panel apply to it) and start wiring.
+    fn drop_part(&mut self, doc: &mut Document, kind: ComponentKind, at: Point) {
+        let id = doc.edit(|s| add_part(s, kind, at, Rotation::R0, false));
+        self.selection = BTreeSet::from([Item::Component(id)]);
+        self.wire_start = None;
+        self.tool = Tool::Wire;
     }
 
     fn wire_tool(&mut self, response: &egui::Response, doc: &mut Document, snapped: Option<Point>) {
@@ -1322,6 +1618,122 @@ impl Canvas {
 mod tests {
     use super::*;
     use crate::examples::voltage_divider;
+
+    #[test]
+    fn corners_are_found_and_moved_with_what_is_attached() {
+        // A resistor at the origin with a bent wire from its right pin: a
+        // corner at (6, 0) and a free end at (6, 4), and a label on the corner.
+        let mut s = Schematic::new();
+        s.add_component(
+            ComponentKind::Resistor { resistance: 1e3 },
+            Point::new(0, 0),
+        );
+        s.add_wire(Point::new(2, 0), Point::new(6, 0));
+        s.add_wire(Point::new(6, 0), Point::new(6, 4));
+        s.add_label("N", Point::new(6, 0));
+
+        // The wire end on the pin belongs to the part; the others can move.
+        assert_eq!(
+            draggable_vertices(&s),
+            vec![Point::new(6, 0), Point::new(6, 4)]
+        );
+        assert_eq!(vertex_near(&s, pos2(6.2, 0.3), 0.5), Some(Point::new(6, 0)));
+        assert_eq!(vertex_near(&s, pos2(2.0, 0.0), 0.5), None, "a pin");
+        assert_eq!(vertex_near(&s, pos2(4.0, 0.0), 0.5), None, "along a wire");
+        assert_eq!(vertex_near(&s, pos2(6.0, 2.0), 0.5), None, "mid-segment");
+
+        // Moving the corner takes both wire ends and the label with it, and
+        // leaves the pin end where it was.
+        move_vertex(&mut s, Point::new(6, 0), Point::new(6, 2));
+        assert_eq!(
+            (s.wires[0].a, s.wires[0].b),
+            (Point::new(2, 0), Point::new(6, 2))
+        );
+        assert_eq!(
+            (s.wires[1].a, s.wires[1].b),
+            (Point::new(6, 2), Point::new(6, 4))
+        );
+        assert_eq!(s.labels[0].position, Point::new(6, 2));
+    }
+
+    #[test]
+    fn wire_presses_are_classified() {
+        // A resistor at the origin: pins at (-2, 0) and (2, 0), body between.
+        let mut s = Schematic::new();
+        let id = s.add_component(
+            ComponentKind::Resistor { resistance: 1e3 },
+            Point::new(0, 0),
+        );
+        let press = |in_progress, x: f32, y: f32, s: &Schematic| {
+            classify_wire_press(in_progress, s, pos2(x, y))
+        };
+        // Idle: the body grabs the part, including a click that snaps there.
+        assert_eq!(press(false, 0.0, 0.0, &s), WirePress::Grab(id));
+        assert_eq!(press(false, 0.9, 0.2, &s), WirePress::Grab(id));
+        // A pin, a click that snaps to a pin, and empty canvas all wire.
+        assert_eq!(press(false, 2.0, 0.0, &s), WirePress::Wire);
+        assert_eq!(press(false, -1.8, 0.2, &s), WirePress::Wire);
+        assert_eq!(press(false, 10.0, 10.0, &s), WirePress::Wire);
+        // Mid-wire: a click inside the body is ignored; a pin still ends it.
+        assert_eq!(press(true, 0.0, 0.0, &s), WirePress::Ignore);
+        assert_eq!(press(true, 2.0, 0.0, &s), WirePress::Wire);
+        assert_eq!(press(true, 10.0, 10.0, &s), WirePress::Wire);
+        // A wire in front of the body is hit first, so it means wiring.
+        s.add_wire(Point::new(-1, 0), Point::new(1, 0));
+        assert_eq!(press(false, 0.0, 0.0, &s), WirePress::Wire);
+        assert_eq!(press(true, 0.0, 0.0, &s), WirePress::Wire);
+    }
+
+    #[test]
+    fn a_click_on_a_pin_is_found_even_with_a_wire_on_it() {
+        let mut s = Schematic::new();
+        s.add_component(
+            ComponentKind::Resistor { resistance: 1e3 },
+            Point::new(0, 0),
+        );
+        // On the pin, and near enough to snap to it.
+        assert_eq!(pin_at(&s, pos2(2.0, 0.0)), Some(Point::new(2, 0)));
+        assert_eq!(pin_at(&s, pos2(-1.8, 0.3)), Some(Point::new(-2, 0)));
+        // The body, the lead's middle and empty canvas are not pins.
+        assert_eq!(pin_at(&s, pos2(0.0, 0.0)), None);
+        assert_eq!(pin_at(&s, pos2(1.0, 0.0)), None);
+        assert_eq!(pin_at(&s, pos2(10.0, 10.0)), None);
+        // A wire ending on the pin does not hide it.
+        s.add_wire(Point::new(2, 0), Point::new(6, 0));
+        assert_eq!(pin_at(&s, pos2(2.0, 0.0)), Some(Point::new(2, 0)));
+    }
+
+    #[test]
+    fn dropping_a_part_places_selects_and_starts_wiring() {
+        let mut canvas = Canvas::default();
+        let mut doc = Document::default();
+        let resistor = ComponentKind::Resistor { resistance: 1e3 };
+        canvas.drop_part(&mut doc, resistor.clone(), Point::new(4, 6));
+
+        let s = doc.schematic();
+        assert_eq!(s.components.len(), 1);
+        let c = &s.components[0];
+        assert_eq!((c.kind.clone(), c.position), (resistor, Point::new(4, 6)));
+        assert_eq!(canvas.selection, BTreeSet::from([Item::Component(c.id)]));
+        assert_eq!(canvas.tool, Tool::Wire);
+        assert!(canvas.wire_start.is_none());
+
+        // One undo step removes it.
+        assert!(doc.undo());
+        assert!(doc.schematic().components.is_empty());
+
+        // A part that needs a model brings it along.
+        let diode = ComponentKind::Diode {
+            model: crate::library::GENERIC_DIODE.into(),
+        };
+        canvas.drop_part(&mut doc, diode, Point::new(0, 0));
+        assert!(
+            doc.schematic()
+                .models
+                .get(crate::library::GENERIC_DIODE)
+                .is_some()
+        );
+    }
 
     #[test]
     fn right_click_rotates_the_part_or_the_selection_it_belongs_to() {

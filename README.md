@@ -31,7 +31,13 @@ cargo run --release -p dunbrec-app -- board.kicad_sch  # import a KiCad schemati
 ## Using Dunbrec
 
 **Drawing.** Pick a part from the palette and click to place it (R rotates, X mirrors, Esc
-stops). Right-clicking a placed part rotates it a quarter-turn. W draws wires (click to bend; a wire ends by itself on a pin or another wire), L adds
+stops). Right-clicking a placed part rotates it a quarter-turn. Or drag a part from the palette onto
+the canvas: it is placed where you drop it, stays selected (R and X still turn it) and the
+wire tool starts, so you can wire it straight away. W draws wires (click to bend; a wire ends by
+itself on a pin or another wire, and clicks inside a part's body are ignored mid-wire; clicking a
+part's body instead of a pin switches back to Select, and a drag there moves the part; in Select,
+a click on a pin starts a wire from it while a drag from it still moves the part; drag a wire's
+corner or free end to reshape it, with guide lines showing where a segment becomes straight), L adds
 net labels — labels with the same name are connected. Drag to move (attached wires follow),
 drag empty space to box-select, Del deletes, Ctrl+C / X / V / D copy, cut, paste and
 duplicate, Ctrl+Z / Y undo and redo. Wheel zooms, middle-drag pans. Values accept engineering
