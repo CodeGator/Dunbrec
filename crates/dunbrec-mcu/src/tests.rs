@@ -482,3 +482,182 @@ fn speed() {
     let s = t.elapsed().as_secs_f64();
     eprintln!("{:.0} MHz equivalent", 160.0 / s);
 }
+
+// ---------------------------------------------------------- debugging ---
+
+#[test]
+fn a_breakpoint_stops_before_its_instruction_and_resuming_runs_it() {
+    let mut a = Asm::new();
+    a.clr(20);
+    a.label("loop").inc(20);
+    a.label("mark").nop();
+    a.rjmp("loop");
+    let mark = a.label_address("mark").unwrap();
+    let mut c = chip(&a);
+    c.set_breakpoints(&[mark]);
+
+    // Stops after INC ran once, before the NOP.
+    assert_eq!(c.run(1000), Stop::Breakpoint);
+    assert_eq!((c.pc(), c.reg(20)), (mark, 1));
+    let first = c.cycle();
+    // Resuming runs the NOP and a whole pass (INC 1 + NOP 1 + RJMP 2 = 4
+    // cycles), then stops again at the same place.
+    assert_eq!(c.run(1000), Stop::Breakpoint);
+    assert_eq!((c.pc(), c.reg(20)), (mark, 2));
+    assert_eq!(c.cycle() - first, 4);
+
+    // With the breakpoints cleared it runs on to the requested cycle.
+    c.set_breakpoints(&[]);
+    assert_eq!(c.run(first + 100), Stop::Reached);
+}
+
+#[test]
+fn a_breakpoint_on_the_first_instruction_stops_before_anything_runs() {
+    let mut a = Asm::new();
+    a.ldi(16, 5).label("end").rjmp("end");
+    let mut c = chip(&a);
+    c.set_breakpoints(&[0]);
+    assert_eq!(c.run(100), Stop::Breakpoint);
+    assert_eq!((c.pc(), c.cycle(), c.reg(16)), (0, 0, 0));
+    // Asking again without moving on does not run it either way: the
+    // second call runs the instruction, as promised.
+    assert_eq!(c.run(100), Stop::Reached);
+    assert_eq!(c.reg(16), 5);
+    // A reset arms the breakpoint again.
+    c.reset();
+    assert_eq!(c.run(c.cycle() + 100), Stop::Breakpoint);
+}
+
+#[test]
+fn a_breakpoint_in_an_interrupt_handler_stops_on_every_entry() {
+    // Timer 0 overflows every 256 cycles; the handler counts in r20.
+    let mut a = Asm::new();
+    a.vectors(&[(0, "reset"), (16, "ovf")], "reset");
+    a.label("reset").init_stack();
+    a.clr(20);
+    a.ldi(16, 0x01).out(io::TCCR0B, 16).sts(mem::TIMSK0, 16);
+    a.sei();
+    a.label("loop").rjmp("loop");
+    a.label("ovf").inc(20).reti();
+    let ovf = a.label_address("ovf").unwrap();
+    let mut c = chip(&a);
+    c.set_breakpoints(&[ovf]);
+
+    assert_eq!(c.run(10_000), Stop::Breakpoint);
+    assert_eq!(
+        (c.pc(), c.reg(20)),
+        (ovf, 0),
+        "stopped before the handler's INC"
+    );
+    let first = c.cycle();
+    assert_eq!(c.run(10_000), Stop::Breakpoint);
+    assert_eq!((c.pc(), c.reg(20)), (ovf, 1));
+    assert_eq!(c.cycle() - first, 256, "one timer period apart");
+    assert!(c.fault().is_none());
+}
+
+#[test]
+fn stopping_at_a_breakpoint_does_not_lose_the_instruction_after_sei() {
+    // The instruction after SEI always runs before an interrupt is taken.
+    // A breakpoint on it must not let the interrupt in first.
+    let mut a = Asm::new();
+    a.vectors(&[(0, "reset"), (1, "int0")], "reset");
+    a.label("reset").init_stack();
+    a.clr(20).clr(21);
+    a.ldi(16, 0x02).sts(mem::EICRA, 16);
+    a.ldi(16, 0x01).out(io::EIMSK, 16);
+    a.sei();
+    a.label("after").inc(21);
+    a.label("loop").rjmp("loop");
+    a.label("int0").inc(20).reti();
+    let after = a.label_address("after").unwrap();
+    let mut c = chip(&a);
+    c.set_input(2, true);
+    c.set_breakpoints(&[after]);
+    assert_eq!(c.run(1000), Stop::Breakpoint);
+    c.set_input(2, false); // falling edge: INT0 becomes pending
+    // Resume: the very next step must be INC r21, not the interrupt entry.
+    c.set_breakpoints(&[]);
+    assert_eq!(c.step_instruction(u64::MAX), Stop::Stepped);
+    assert_eq!(
+        (c.reg(21), c.reg(20)),
+        (1, 0),
+        "INC ran before the interrupt"
+    );
+    // And then the interrupt is taken.
+    c.run(c.cycle() + 100);
+    assert_eq!((c.reg(21), c.reg(20)), (1, 1));
+}
+
+#[test]
+fn stepping_runs_exactly_one_instruction() {
+    let mut a = Asm::new();
+    a.ldi(16, 7).ldi(17, 9).add(16, 17).label("end").rjmp("end");
+    let mut c = chip(&a);
+    let step = |c: &mut Atmega328p| c.step_instruction(u64::MAX);
+
+    assert_eq!(step(&mut c), Stop::Stepped);
+    assert_eq!((c.pc(), c.reg(16), c.cycle()), (1, 7, 1));
+    assert_eq!(step(&mut c), Stop::Stepped);
+    assert_eq!((c.pc(), c.reg(17), c.cycle()), (2, 9, 2));
+    assert_eq!(step(&mut c), Stop::Stepped);
+    assert_eq!((c.pc(), c.reg(16), c.cycle()), (3, 16, 3));
+    // RJMP to itself takes two cycles and leaves the program counter put.
+    assert_eq!(step(&mut c), Stop::Stepped);
+    assert_eq!((c.pc(), c.cycle()), (3, 5));
+
+    // A step stops at a breakpoint without running anything.
+    c.set_breakpoints(&[3]);
+    assert_eq!(step(&mut c), Stop::Breakpoint);
+    assert_eq!(c.cycle(), 5);
+    // And the next step runs it.
+    assert_eq!(step(&mut c), Stop::Stepped);
+    assert_eq!(c.cycle(), 7);
+}
+
+#[test]
+fn a_step_lands_in_the_interrupt_handler() {
+    let mut a = Asm::new();
+    a.vectors(&[(0, "reset"), (16, "ovf")], "reset");
+    a.label("reset").init_stack();
+    a.ldi(16, 0x01).out(io::TCCR0B, 16).sts(mem::TIMSK0, 16);
+    a.sei();
+    a.label("loop").rjmp("loop");
+    a.label("ovf").reti();
+    let ovf = a.label_address("ovf").unwrap();
+    let mut c = chip(&a);
+    // Step until the program counter reaches the handler: the interrupt
+    // entry counts as one step.
+    let mut steps = 0;
+    while c.pc() != ovf {
+        assert_eq!(c.step_instruction(u64::MAX), Stop::Stepped);
+        steps += 1;
+        assert!(steps < 1000, "never entered the handler");
+    }
+    assert!(c.cycle() >= 256);
+    // Returning lands back in the main loop.
+    c.step_instruction(u64::MAX);
+    assert_ne!(c.pc(), ovf);
+}
+
+#[test]
+fn a_snapshot_matches_the_chip() {
+    let mut a = Asm::new();
+    a.init_stack();
+    a.ldi(16, 0x5A).ldi(31, 0x01).label("end").rjmp("end");
+    let mut c = chip(&a);
+    c.run(50);
+    let s = c.snapshot();
+    assert_eq!(
+        (s.pc, s.cycle, s.sreg, s.sp),
+        (c.pc(), c.cycle(), c.sreg(), c.sp())
+    );
+    assert_eq!(s.regs[16], 0x5A);
+    assert_eq!(s.regs[31], 0x01);
+    assert_eq!(s.data.len(), c.data().len());
+    assert_eq!(s.sp, 0x08FF, "init_stack puts the stack at the top of SRAM");
+    assert!(!s.sleeping && s.fault.is_none());
+    // The snapshot is a copy: running on does not change it.
+    c.run(200);
+    assert_ne!(c.cycle(), s.cycle);
+}

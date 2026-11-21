@@ -30,7 +30,8 @@ mod periph;
 pub mod programs;
 
 pub use avr::{
-    ARDUINO_NAMES, Atmega328p, DEFAULT_CLOCK, FLASH_BYTES, PIN_COUNT, PIN_NAMES, PinDrive, Stop,
+    ARDUINO_NAMES, Atmega328p, CpuSnapshot, DEFAULT_CLOCK, FLASH_BYTES, PIN_COUNT, PIN_NAMES,
+    PinDrive, Stop,
 };
 
 #[cfg(test)]

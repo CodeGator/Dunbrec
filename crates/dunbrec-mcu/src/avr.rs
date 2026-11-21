@@ -54,6 +54,27 @@ pub enum Stop {
     /// The ADC started converting analog channel `n` (0–5) and samples its
     /// voltage now: call [`Atmega328p::set_analog`] before running on.
     AdcSample(usize),
+    /// The next instruction is at a breakpoint (see
+    /// [`Atmega328p::set_breakpoints`]) and has **not** run. Calling `run`
+    /// again runs it.
+    Breakpoint,
+    /// The instruction budget of [`Atmega328p::step_instruction`] was used.
+    Stepped,
+}
+
+/// Everything a debugger shows, copied out of the chip.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CpuSnapshot {
+    /// Program counter (word address).
+    pub pc: usize,
+    pub sp: u16,
+    pub sreg: u8,
+    pub regs: [u8; 32],
+    pub cycle: u64,
+    pub sleeping: bool,
+    pub fault: Option<String>,
+    /// Data space: registers (0x00 to 0x1F), I/O (0x20 to 0xFF), SRAM.
+    pub data: Box<[u8]>,
 }
 
 // SREG bits.
@@ -94,6 +115,11 @@ pub struct Atmega328p {
     drive: u64,
     /// Bytes transmitted by the USART: (cycle the stop bit ended, byte).
     pub(crate) serial: Vec<(u64, u8)>,
+    /// Word addresses at which `run` stops before executing.
+    breakpoints: Vec<usize>,
+    /// False right after stopping at a breakpoint, so that resuming runs
+    /// that instruction instead of stopping on it again.
+    armed: bool,
 }
 
 impl std::fmt::Debug for Atmega328p {
@@ -142,6 +168,8 @@ impl Atmega328p {
             dirty: true,
             drive: 0,
             serial: Vec::new(),
+            breakpoints: Vec::new(),
+            armed: true,
         };
         chip.reset();
         Ok(chip)
@@ -157,6 +185,7 @@ impl Atmega328p {
         self.pc = 0;
         self.sleeping = false;
         self.irq_delay = false;
+        self.armed = true;
         self.fault = None;
         self.timers = Default::default();
         self.adc = Adc::default();
@@ -197,6 +226,42 @@ impl Atmega328p {
 
     pub fn is_sleeping(&self) -> bool {
         self.sleeping
+    }
+
+    /// Data space (registers, I/O, SRAM), read without side effects.
+    pub fn data(&self) -> &[u8] {
+        &self.data
+    }
+
+    /// Flash as words, for disassembly.
+    pub fn flash(&self) -> &[u16] {
+        &self.flash
+    }
+
+    /// Stop `run` before executing the instruction at any of these word
+    /// addresses (the program counter's units). Replaces the previous set.
+    pub fn set_breakpoints(&mut self, words: &[usize]) {
+        self.breakpoints = words.to_vec();
+        self.breakpoints.sort_unstable();
+        self.breakpoints.dedup();
+    }
+
+    pub fn breakpoints(&self) -> &[usize] {
+        &self.breakpoints
+    }
+
+    /// A copy of the state a debugger shows.
+    pub fn snapshot(&self) -> CpuSnapshot {
+        CpuSnapshot {
+            pc: self.pc,
+            sp: self.sp(),
+            sreg: self.sreg(),
+            regs: std::array::from_fn(|r| self.data[r]),
+            cycle: self.cycle,
+            sleeping: self.sleeping,
+            fault: self.fault.clone(),
+            data: self.data.clone(),
+        }
     }
 
     /// The logic level the circuit presents on `pin`.
@@ -245,6 +310,19 @@ impl Atmega328p {
     /// Run until cycle `until`, or earlier if the outside world needs to
     /// know (see [`Stop`]). The returned stop happened at [`Self::cycle`].
     pub fn run(&mut self, until: u64) -> Stop {
+        self.run_for(until, u64::MAX)
+    }
+
+    /// Execute one instruction (or interrupt entry), unless cycle `until`
+    /// comes first. The instruction has run when this returns
+    /// [`Stop::Stepped`], `Pins` or `AdcSample` (the last two mean the
+    /// outside world must hear about it); with [`Stop::Breakpoint`] nothing
+    /// ran.
+    pub fn step_instruction(&mut self, until: u64) -> Stop {
+        self.run_for(until, 1)
+    }
+
+    fn run_for(&mut self, until: u64, mut steps: u64) -> Stop {
         if let Some(ch) = self.adc.request.take() {
             self.adc_latch(ch);
         }
@@ -267,15 +345,30 @@ impl Atmega328p {
             {
                 self.service_irq(vector);
                 self.tick(4);
+                self.armed = true;
+                steps = steps.saturating_sub(1);
             } else {
+                if self.armed && !self.breakpoints.is_empty() && self.breakpoints.contains(&self.pc)
+                {
+                    self.armed = false;
+                    // Nothing ran: the instruction after SEI or RETI still
+                    // has to run before an interrupt.
+                    self.irq_delay = delayed;
+                    return Stop::Breakpoint;
+                }
                 let cycles = self.step();
                 self.tick(cycles as u64);
+                self.armed = true;
+                steps = steps.saturating_sub(1);
             }
             if let Some(ch) = self.adc.request {
                 return Stop::AdcSample(ch);
             }
             if let Some(stop) = self.check_pins() {
                 return stop;
+            }
+            if steps == 0 {
+                return Stop::Stepped;
             }
         }
         Stop::Reached
@@ -334,7 +427,8 @@ impl Atmega328p {
         self.flash[pc % FLASH_WORDS]
     }
 
-    fn sp(&self) -> u16 {
+    /// Stack pointer.
+    pub fn sp(&self) -> u16 {
         u16::from_le_bytes([self.data[reg::SPL], self.data[reg::SPH]])
     }
 

@@ -135,7 +135,10 @@ Key mechanisms worth knowing before changing the engine:
      composite machinery.
    - A CMOS 555 (TLC555) would need different output levels.
    - The ngspice cross-check (item 1) can now also cover the exported 741 subcircuit.
-6. **Not yet supported:**
+6. **MCU firmware development** (debugger, assembly text, Arduino C++ builds): designed, not
+   built. See [docs/mcu-firmware-development.md](docs/mcu-firmware-development.md); start with
+   phase A (the debugger).
+7. **Not yet supported:**
    - MCU: SPI, I²C, EEPROM, watchdog, serial receive and other chips.
    - Simulation: a fixed temperature of 27 °C, MOSFET level 1 only, and a single logic family.
    - Import: KiCad hierarchical sheets, SPICE `.param` expressions and EXP/SFFM sources.

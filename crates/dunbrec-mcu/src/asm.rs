@@ -162,6 +162,11 @@ impl Asm {
         self.code.len()
     }
 
+    /// Word address of a label defined so far.
+    pub fn label_address(&self, name: &str) -> Option<usize> {
+        self.labels.get(name).copied()
+    }
+
     fn emit(&mut self, w: u16) -> &mut Self {
         self.code.push(w);
         self
