@@ -5,11 +5,20 @@
 //! cannot get out of step with the data the way per-operation undo can.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use dunbrec_core::Schematic;
 
 /// Most snapshots kept for undo.
 const UNDO_LIMIT: usize = 200;
+
+/// A generation number no document has used before. Generations are unique
+/// across documents, so a cache keyed on one can never mistake a newly opened
+/// document for the one it replaced.
+fn next_generation() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
 
 pub struct Document {
     schematic: Schematic,
@@ -21,7 +30,7 @@ pub struct Document {
     state_id: u64,
     next_state_id: u64,
     saved_state_id: u64,
-    /// Bumped on every mutable access, so caches can tell when to rebuild.
+    /// Renewed on every mutable access, so caches can tell when to rebuild.
     generation: u64,
 }
 
@@ -41,7 +50,7 @@ impl Document {
             state_id: 0,
             next_state_id: 1,
             saved_state_id: 0,
-            generation: 0,
+            generation: next_generation(),
         }
     }
 
@@ -52,7 +61,7 @@ impl Document {
     /// Mutable access without an undo checkpoint (for continuous edits such
     /// as dragging, after a [`checkpoint`](Self::checkpoint) at the start).
     pub fn schematic_mut(&mut self) -> &mut Schematic {
-        self.generation += 1;
+        self.generation = next_generation();
         &mut self.schematic
     }
 
@@ -88,7 +97,7 @@ impl Document {
         let current = std::mem::replace(&mut self.schematic, previous);
         self.redo.push((current, self.state_id));
         self.state_id = id;
-        self.generation += 1;
+        self.generation = next_generation();
         true
     }
 
@@ -99,7 +108,7 @@ impl Document {
         let current = std::mem::replace(&mut self.schematic, next);
         self.undo.push((current, self.state_id));
         self.state_id = id;
-        self.generation += 1;
+        self.generation = next_generation();
         true
     }
 
@@ -201,5 +210,14 @@ mod tests {
         let g2 = doc.generation();
         doc.undo();
         assert!(g0 < g1 && g1 < g2 && g2 < doc.generation());
+    }
+
+    #[test]
+    fn new_documents_never_reuse_a_generation() {
+        // Caches keyed on the generation must rebuild when a document is
+        // replaced, e.g. opening an example over an untouched empty schematic.
+        let a = Document::default();
+        let b = Document::default();
+        assert_ne!(a.generation(), b.generation());
     }
 }
