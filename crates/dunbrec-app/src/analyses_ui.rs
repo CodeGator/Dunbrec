@@ -36,43 +36,22 @@ pub struct Analyses {
 }
 
 impl Analyses {
-    /// Show the open windows; returns true if a probe button was clicked.
-    pub fn show(&mut self, ctx: &egui::Context, mut inp: Inputs) -> bool {
-        let mut probe_clicked = false;
-        if self.show_bode {
-            let mut open = true;
-            egui::Window::new("Bode plotter")
-                .open(&mut open)
-                .default_size([560.0, 520.0])
-                .show(ctx, |ui| probe_clicked |= self.bode.ui(ui, &mut inp));
-            self.show_bode = open;
-        }
-        if self.show_transfer {
-            let mut open = true;
-            egui::Window::new("DC transfer")
-                .open(&mut open)
-                .default_size([520.0, 400.0])
-                .show(ctx, |ui| probe_clicked |= self.transfer.ui(ui, &mut inp));
-            self.show_transfer = open;
-        }
-        if self.show_tracer {
-            let mut open = true;
-            egui::Window::new("Curve tracer")
-                .open(&mut open)
-                .default_size([520.0, 440.0])
-                .show(ctx, |ui| self.tracer.ui(ui, &mut inp));
-            self.show_tracer = open;
-        }
-        if self.show_fgen {
-            let mut open = true;
-            egui::Window::new("Function generator")
-                .open(&mut open)
-                .default_size([320.0, 240.0])
-                .resizable(false)
-                .show(ctx, |ui| self.fgen.ui(ui, inp.doc));
-            self.show_fgen = open;
-        }
-        probe_clicked
+    /// Bode plotter body; returns true if a probe button was clicked.
+    pub fn bode_ui(&mut self, ui: &mut Ui, inp: &mut Inputs) -> bool {
+        self.bode.ui(ui, inp)
+    }
+
+    /// DC transfer body; returns true if a probe button was clicked.
+    pub fn transfer_ui(&mut self, ui: &mut Ui, inp: &mut Inputs) -> bool {
+        self.transfer.ui(ui, inp)
+    }
+
+    pub fn tracer_ui(&mut self, ui: &mut Ui, inp: &mut Inputs) {
+        self.tracer.ui(ui, inp);
+    }
+
+    pub fn fgen_ui(&mut self, ui: &mut Ui, doc: &mut Document) {
+        self.fgen.ui(ui, doc);
     }
 }
 

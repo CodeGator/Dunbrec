@@ -347,9 +347,9 @@ impl Bench {
     // ------------------------------------------------- oscilloscope ---
 
     /// Returns (timebase changed, a probe button was clicked).
-    pub fn scope_window(
+    pub fn scope_ui(
         &mut self,
-        ctx: &egui::Context,
+        ui: &mut Ui,
         s: &Schematic,
         netlist: &Netlist,
         map: &NodeMap,
@@ -357,14 +357,8 @@ impl Bench {
     ) -> (bool, bool) {
         let mut timebase_changed = false;
         let mut probe_clicked = false;
-        let mut open = self.show_scope;
-        egui::Window::new("Oscilloscope")
-            .open(&mut open)
-            .default_size([520.0, 520.0])
-            // Top right, over the properties panel, leaving the schematic clear.
-            .default_pos(ctx.content_rect().right_top() + vec2(-540.0, 90.0))
-            .resizable(true)
-            .show(ctx, |ui| {
+        {
+            {
                 let width = ui.available_width().max(300.0);
                 let height = (width * 0.6).clamp(180.0, 420.0);
                 let (rect, _) = ui.allocate_exact_size(vec2(width, height), Sense::hover());
@@ -507,17 +501,17 @@ impl Bench {
                             }
                         }
                     });
-            });
-        self.show_scope = open;
+            }
+        }
         (timebase_changed, probe_clicked)
     }
 
     // ----------------------------------------------------- multimeter ---
 
     /// Returns true if a probe button was clicked.
-    pub fn meter_window(
+    pub fn meter_ui(
         &mut self,
-        ctx: &egui::Context,
+        ui: &mut Ui,
         s: &Schematic,
         netlist: &Netlist,
         map: &NodeMap,
@@ -525,13 +519,8 @@ impl Bench {
         running: bool,
     ) -> bool {
         let mut probe_clicked = false;
-        let mut open = self.show_meter;
-        egui::Window::new("Multimeter")
-            .open(&mut open)
-            .default_size([300.0, 220.0])
-            .default_pos(ctx.content_rect().left_bottom() + vec2(150.0, -440.0))
-            .resizable(false)
-            .show(ctx, |ui| {
+        {
+            {
                 let reading = match (running, self.meter.reading()) {
                     (true, Some(v)) => format_value(v, self.meter.mode.unit()),
                     _ => "– – – –".into(),
@@ -629,26 +618,23 @@ impl Bench {
                 if !running {
                     ui.label(RichText::new("Press ▶ Run to measure.").weak());
                 }
-            });
-        self.show_meter = open;
+            }
+        }
         probe_clicked
     }
 
     /// Returns true if a probe button was clicked.
-    pub fn logic_window(
+    pub fn logic_ui(
         &mut self,
-        ctx: &egui::Context,
+        ui: &mut Ui,
         s: &Schematic,
         netlist: &Netlist,
         map: &NodeMap,
         probe_tool_active: bool,
     ) -> bool {
         let mut probe_clicked = false;
-        let mut open = self.show_logic;
-        egui::Window::new("Logic analyser")
-            .open(&mut open)
-            .default_size([560.0, 420.0])
-            .show(ctx, |ui| {
+        {
+            {
                 let names: [String; LOGIC_CHANNELS] =
                     std::array::from_fn(|ch| match self.logic_probes[ch] {
                         Some(p) => self.describe(Some(ProbeTarget::Node(p)), s, netlist, map),
@@ -677,8 +663,8 @@ impl Bench {
                         }
                     }
                 });
-            });
-        self.show_logic = open;
+            }
+        }
         probe_clicked
     }
 

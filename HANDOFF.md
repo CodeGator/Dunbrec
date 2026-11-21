@@ -21,8 +21,9 @@ Version is `0.1.0`; nothing has been released or pushed by this work.
 | 10 | Event-driven digital logic mixed with analog; logic analyser |
 | 11 | ATmega328P emulation with `.hex` firmware; serial monitor; Arduino examples |
 | 12 | Composite parts; 741 op-amp (Boyle macromodel); 555 timer; examples 12–14 |
+| 13 | Dockable panels: every panel is an `egui_dock` tab; layout saved between sessions |
 
-Health at handoff: `cargo test --workspace` 229 passed, 0 failed (1 ignored: an emulator speed
+Health at handoff: `cargo test --workspace` 237 passed, 0 failed (1 ignored: an emulator speed
 benchmark); `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --check`
 clean. Toolchain: Rust 1.99 (edition 2024, MSRV 1.90), Windows 11.
 
@@ -47,6 +48,23 @@ powershell -ExecutionPolicy Bypass -File tools\build-installer.ps1   # MSI; need
 | `dunbrec-io` | `.dbr` (RON), SPICE import/export, KiCad import, auto layout |
 | `dunbrec-instruments` | Scope/meter signal processing |
 | `dunbrec-app` | eframe app; `live.rs` runs the transient on a worker thread |
+
+UI layout (`dock.rs`, `PaneViewer` in `app.rs`):
+
+- Every panel is a `Pane` tab in an `egui_dock::DockState`. Only the menu bar, run toolbar and
+  status bar are fixed. `dock.rs` has the pane list, `default_layout`, `open` / `close`
+  placement, `reconcile` and `sanitize`; `PaneViewer` (in `app.rs`) draws each pane from
+  borrowed app state. Instrument bodies are plain `*_ui(ui, …)` functions on `Bench`,
+  `Analyses` and `SerialMonitor`.
+- Instrument visibility is still the `show_*` flags (toolbar, menus, serial auto-open).
+  `reconcile` adds or removes tabs to match each frame, and a tab that disappears from the dock
+  (closed any way) switches its instrument off (`DunbrecApp::dock_area`).
+- In `egui_dock` splits, `fraction` is the share of the *first* child (left or top), which is
+  the new panel for `split_left` despite the crate's wording. `dock.rs` has a test on the real
+  proportions.
+- The layout is saved under `dunbrec.layout.v1` in eframe storage, separate from `Settings`,
+  and restored through `sanitize` (instruments dropped, duplicates removed, no schematic means
+  default). Bump the key suffix if panes change in a way old layouts cannot express.
 
 Key mechanisms worth knowing before changing the engine:
 

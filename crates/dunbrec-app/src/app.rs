@@ -7,12 +7,14 @@ use dunbrec_core::{
 };
 use dunbrec_sim::{Circuit, Sample, SimWarning, operating_point};
 use egui::{Color32, Key, KeyboardShortcut, Modifiers, RichText, ViewportCommand};
+use egui_dock::{DockArea, DockState, TabViewer};
 
 use crate::analyses_ui::{Analyses, Inputs};
 use crate::canvas::{
-    Annotation, Canvas, Item, NodeMap, TagPlace, Tool, delete_items, node_tag_positions,
+    Annotation, Canvas, Item, Marker, NodeMap, TagPlace, Tool, delete_items, node_tag_positions,
     transform_components,
 };
+use crate::dock::{self, LAYOUT_KEY, Pane};
 use crate::document::Document;
 use crate::examples::examples;
 use crate::instruments_ui::{Bench, MeterSignal, Signals};
@@ -106,6 +108,8 @@ pub struct DunbrecApp {
     analyses: Analyses,
     /// Microcontroller serial output.
     serial: SerialMonitor,
+    /// Where each panel is: docked, tabbed or floating.
+    dock: DockState<Pane>,
 }
 
 /// True if two netlists have the same nodes and connections, so a running
@@ -159,10 +163,15 @@ impl DunbrecApp {
             }
             None => Document::default(),
         };
+        let dock = cc
+            .storage
+            .and_then(|s| eframe::get_value::<DockState<Pane>>(s, LAYOUT_KEY))
+            .map_or_else(dock::default_layout, dock::sanitize);
         let netlist = build_netlist(doc.schematic());
         let node_map = NodeMap::new(doc.schematic(), &netlist);
         let tags = node_tag_positions(doc.schematic(), &netlist);
         Self {
+            dock,
             node_map: (doc.generation(), node_map, tags),
             analyses: Analyses::default(),
             serial: SerialMonitor::default(),
@@ -435,44 +444,6 @@ impl DunbrecApp {
             generation: self.doc.generation(),
             outcome,
         });
-    }
-
-    fn describe(&self, d: &Diagnostic) -> String {
-        let name = |id| {
-            self.doc
-                .schematic()
-                .component(id)
-                .map(|c| c.designator.clone())
-                .unwrap_or_else(|| "?".into())
-        };
-        match d {
-            Diagnostic::NoGround => "No ground symbol: every circuit needs a 0 V reference.".into(),
-            Diagnostic::UnconnectedPin { component, pin } => {
-                format!("{} pin {pin} is not connected.", name(*component))
-            }
-            Diagnostic::ConflictingLabels { names } => {
-                format!("One net has several labels: {}.", names.join(", "))
-            }
-            Diagnostic::MissingModel { component, model } => {
-                format!(
-                    "{} uses model {model}, which is not defined.",
-                    name(*component)
-                )
-            }
-            Diagnostic::WrongModelKind {
-                component,
-                model,
-                expected,
-                ..
-            } => format!(
-                "{} needs a {} model, but {model} is a different kind.",
-                name(*component),
-                expected.spice_name()
-            ),
-            Diagnostic::DuplicateDesignator { designator, .. } => {
-                format!("More than one part is called {designator}.")
-            }
-        }
     }
 
     // ---------------------------------------------------- shortcuts ---
@@ -803,44 +774,115 @@ impl DunbrecApp {
         });
     }
 
-    fn instrument_windows(&mut self, ctx: &egui::Context) {
-        let probing = self.canvas.tool == Tool::Probe;
-        let s = self.doc.schematic();
-        let netlist = &self.netlist.1;
-        let map = &self.node_map.1;
-        let mut probe_clicked = false;
-        if self.bench.show_scope {
-            let (timebase_changed, clicked) =
-                self.bench.scope_window(ctx, s, netlist, map, probing);
-            probe_clicked |= clicked;
-            if timebase_changed && let Some(live) = &mut self.live {
-                live.send(Command::SetMaxStep(self.bench.max_step()));
-                live.send(Command::SetSpeed(self.bench.speed.value(&self.bench.scope)));
+    /// The instruments' on/off switches, which the toolbar and menus own.
+    fn instrument_switches(&self) -> [(Pane, bool); 8] {
+        [
+            (Pane::Scope, self.bench.show_scope),
+            (Pane::Meter, self.bench.show_meter),
+            (Pane::Logic, self.bench.show_logic),
+            (Pane::Bode, self.analyses.show_bode),
+            (Pane::Transfer, self.analyses.show_transfer),
+            (Pane::Tracer, self.analyses.show_tracer),
+            (Pane::Fgen, self.analyses.show_fgen),
+            (Pane::Serial, self.serial.show),
+        ]
+    }
+
+    /// An instrument's tab was closed in the dock: switch it off.
+    fn instrument_closed(&mut self, pane: Pane) {
+        match pane {
+            Pane::Scope => self.bench.show_scope = false,
+            Pane::Meter => self.bench.show_meter = false,
+            Pane::Logic => self.bench.show_logic = false,
+            Pane::Bode => self.analyses.show_bode = false,
+            Pane::Transfer => self.analyses.show_transfer = false,
+            Pane::Tracer => self.analyses.show_tracer = false,
+            Pane::Fgen => self.analyses.show_fgen = false,
+            Pane::Serial => self.serial.close(),
+            _ => {}
+        }
+    }
+
+    /// Draw every panel (schematic, palette, properties, checks, values and
+    /// the instruments) in the dock.
+    fn dock_area(&mut self, ctx: &egui::Context) {
+        // Tabs follow the instruments' switches. Note which tabs exist now,
+        // so one that is gone afterwards, however it was closed, switches
+        // its instrument off.
+        let switches = self.instrument_switches();
+        dock::reconcile(&mut self.dock, &switches);
+        let before: Vec<(Pane, bool)> = Pane::INSTRUMENTS
+            .iter()
+            .map(|&p| (p, dock::is_open(&self.dock, p)))
+            .collect();
+
+        // Live values while simulating, otherwise the DC point.
+        let live_tags: Vec<Annotation>;
+        let annotations: &[Annotation] = match (&self.live, &self.latest, &self.dc) {
+            _ if !self.show_voltages => &[],
+            (Some(_), Some(sample), _) if self.live_generation == self.doc.generation() => {
+                live_tags = self
+                    .node_map
+                    .2
+                    .iter()
+                    .filter_map(|place| {
+                        sample.voltages.get(place.node.0).map(|v| Annotation {
+                            place: *place,
+                            text: format_value(*v, "V"),
+                        })
+                    })
+                    .collect();
+                &live_tags
             }
-        }
-        if self.bench.show_meter {
-            let running = self.live.is_some();
-            probe_clicked |= self
-                .bench
-                .meter_window(ctx, s, netlist, map, probing, running);
-        }
-        let inputs = Inputs {
-            doc: &mut self.doc,
-            netlist: &self.netlist.1,
-            map: &self.node_map.1,
-            bench: &mut self.bench,
-            probing,
+            (
+                None,
+                _,
+                Some(DcResults {
+                    outcome: Ok(t),
+                    generation,
+                }),
+            ) if *generation == self.doc.generation() => &t.annotations,
+            _ => &[],
         };
-        probe_clicked |= self.analyses.show(ctx, inputs);
-        if self.bench.show_logic {
-            let s = self.doc.schematic();
-            probe_clicked |=
-                self.bench
-                    .logic_window(ctx, s, &self.netlist.1, &self.node_map.1, probing);
+        let markers = self.bench.markers(self.doc.schematic());
+        let lit = self.lit_leds();
+        let probing = self.canvas.tool == Tool::Probe;
+
+        let mut viewer = PaneViewer {
+            doc: &mut self.doc,
+            canvas: &mut self.canvas,
+            properties: &mut self.properties,
+            bench: &mut self.bench,
+            analyses: &mut self.analyses,
+            serial: &mut self.serial,
+            netlist: &self.netlist.1,
+            node_map: &self.node_map.1,
+            dc: &self.dc,
+            latest: &self.latest,
+            running: self.live.is_some(),
+            probing,
+            annotations,
+            markers: &markers,
+            lit: &lit,
+            probe_clicked: false,
+            timebase_changed: false,
+        };
+        DockArea::new(&mut self.dock)
+            .style(egui_dock::Style::from_egui(ctx.style().as_ref()))
+            .show(ctx, &mut viewer);
+        let (probe_clicked, timebase_changed) = (viewer.probe_clicked, viewer.timebase_changed);
+
+        if timebase_changed && let Some(live) = &mut self.live {
+            live.send(Command::SetMaxStep(self.bench.max_step()));
+            live.send(Command::SetSpeed(self.bench.speed.value(&self.bench.scope)));
         }
-        self.serial.window(ctx);
         if probe_clicked {
             self.canvas.tool = Tool::Probe;
+        }
+        for (pane, was_open) in before {
+            if was_open && !dock::is_open(&self.dock, pane) {
+                self.instrument_closed(pane);
+            }
         }
     }
 
@@ -1020,6 +1062,27 @@ impl DunbrecApp {
                     }
                     ui.separator();
                     ui.checkbox(&mut self.show_voltages, "Node voltages on the schematic");
+                    ui.separator();
+                    ui.menu_button("Panels", |ui| {
+                        for pane in Pane::SIDE_PANELS {
+                            let mut open = dock::is_open(&self.dock, pane);
+                            if ui.checkbox(&mut open, pane.title()).changed() {
+                                if open {
+                                    dock::open(&mut self.dock, pane);
+                                } else {
+                                    dock::close(&mut self.dock, pane);
+                                }
+                            }
+                        }
+                    });
+                    if ui
+                        .button("Reset layout")
+                        .on_hover_text("Put every panel back where it started")
+                        .clicked()
+                    {
+                        self.dock = dock::default_layout();
+                        ui.close();
+                    }
                 });
                 ui.menu_button("Help", |ui| {
                     if ui.button("Keyboard shortcuts").clicked() {
@@ -1033,156 +1096,6 @@ impl DunbrecApp {
                 });
             });
         });
-    }
-
-    fn palette_panel(&mut self, ctx: &egui::Context) {
-        egui::SidePanel::left("palette")
-            .resizable(true)
-            .default_width(170.0)
-            .show(ctx, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.heading("Tools");
-                    let tool = self.canvas.tool.clone();
-                    if ui
-                        .selectable_label(tool == Tool::Select, "⬉ Select   (S)")
-                        .clicked()
-                    {
-                        self.canvas.cancel();
-                    }
-                    if ui
-                        .selectable_label(tool == Tool::Wire, "✏ Wire   (W)")
-                        .clicked()
-                    {
-                        self.canvas.tool = Tool::Wire;
-                    }
-                    if ui
-                        .selectable_label(tool == Tool::Label, "🏷 Net label   (L)")
-                        .clicked()
-                    {
-                        self.canvas.tool = Tool::Label;
-                    }
-                    if ui
-                        .selectable_label(tool == Tool::Probe, "🔌 Probe   (P)")
-                        .clicked()
-                    {
-                        self.canvas.tool = Tool::Probe;
-                    }
-                    ui.add_space(8.0);
-                    let mut group = "";
-                    for entry in palette() {
-                        if entry.group != group {
-                            group = entry.group;
-                            ui.add_space(6.0);
-                            ui.label(RichText::new(group).strong());
-                        }
-                        let kind = (entry.make)();
-                        let active = matches!(&tool, Tool::Place { kind: k, .. } if *k == kind);
-                        if ui.selectable_label(active, entry.name).clicked() {
-                            self.canvas.tool = Tool::Place {
-                                kind,
-                                rotation: dunbrec_core::Rotation::R0,
-                                mirrored: false,
-                            };
-                        }
-                    }
-                });
-            });
-    }
-
-    fn results_panel(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::bottom("results")
-            .resizable(true)
-            .default_height(150.0)
-            .show(ctx, |ui| {
-                ui.columns(2, |cols| {
-                    cols[0].strong("Checks");
-                    egui::ScrollArea::vertical()
-                        .id_salt("checks")
-                        .show(&mut cols[0], |ui| {
-                            let diags = &self.netlist.1.diagnostics;
-                            if diags.is_empty() {
-                                ui.label(
-                                    RichText::new("✔ No wiring problems found")
-                                        .color(Color32::from_rgb(80, 170, 90)),
-                                );
-                            }
-                            for d in diags {
-                                let color = match d.severity() {
-                                    dunbrec_core::Severity::Error => Color32::from_rgb(225, 70, 70),
-                                    dunbrec_core::Severity::Warning => {
-                                        Color32::from_rgb(220, 160, 40)
-                                    }
-                                };
-                                ui.label(RichText::new(self.describe(d)).color(color));
-                            }
-                        });
-
-                    if let (Some(_), Some(sample)) = (&self.live, &self.latest) {
-                        cols[1].strong(format!(
-                            "Live values at t = {}",
-                            format_value(sample.time, "s")
-                        ));
-                        egui::ScrollArea::vertical()
-                            .id_salt("live")
-                            .show(&mut cols[1], |ui| {
-                                let unused = self.netlist.1.unused_io_nets();
-                                egui::Grid::new("live_table").striped(true).show(ui, |ui| {
-                                    for (i, node) in self.netlist.1.nodes.iter().enumerate().skip(1)
-                                    {
-                                        if unused.contains(&NodeId(i)) {
-                                            continue;
-                                        }
-                                        if let Some(v) = sample.voltages.get(i) {
-                                            ui.monospace(format!("V({})", node.name));
-                                            ui.monospace(format_value(*v, "V"));
-                                            ui.end_row();
-                                        }
-                                    }
-                                    for (e, i) in
-                                        self.netlist.1.elements.iter().zip(&sample.currents)
-                                    {
-                                        ui.monospace(format!("I({})", e.designator));
-                                        ui.monospace(format_value(*i, "A"));
-                                        ui.end_row();
-                                    }
-                                });
-                            });
-                        return;
-                    }
-                    cols[1].strong("DC operating point");
-                    egui::ScrollArea::vertical()
-                        .id_salt("dc")
-                        .show(&mut cols[1], |ui| match &self.dc {
-                            None => {
-                                ui.label(RichText::new("Simulate → Recalculate DC now").weak());
-                            }
-                            Some(DcResults {
-                                outcome: Err(e), ..
-                            }) => {
-                                ui.label(RichText::new(e).color(Color32::from_rgb(225, 70, 70)));
-                            }
-                            Some(DcResults { outcome: Ok(t), .. }) => {
-                                for w in &t.warnings {
-                                    ui.label(
-                                        RichText::new(w).color(Color32::from_rgb(220, 160, 40)),
-                                    );
-                                }
-                                egui::Grid::new("dc_table").striped(true).show(ui, |ui| {
-                                    for (name, v) in &t.voltages {
-                                        ui.monospace(format!("V({name})"));
-                                        ui.monospace(format_value(*v, "V"));
-                                        ui.end_row();
-                                    }
-                                    for (name, i) in &t.currents {
-                                        ui.monospace(format!("I({name})"));
-                                        ui.monospace(format_value(*i, "A"));
-                                        ui.end_row();
-                                    }
-                                });
-                            }
-                        });
-                });
-            });
     }
 
     fn dialogs(&mut self, ctx: &egui::Context) {
@@ -1302,9 +1215,326 @@ impl DunbrecApp {
     }
 }
 
+/// Explain a netlist problem in a sentence.
+fn describe_diagnostic(schematic: &Schematic, d: &Diagnostic) -> String {
+    let name = |id| {
+        schematic
+            .component(id)
+            .map(|c| c.designator.clone())
+            .unwrap_or_else(|| "?".into())
+    };
+    match d {
+        Diagnostic::NoGround => "No ground symbol: every circuit needs a 0 V reference.".into(),
+        Diagnostic::UnconnectedPin { component, pin } => {
+            format!("{} pin {pin} is not connected.", name(*component))
+        }
+        Diagnostic::ConflictingLabels { names } => {
+            format!("One net has several labels: {}.", names.join(", "))
+        }
+        Diagnostic::MissingModel { component, model } => {
+            format!(
+                "{} uses model {model}, which is not defined.",
+                name(*component)
+            )
+        }
+        Diagnostic::WrongModelKind {
+            component,
+            model,
+            expected,
+            ..
+        } => format!(
+            "{} needs a {} model, but {model} is a different kind.",
+            name(*component),
+            expected.spice_name()
+        ),
+        Diagnostic::DuplicateDesignator { designator, .. } => {
+            format!("More than one part is called {designator}.")
+        }
+    }
+}
+
+/// The tools and the parts library.
+fn palette_ui(ui: &mut egui::Ui, canvas: &mut Canvas) {
+    egui::ScrollArea::vertical().show(ui, |ui| {
+        ui.heading("Tools");
+        let tool = canvas.tool.clone();
+        if ui
+            .selectable_label(tool == Tool::Select, "⬉ Select   (S)")
+            .clicked()
+        {
+            canvas.cancel();
+        }
+        if ui
+            .selectable_label(tool == Tool::Wire, "✏ Wire   (W)")
+            .clicked()
+        {
+            canvas.tool = Tool::Wire;
+        }
+        if ui
+            .selectable_label(tool == Tool::Label, "🏷 Net label   (L)")
+            .clicked()
+        {
+            canvas.tool = Tool::Label;
+        }
+        if ui
+            .selectable_label(tool == Tool::Probe, "🔌 Probe   (P)")
+            .clicked()
+        {
+            canvas.tool = Tool::Probe;
+        }
+        ui.add_space(8.0);
+        let mut group = "";
+        for entry in palette() {
+            if entry.group != group {
+                group = entry.group;
+                ui.add_space(6.0);
+                ui.label(RichText::new(group).strong());
+            }
+            let kind = (entry.make)();
+            let active = matches!(&tool, Tool::Place { kind: k, .. } if *k == kind);
+            if ui.selectable_label(active, entry.name).clicked() {
+                canvas.tool = Tool::Place {
+                    kind,
+                    rotation: dunbrec_core::Rotation::R0,
+                    mirrored: false,
+                };
+            }
+        }
+    });
+}
+
+/// Wiring problems in plain English.
+fn checks_ui(ui: &mut egui::Ui, netlist: &Netlist, schematic: &Schematic) {
+    egui::ScrollArea::vertical()
+        .id_salt("checks")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            let diags = &netlist.diagnostics;
+            if diags.is_empty() {
+                ui.label(
+                    RichText::new("✔ No wiring problems found")
+                        .color(Color32::from_rgb(80, 170, 90)),
+                );
+            }
+            for d in diags {
+                let color = match d.severity() {
+                    dunbrec_core::Severity::Error => Color32::from_rgb(225, 70, 70),
+                    dunbrec_core::Severity::Warning => Color32::from_rgb(220, 160, 40),
+                };
+                ui.label(RichText::new(describe_diagnostic(schematic, d)).color(color));
+            }
+        });
+}
+
+/// Live node voltages and currents while simulating, otherwise the DC
+/// operating point.
+fn values_ui(
+    ui: &mut egui::Ui,
+    netlist: &Netlist,
+    running: bool,
+    latest: &Option<Sample>,
+    dc: &Option<DcResults>,
+) {
+    if let (true, Some(sample)) = (running, latest) {
+        ui.strong(format!(
+            "Live values at t = {}",
+            format_value(sample.time, "s")
+        ));
+        egui::ScrollArea::vertical()
+            .id_salt("live")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                let unused = netlist.unused_io_nets();
+                egui::Grid::new("live_table").striped(true).show(ui, |ui| {
+                    for (i, node) in netlist.nodes.iter().enumerate().skip(1) {
+                        if unused.contains(&NodeId(i)) {
+                            continue;
+                        }
+                        if let Some(v) = sample.voltages.get(i) {
+                            ui.monospace(format!("V({})", node.name));
+                            ui.monospace(format_value(*v, "V"));
+                            ui.end_row();
+                        }
+                    }
+                    for (e, i) in netlist.elements.iter().zip(&sample.currents) {
+                        ui.monospace(format!("I({})", e.designator));
+                        ui.monospace(format_value(*i, "A"));
+                        ui.end_row();
+                    }
+                });
+            });
+        return;
+    }
+    ui.strong("DC operating point");
+    egui::ScrollArea::vertical()
+        .id_salt("dc")
+        .auto_shrink([false, false])
+        .show(ui, |ui| match dc {
+            None => {
+                ui.label(RichText::new("Simulate → Recalculate DC now").weak());
+            }
+            Some(DcResults {
+                outcome: Err(e), ..
+            }) => {
+                ui.label(RichText::new(e).color(Color32::from_rgb(225, 70, 70)));
+            }
+            Some(DcResults { outcome: Ok(t), .. }) => {
+                for w in &t.warnings {
+                    ui.label(RichText::new(w).color(Color32::from_rgb(220, 160, 40)));
+                }
+                egui::Grid::new("dc_table").striped(true).show(ui, |ui| {
+                    for (name, v) in &t.voltages {
+                        ui.monospace(format!("V({name})"));
+                        ui.monospace(format_value(*v, "V"));
+                        ui.end_row();
+                    }
+                    for (name, i) in &t.currents {
+                        ui.monospace(format!("I({name})"));
+                        ui.monospace(format_value(*i, "A"));
+                        ui.end_row();
+                    }
+                });
+            }
+        });
+}
+
+/// What the dock needs to draw each panel: the parts of the app they show
+/// or edit, borrowed for one frame. Panels report back through
+/// `probe_clicked` and `timebase_changed`.
+struct PaneViewer<'a> {
+    doc: &'a mut Document,
+    canvas: &'a mut Canvas,
+    properties: &'a mut Properties,
+    bench: &'a mut Bench,
+    analyses: &'a mut Analyses,
+    serial: &'a mut SerialMonitor,
+    netlist: &'a Netlist,
+    node_map: &'a NodeMap,
+    dc: &'a Option<DcResults>,
+    latest: &'a Option<Sample>,
+    running: bool,
+    probing: bool,
+    annotations: &'a [Annotation],
+    markers: &'a [Marker],
+    lit: &'a std::collections::HashSet<dunbrec_core::ComponentId>,
+    probe_clicked: bool,
+    timebase_changed: bool,
+}
+
+impl TabViewer for PaneViewer<'_> {
+    type Tab = Pane;
+
+    fn title(&mut self, tab: &mut Pane) -> egui::WidgetText {
+        tab.title().into()
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Pane) {
+        match *tab {
+            Pane::Schematic => self.canvas.show(
+                ui,
+                self.doc,
+                self.netlist,
+                self.annotations,
+                self.markers,
+                self.lit,
+            ),
+            Pane::Palette => palette_ui(ui, self.canvas),
+            Pane::Properties => {
+                let selection: Vec<Item> = self.canvas.selection.iter().copied().collect();
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    self.properties.show(ui, self.doc, &selection);
+                });
+            }
+            Pane::Checks => checks_ui(ui, self.netlist, self.doc.schematic()),
+            Pane::Values => values_ui(ui, self.netlist, self.running, self.latest, self.dc),
+            Pane::Scope => {
+                let (timebase, probe) = self.bench.scope_ui(
+                    ui,
+                    self.doc.schematic(),
+                    self.netlist,
+                    self.node_map,
+                    self.probing,
+                );
+                self.timebase_changed |= timebase;
+                self.probe_clicked |= probe;
+            }
+            Pane::Meter => {
+                self.probe_clicked |= self.bench.meter_ui(
+                    ui,
+                    self.doc.schematic(),
+                    self.netlist,
+                    self.node_map,
+                    self.probing,
+                    self.running,
+                );
+            }
+            Pane::Logic => {
+                self.probe_clicked |= self.bench.logic_ui(
+                    ui,
+                    self.doc.schematic(),
+                    self.netlist,
+                    self.node_map,
+                    self.probing,
+                );
+            }
+            Pane::Bode | Pane::Transfer | Pane::Tracer => {
+                let mut inputs = Inputs {
+                    doc: &mut *self.doc,
+                    netlist: self.netlist,
+                    map: self.node_map,
+                    bench: &mut *self.bench,
+                    probing: self.probing,
+                };
+                match *tab {
+                    Pane::Bode => self.probe_clicked |= self.analyses.bode_ui(ui, &mut inputs),
+                    Pane::Transfer => {
+                        self.probe_clicked |= self.analyses.transfer_ui(ui, &mut inputs)
+                    }
+                    _ => self.analyses.tracer_ui(ui, &mut inputs),
+                }
+            }
+            Pane::Fgen => self.analyses.fgen_ui(ui, self.doc),
+            Pane::Serial => self.serial.ui(ui),
+        }
+    }
+
+    fn is_closeable(&self, tab: &Pane) -> bool {
+        tab.closeable()
+    }
+
+    fn allowed_in_windows(&self, tab: &mut Pane) -> bool {
+        tab.closeable()
+    }
+
+    /// Panels that scroll themselves, or draw edge to edge, get no scroll
+    /// bars from the dock. Instruments scroll vertically only, so their
+    /// width stays the width of the tab.
+    fn scroll_bars(&self, tab: &Pane) -> [bool; 2] {
+        if tab.is_instrument() {
+            [false, true]
+        } else {
+            [false, false]
+        }
+    }
+
+    /// The schematic fills its tab to the edge.
+    fn tab_style_override(
+        &self,
+        tab: &Pane,
+        global: &egui_dock::TabStyle,
+    ) -> Option<egui_dock::TabStyle> {
+        (*tab == Pane::Schematic).then(|| {
+            let mut style = global.clone();
+            style.tab_body.inner_margin = egui::Margin::ZERO;
+            style
+        })
+    }
+}
+
 impl eframe::App for DunbrecApp {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, STORAGE_KEY, &self.settings);
+        eframe::set_value(storage, LAYOUT_KEY, &self.dock);
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -1339,66 +1569,15 @@ impl eframe::App for DunbrecApp {
         self.menu_bar(ctx);
         self.run_toolbar(ctx);
         self.status_bar(ctx);
-        self.results_panel(ctx);
-        self.palette_panel(ctx);
-        egui::SidePanel::right("properties")
-            .resizable(true)
-            .default_width(260.0)
-            .show(ctx, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    let selection: Vec<Item> = self.canvas.selection.iter().copied().collect();
-                    self.properties.show(ui, &mut self.doc, &selection);
-                });
-            });
-        egui::CentralPanel::default()
-            .frame(egui::Frame::NONE)
-            .show(ctx, |ui| {
-                // Live values while simulating, otherwise the DC point.
-                let live_tags: Vec<Annotation>;
-                let annotations: &[Annotation] = match (&self.live, &self.latest, &self.dc) {
-                    _ if !self.show_voltages => &[],
-                    (Some(_), Some(sample), _) if self.live_generation == self.doc.generation() => {
-                        live_tags = self
-                            .node_map
-                            .2
-                            .iter()
-                            .filter_map(|place| {
-                                sample.voltages.get(place.node.0).map(|v| Annotation {
-                                    place: *place,
-                                    text: format_value(*v, "V"),
-                                })
-                            })
-                            .collect();
-                        &live_tags
-                    }
-                    (
-                        None,
-                        _,
-                        Some(DcResults {
-                            outcome: Ok(t),
-                            generation,
-                        }),
-                    ) if *generation == self.doc.generation() => &t.annotations,
-                    _ => &[],
-                };
-                let markers = self.bench.markers(self.doc.schematic());
-                let lit = self.lit_leds();
-                self.canvas.show(
-                    ui,
-                    &mut self.doc,
-                    &self.netlist.1,
-                    annotations,
-                    &markers,
-                    &lit,
-                );
-            });
+        self.dock_area(ctx);
 
         if let Some((at, part)) = self.canvas.take_probe_request() {
             let s = self.doc.schematic();
             let on_net = self.node_map.1.node_at(s, &self.netlist.1, at).is_some();
             self.probe_hint = self.bench.connect(at, part, on_net).err();
+            // The instruments were drawn before this click was handled.
+            ctx.request_repaint();
         }
-        self.instrument_windows(ctx);
 
         // Drop selections of items that no longer exist (after undo etc.).
         let s = self.doc.schematic();

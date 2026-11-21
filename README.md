@@ -37,6 +37,14 @@ drag empty space to box-select, Del deletes, Ctrl+C / X / V / D copy, cut, paste
 duplicate, Ctrl+Z / Y undo and redo. Wheel zooms, middle-drag pans. Values accept engineering
 notation (`4k7`, `10u`, `2.2M`). Help → Keyboard shortcuts lists everything.
 
+**Panels.** Every panel (the schematic, palette, properties, checks, live values and each
+instrument) is a tab you can drag. Drop it on the edge of another panel to split the window,
+on the middle of one to stack it as a tab, or outside the window area to float it. Drag the
+dividers to resize. Closing a panel's tab hides it: bring Palette, Properties, Checks or Values
+back from View → Panels, and reopen an instrument from the toolbar or Instruments menu (a newly
+opened instrument appears in a tab strip under the schematic). The arrangement is remembered
+between sessions; View → Reset layout puts everything back.
+
 **Checking.** The Checks panel lists wiring problems in plain English (missing ground,
 unconnected pins, missing models), and the DC operating point is recalculated after every edit
 with each node's voltage shown on the schematic.
@@ -134,6 +142,7 @@ written as a subcircuit call with its `.subckt` definition included.
 10. Digital logic: gates, flip-flops, counters, clocks, logic analyser ✅
 11. Microcontrollers: ATmega328P emulation, `.hex` firmware, GPIO/timers/PWM/ADC/serial ✅
 12. Integrated circuits: composite parts, 741 op-amp (Boyle macromodel), 555 timer ✅
+13. Dockable, draggable panels (egui_dock) with a remembered layout ✅
 
 Known limits: fixed temperature (27 °C); MOSFETs are level 1 only; one logic family (5 V
 CMOS-style); logic parts, microcontrollers and 555 timers are not exported to SPICE; the 555

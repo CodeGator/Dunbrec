@@ -59,15 +59,15 @@ impl SerialMonitor {
         self.logs.get(designator).map(|s| s.as_str())
     }
 
-    pub fn window(&mut self, ctx: &egui::Context) {
-        if !self.show {
-            return;
-        }
-        let mut open = true;
-        egui::Window::new("Serial monitor")
-            .open(&mut open)
-            .default_size([460.0, 300.0])
-            .show(ctx, |ui| {
+    /// The user closed the monitor: stay closed until they open it again.
+    pub fn close(&mut self) {
+        self.show = false;
+        self.dismissed = true;
+    }
+
+    pub fn ui(&mut self, ui: &mut egui::Ui) {
+        {
+            {
                 ui.horizontal(|ui| {
                     if self.logs.len() > 1 {
                         let current = self.selected.clone().unwrap_or_default();
@@ -117,10 +117,7 @@ impl SerialMonitor {
                             );
                         }
                     });
-            });
-        if !open {
-            self.show = false;
-            self.dismissed = true;
+            }
         }
     }
 }

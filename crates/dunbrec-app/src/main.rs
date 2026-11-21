@@ -10,6 +10,7 @@
 mod analyses_ui;
 mod app;
 mod canvas;
+mod dock;
 mod document;
 mod examples;
 mod instruments_ui;
