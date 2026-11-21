@@ -777,8 +777,31 @@ impl DunbrecApp {
         }
     }
 
+    /// Fill for the toolbar and status bar that says whether a simulation
+    /// is running (green) or paused (amber); `None` when there is none.
+    fn run_tint(&self, ctx: &egui::Context) -> Option<Color32> {
+        let live = self.live.as_ref()?;
+        let dark = ctx.style().visuals.dark_mode;
+        Some(match (live.paused, dark) {
+            (false, true) => Color32::from_rgb(22, 78, 42),
+            (false, false) => Color32::from_rgb(196, 232, 204),
+            (true, true) => Color32::from_rgb(88, 66, 18),
+            (true, false) => Color32::from_rgb(248, 228, 184),
+        })
+    }
+
+    /// A panel frame in the run tint, or the usual one when stopped.
+    fn run_frame(&self, ctx: &egui::Context) -> egui::Frame {
+        let frame = egui::Frame::side_top_panel(&ctx.style());
+        match self.run_tint(ctx) {
+            Some(fill) => frame.fill(fill),
+            None => frame,
+        }
+    }
+
     fn run_toolbar(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::top("run").show(ctx, |ui| {
+        let frame = self.run_frame(ctx);
+        egui::TopBottomPanel::top("run").frame(frame).show(ctx, |ui| {
             ui.horizontal(|ui| {
                 match &self.live {
                     None => {
@@ -1284,7 +1307,8 @@ impl DunbrecApp {
     }
 
     fn status_bar(&self, ctx: &egui::Context) {
-        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
+        let frame = self.run_frame(ctx);
+        egui::TopBottomPanel::bottom("status").frame(frame).show(ctx, |ui| {
             ui.horizontal(|ui| {
                 let hint = match &self.canvas.tool {
                     Tool::Select => "Click to select · click a pin to start a wire · drag a wire corner to reshape it · drag to move · drag empty space to box-select · R rotate · X mirror · Del delete",
