@@ -337,6 +337,16 @@ impl Transient {
         {
             return Ok(m.spec(part).kind == element.kind);
         }
+        // The switches of a CD4066B were built with its on-resistance.
+        if matches!(element.kind, dunbrec_core::ComponentKind::Cd4066 { .. })
+            && self
+                .digital
+                .as_ref()
+                .and_then(|sys| sys.part_kind(index))
+                .is_some_and(|kind| *kind != element.kind)
+        {
+            return Ok(false);
+        }
         if !self.circuit.replace_device(index, element, models)? {
             return Ok(false);
         }

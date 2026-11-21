@@ -220,6 +220,52 @@ mod tests {
     }
 
     #[test]
+    fn switches_round_trip_and_old_switches_load_as_not_momentary() {
+        use dunbrec_core::SwitchForm;
+        let mut s = sample();
+        s.add_component(
+            ComponentKind::MultiSwitch {
+                form: SwitchForm::Dpdt,
+                thrown: true,
+                r_on: 0.01,
+                r_off: 1e9,
+            },
+            Point::new(20, 0),
+        );
+        s.add_component(
+            ComponentKind::Switch {
+                closed: true,
+                r_on: 0.01,
+                r_off: 1e9,
+                momentary: true,
+            },
+            Point::new(30, 0),
+        );
+        let text = to_string(&s).unwrap();
+        assert_eq!(from_str(&text).unwrap(), s);
+
+        // A file saved before push buttons existed has no `momentary` entry.
+        let old: String = text
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("momentary:"))
+            .collect::<Vec<_>>()
+            .join(
+                "
+",
+            );
+        assert!(!old.contains("momentary"));
+        let loaded = from_str(&old).unwrap();
+        assert!(loaded.components.iter().any(|c| matches!(
+            c.kind,
+            ComponentKind::Switch {
+                momentary: false,
+                closed: true,
+                ..
+            }
+        )));
+    }
+
+    #[test]
     fn round_trip_file() {
         let dir = std::env::temp_dir().join(format!("dunbrec-test-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();

@@ -337,6 +337,41 @@ impl Device for Resistor {
     }
 }
 
+/// The contacts of a multi-contact switch: each is a resistor between two
+/// nodes, low when closed and high when open.
+#[derive(Debug)]
+pub struct SwitchContacts {
+    pub name: String,
+    /// Node pair and resistance of each contact.
+    pub contacts: Vec<(NodeId, NodeId, f64)>,
+}
+
+impl Device for SwitchContacts {
+    fn designator(&self) -> &str {
+        &self.name
+    }
+    fn stamp_ac(&self, s: &mut AcStamper, _ctx: &AcContext) {
+        for &(p, n, r) in &self.contacts {
+            s.conductance(p, n, 1.0 / r);
+        }
+    }
+    fn stamp(&self, s: &mut Stamper, _ctx: &StampContext) {
+        for &(p, n, r) in &self.contacts {
+            s.conductance(p, n, 1.0 / r);
+        }
+    }
+    fn dc_paths(&self) -> Vec<(NodeId, NodeId)> {
+        self.contacts.iter().map(|&(p, n, _)| (p, n)).collect()
+    }
+    /// Current through the first contact (the one a probe on the first
+    /// pin would see).
+    fn current(&self, sol: &SolutionView) -> f64 {
+        self.contacts
+            .first()
+            .map_or(0.0, |&(p, n, r)| (sol.voltage(p) - sol.voltage(n)) / r)
+    }
+}
+
 /// Smallest resistance a potentiometer segment is allowed to reach, so a
 /// wiper at either end does not create an infinite conductance.
 pub const POT_MIN_SEGMENT: f64 = 1e-3;

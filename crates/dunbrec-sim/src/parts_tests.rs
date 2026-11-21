@@ -160,9 +160,58 @@ fn q2n3904_transition_frequency() {
 
 #[test]
 fn d1n4148_meets_datasheet() {
+    switching_diode_meets_datasheet("1N4148");
+}
+
+#[test]
+fn d1n914_meets_datasheet() {
+    switching_diode_meets_datasheet("1N914");
+    let lib = library();
+    // IR ≤ 5 µA at VR = 75 V (Vishay 1N914).
+    let rev = NetlistBuilder::new()
+        .element("VR", K::VoltageSource { waveform: dc(75.0) }, &["k", "0"])
+        .element(
+            "D",
+            K::Diode {
+                model: "1N914".into(),
+            },
+            &["0", "k"],
+        )
+        .build();
+    let ir = DcSweeper::new(&rev, &lib)
+        .unwrap()
+        .solve()
+        .unwrap()
+        .current("D")
+        .unwrap()
+        .abs();
+    assert!(ir <= 5e-6, "IR {ir} at 75 V");
+    // CD ≤ 4 pF at VR = 0, 1 MHz: a unit AC current into the unbiased diode.
+    let cap = NetlistBuilder::new()
+        .element("IB", K::CurrentSource { waveform: dc(0.0) }, &["0", "a"])
+        .element(
+            "D",
+            K::Diode {
+                model: "1N914".into(),
+            },
+            &["a", "0"],
+        )
+        .build();
+    let f = 1e6;
+    let res = ac_analysis(&cap, &lib, "IB", &[f]).unwrap();
+    let z = res.response(res.node("a").unwrap())[0].norm();
+    let farads = 1.0 / (2.0 * std::f64::consts::PI * f * z);
+    assert!(farads <= 4.05e-12, "CD {:.2} pF", farads * 1e12);
+    // trr ≤ 4 ns (VR = 6 V, RL = 100 Ω, IF = 10 mA, iR = 1 mA).
+    let trr = reverse_recovery_time("1N914");
+    assert!(trr <= 4e-9, "trr {:.2} ns", trr * 1e9);
+}
+
+/// VF and leakage limits shared by the 1N914 and 1N4148 datasheets.
+fn switching_diode_meets_datasheet(model: &str) {
     let lib = library();
     let diode = K::Diode {
-        model: "1N4148".into(),
+        model: model.into(),
     };
     // VF ≤ 1 V at IF = 10 mA.
     let fwd = NetlistBuilder::new()
@@ -223,4 +272,64 @@ fn d1n750_zener_voltage() {
         .voltage_by_name("k")
         .unwrap();
     assert!((4.465..=4.935).contains(&vz), "VZ {vz}");
+}
+
+/// Reverse recovery time under the 1N914 datasheet's test conditions:
+/// forward current 10 mA, then switched to VR = 6 V through RL = 100 Ω; the
+/// time from the switching edge until the reverse current has fallen to
+/// 1 mA.
+fn reverse_recovery_time(model: &str) -> f64 {
+    use crate::{TransientOptions, transient};
+    let edge = 20e-9;
+    let netlist = NetlistBuilder::new()
+        .element(
+            "V1",
+            K::VoltageSource {
+                waveform: Waveform::Pulse {
+                    // Chosen so the forward current settles at 10 mA.
+                    v1: 1.72,
+                    v2: -6.0,
+                    delay: edge,
+                    rise: 0.1e-9,
+                    fall: 0.1e-9,
+                    width: 1e3,
+                    period: 0.0,
+                },
+            },
+            &["in", "0"],
+        )
+        .element("RL", K::Resistor { resistance: 100.0 }, &["in", "a"])
+        .element(
+            "D",
+            K::Diode {
+                model: model.into(),
+            },
+            &["a", "0"],
+        )
+        .build();
+    let circuit = crate::Circuit::from_netlist(&netlist, &library()).unwrap();
+    let res = transient(
+        circuit,
+        TransientOptions::new(edge + 100e-9).with_max_step(0.05e-9),
+    )
+    .unwrap();
+    let i = res.current("D").unwrap();
+    let forward = res.at(i, edge * 0.9);
+    assert!(
+        (forward - 10e-3).abs() < 0.5e-3,
+        "forward current {forward} A, not the 10 mA the test calls for"
+    );
+    let after: Vec<(f64, f64)> = res
+        .times
+        .iter()
+        .zip(i)
+        .filter(|(t, _)| **t > edge)
+        .map(|(t, i)| (*t, *i))
+        .collect();
+    let back = after
+        .iter()
+        .skip_while(|p| p.1 > -1e-3)
+        .find(|p| p.1 > -1e-3)
+        .expect("the reverse current never recovered");
+    back.0 - edge
 }

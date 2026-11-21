@@ -9,7 +9,8 @@ State of the project for whoever picks it up next. User-facing documentation is 
 
 All eleven planned phases are done and committed on `main` (one commit per phase, "Phase N: …"),
 plus Phase 12 (integrated circuits) and a fix for probes failing after opening a document.
-Version is `0.1.0`; nothing has been released or pushed by this work.
+Version 0.1.0 was released on 2026-11-21 (tag `v0.1.0`, merged to `main`). Work branches are
+named after the application version and merged into `main`; this one is `0.2.0`.
 
 | Phase | Content |
 |---|---|
@@ -22,6 +23,7 @@ Version is `0.1.0`; nothing has been released or pushed by this work.
 | 11 | ATmega328P emulation with `.hex` firmware; serial monitor; Arduino examples |
 | 12 | Composite parts; 741 op-amp (Boyle macromodel); 555 timer; examples 12–14 |
 | 13 | Dockable panels: every panel is an `egui_dock` tab; layout saved between sessions |
+| 0.2.0 | Switches group: SPST, SPDT, DPST, DPDT (`ComponentKind::MultiSwitch`, `SwitchContacts` device) and hold-to-press push buttons (`Switch { momentary }`, `Canvas::push_buttons`) |
 
 Health at handoff: `cargo test --workspace` 237 passed, 0 failed (1 ignored: an emulator speed
 benchmark); `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --check`
@@ -30,7 +32,7 @@ clean. Toolchain: Rust 1.99 (edition 2024, MSRV 1.90), Windows 11.
 ## Building and checking
 
 ```sh
-cargo run --release -p dunbrec-app -- --example 12   # examples 1–14, see File → Open example
+cargo run --release -p dunbrec-app -- --example 12   # examples 1–15, see File → Open example
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
@@ -103,7 +105,7 @@ Key mechanisms worth knowing before changing the engine:
 - GUI egui/eframe; own Rust simulation engine. ngspice is a dev-time reference only and is
   never shipped.
 - Publisher CodeGator; **GPL-3.0-only** licence (changed from MIT on 2026-11-21; earlier commits
-  were published under MIT); version stays 0.1.0 for now.
+  were published under MIT).
 - Microcontrollers:
   - Own AVR emulator; simavr was rejected because it is GPL (that reason lapsed when the
     project became GPL-3.0; the in-house emulator stays).

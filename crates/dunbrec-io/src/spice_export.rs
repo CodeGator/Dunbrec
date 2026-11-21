@@ -126,7 +126,7 @@ pub fn export(
     let digital: Vec<String> = netlist
         .elements
         .iter()
-        .filter(|e| e.kind.is_digital() || matches!(e.kind, K::Timer555))
+        .filter(|e| e.kind.is_digital() || matches!(e.kind, K::Timer555 | K::Cd4066 { .. }))
         .map(|e| e.designator.clone())
         .collect();
     if !digital.is_empty() {
@@ -176,7 +176,8 @@ fn write_netlist(
             | K::LogicSwitch { .. }
             | K::LogicLed
             | K::Mcu { .. }
-            | K::Timer555 => continue,
+            | K::Timer555
+            | K::Cd4066 { .. } => continue,
             K::OpAmp { part } => match dunbrec_core::schematic::opamp_subckt(part) {
                 Some((name, text)) => {
                     if !subckts.contains(&text) {
@@ -264,10 +265,37 @@ fn write_netlist(
                     sanitize(model)
                 )
             }
+            K::MultiSwitch {
+                form,
+                thrown,
+                r_on,
+                r_off,
+            } => {
+                let name = element_name('R', d);
+                let mut text = format!(
+                    "* {} switch {d} ({})",
+                    form.name(),
+                    if *thrown { "thrown" } else { "rest" }
+                );
+                for (i, &(a, b, when)) in form.contacts().iter().enumerate() {
+                    let r = if *thrown == when { r_on } else { r_off };
+                    let _ = write!(
+                        text,
+                        "
+{name}_{} {} {} {}",
+                        i + 1,
+                        n[a],
+                        n[b],
+                        num(*r)
+                    );
+                }
+                text
+            }
             K::Switch {
                 closed,
                 r_on,
                 r_off,
+                ..
             } => {
                 let (r, state) = if *closed {
                     (r_on, "closed")
@@ -435,6 +463,20 @@ mod tests {
     }
 
     #[test]
+    fn analog_switch_chips_are_not_exported() {
+        let s = lone_part(
+            K::Cd4066 { r_on: 180.0 },
+            &[
+                "a1", "a2", "b2", "b1", "cb", "0", "0", "c1", "c2", "d2", "d1", "cd", "ca", "vdd",
+            ],
+        );
+        match export(&s, "", &[]) {
+            Err(ExportError::Digital(parts)) => assert_eq!(parts, vec!["U1".to_string()]),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
     fn timers_are_not_exported() {
         let s = lone_part(
             K::Timer555,
@@ -518,6 +560,7 @@ mod tests {
                         closed: true,
                         r_on: 0.01,
                         r_off: 1e9,
+                        momentary: false,
                     },
                     &["w", "out"],
                 ),

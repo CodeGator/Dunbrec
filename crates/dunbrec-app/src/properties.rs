@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use dunbrec_core::{
-    ComponentId, ComponentKind, ModelKind, Polarity, Schematic, Waveform,
+    ComponentId, ComponentKind, ModelKind, Polarity, Schematic, SwitchForm, Waveform,
     units::{format_value, parse_eng, parse_spice},
 };
 use egui::{Color32, RichText, Ui};
@@ -167,9 +167,26 @@ impl Properties {
                         closed,
                         r_on,
                         r_off,
+                        momentary,
                     } => {
                         ui.label("Closed");
                         let a = ui.checkbox(closed, "").changed();
+                        ui.end_row();
+                        ui.label("Push button");
+                        let b = ui.checkbox(momentary, "").changed();
+                        ui.end_row();
+                        a | b
+                            | self.value(ui, id, "On resistance", "Ω", r_on)
+                            | self.value(ui, id, "Off resistance", "Ω", r_off)
+                    }
+                    ComponentKind::MultiSwitch {
+                        thrown,
+                        r_on,
+                        r_off,
+                        ..
+                    } => {
+                        ui.label("Thrown");
+                        let a = ui.checkbox(thrown, "").changed();
                         ui.end_row();
                         a | self.value(ui, id, "On resistance", "Ω", r_on)
                             | self.value(ui, id, "Off resistance", "Ω", r_off)
@@ -249,6 +266,19 @@ impl Properties {
                         );
                         ui.end_row();
                         *part != before
+                    }
+                    ComponentKind::Cd4066 { r_on } => {
+                        let changed = self.value(ui, id, "On resistance", "Ω", r_on);
+                        ui.label("");
+                        ui.label(
+                            egui::RichText::new(
+                                "CD4066B quad bilateral switch, 3–18 V. Each switch passes                                  a signal either way between its two pins while its control                                  pin is above half of VDD, and blocks it below. Signals must                                  stay between VSS and VDD. The on resistance depends on the                                  supply: typically 470 Ω at 5 V, 180 Ω at 10 V, 125 Ω at 15 V.                                  Tie unused controls to VSS.",
+                            )
+                            .small()
+                            .weak(),
+                        );
+                        ui.end_row();
+                        changed
                     }
                     ComponentKind::Timer555 => {
                         ui.label("");
@@ -738,7 +768,19 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
             ..
         } => "N-channel MOSFET",
         ComponentKind::Mosfet { .. } => "P-channel MOSFET",
+        ComponentKind::Switch {
+            momentary: true, ..
+        } => "Push button",
         ComponentKind::Switch { .. } => "Switch",
+        ComponentKind::MultiSwitch {
+            form: SwitchForm::Spdt,
+            ..
+        } => "SPDT switch",
+        ComponentKind::MultiSwitch {
+            form: SwitchForm::Dpst,
+            ..
+        } => "DPST switch",
+        ComponentKind::MultiSwitch { .. } => "DPDT switch",
         ComponentKind::Potentiometer { .. } => "Potentiometer",
         ComponentKind::Vcvs { .. } => "Voltage-controlled voltage source",
         ComponentKind::Vccs { .. } => "Voltage-controlled current source",
@@ -754,6 +796,7 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
         ComponentKind::Mcu { .. } => "Microcontroller (ATmega328P)",
         ComponentKind::OpAmp { .. } => "Operational amplifier",
         ComponentKind::Timer555 => "555 timer",
+        ComponentKind::Cd4066 { .. } => "CD4066 analog switch",
     }
 }
 

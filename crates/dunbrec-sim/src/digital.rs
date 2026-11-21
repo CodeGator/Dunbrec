@@ -450,6 +450,7 @@ impl Part {
             | ComponentKind::DFlipFlop { delay }
             | ComponentKind::Counter4 { delay } => delay.max(0.0),
             ComponentKind::Timer555 => TIMER555_DELAY,
+            ComponentKind::Cd4066 { .. } => CD4066_DELAY,
             _ => 0.0,
         }
     }
@@ -467,6 +468,8 @@ impl Part {
             ComponentKind::LogicSwitch { high } => vec![Logic::from_bool(high)],
             // Output high side, output low side, discharge.
             ComponentKind::Timer555 => vec![self.flop, self.flop.invert(), self.flop.invert()],
+            // Each switch follows its control input.
+            ComponentKind::Cd4066 { .. } => self.inputs.clone(),
             _ => Vec::new(),
         }
     }
@@ -507,6 +510,10 @@ impl Part {
         }
     }
 }
+
+/// Delay from a CD4066B control pin to its switch (s): of the order of the
+/// data sheet's 7–40 ns signal propagation time.
+pub const CD4066_DELAY: f64 = 20e-9;
 
 /// Propagation delay of the 555 from a comparator to its outputs (s).
 pub const TIMER555_DELAY: f64 = 100e-9;
@@ -784,6 +791,12 @@ impl DigitalSystem {
             self.schedule_clock(part, time);
         }
         self.schedule_outputs(part, time);
+    }
+
+    /// The kind of the part for netlist element `element`, as last set.
+    pub fn part_kind(&self, element: usize) -> Option<&ComponentKind> {
+        self.part_of_element(element)
+            .map(|p| &self.parts[p].spec.kind)
     }
 
     /// Present output levels of the part for netlist element `element`.

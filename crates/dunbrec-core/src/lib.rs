@@ -18,7 +18,8 @@ pub use netlist::{
     Diagnostic, Element, Netlist, NetlistBuilder, Node, NodeId, Severity, build_netlist,
 };
 pub use schematic::{
-    Component, ComponentId, ComponentKind, DEFAULT_LOGIC_DELAY, DEFAULT_MCU_CLOCK, GateOp, LabelId,
-    NetLabel, OPAMP_PARTS, PinDomain, Point, Polarity, Rotation, SOURCE_PREFIX, Schematic,
-    SourceFile, SourceLanguage, Waveform, Wire, WireId,
+    CD4066_DEFAULT_R_ON, CD4066_PINS, CD4066_R_ON, CD4066_SWITCHES, Component, ComponentId,
+    ComponentKind, DEFAULT_LOGIC_DELAY, DEFAULT_MCU_CLOCK, GateOp, LabelId, NetLabel, OPAMP_PARTS,
+    PinDomain, Point, Polarity, Rotation, SOURCE_PREFIX, Schematic, SourceFile, SourceLanguage,
+    SwitchForm, Waveform, Wire, WireId,
 };

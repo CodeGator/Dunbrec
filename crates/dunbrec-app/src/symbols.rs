@@ -3,7 +3,7 @@
 //! Pin positions come from `dunbrec_core` (`ComponentKind::pins`); every
 //! symbol has a lead ending exactly on each pin.
 
-use dunbrec_core::{Component, ComponentKind, GateOp, Polarity, Rotation, Waveform};
+use dunbrec_core::{Component, ComponentKind, GateOp, Polarity, Rotation, SwitchForm, Waveform};
 use egui::{Pos2, Rect, pos2};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -57,6 +57,46 @@ fn arc(center: (f32, f32), radius: f32, from: f32, to: f32) -> Vec<Pos2> {
             pos2(center.0 + radius * a.cos(), center.1 + radius * a.sin())
         })
         .collect()
+}
+
+/// A single-throw contact centred on row `y`: leads, contact dots and the
+/// blade, closed or raised. Returns where the blade is at the middle, for
+/// drawing a linkage between poles.
+fn switch_pole(prims: &mut Vec<Prim>, y: f32, closed: bool) -> f32 {
+    prims.push(line(&[(-2.0, y), (-1.0, y)]));
+    prims.push(line(&[(1.0, y), (2.0, y)]));
+    for x in [-1.0, 1.0] {
+        prims.push(Prim::Circle {
+            center: pos2(x, y),
+            radius: 0.12,
+        });
+    }
+    if closed {
+        prims.push(line(&[(-1.0, y), (1.0, y - 0.12)]));
+        y - 0.06
+    } else {
+        prims.push(line(&[(-1.0, y), (0.85, y - 0.75)]));
+        y - 0.4
+    }
+}
+
+/// A changeover contact: common on the left at row `y`, two throws on the
+/// right at rows `up` and `down`, the blade on the second when `thrown`.
+/// Returns where the blade is at the middle.
+fn changeover_pole(prims: &mut Vec<Prim>, y: f32, up: f32, down: f32, thrown: bool) -> f32 {
+    prims.push(line(&[(-2.0, y), (-1.0, y)]));
+    prims.push(line(&[(1.0, up), (2.0, up)]));
+    prims.push(line(&[(1.0, down), (2.0, down)]));
+    for (x, yy) in [(-1.0, y), (1.0, up), (1.0, down)] {
+        prims.push(Prim::Circle {
+            center: pos2(x, yy),
+            radius: 0.12,
+        });
+    }
+    let target = if thrown { down } else { up };
+    let tip_y = y + (target - y) * 0.92;
+    prims.push(line(&[(-1.0, y), (0.88, tip_y)]));
+    y + (tip_y - y) * 0.53
 }
 
 fn resistor_body(prims: &mut Vec<Prim>) {
@@ -307,23 +347,47 @@ pub fn symbol_styled(kind: &ComponentKind, zener: bool) -> Symbol {
             });
             label = pos2(-1.2, -1.3);
         }
+        ComponentKind::Switch {
+            closed,
+            momentary: false,
+            ..
+        } => {
+            switch_pole(&mut p, 0.0, *closed);
+        }
         ComponentKind::Switch { closed, .. } => {
+            // Push button: a bar over the contacts, pushed down by a plunger.
             p.push(line(&[(-2.0, 0.0), (-1.0, 0.0)]));
             p.push(line(&[(1.0, 0.0), (2.0, 0.0)]));
-            p.push(Prim::Circle {
-                center: pos2(-1.0, 0.0),
-                radius: 0.12,
-            });
-            p.push(Prim::Circle {
-                center: pos2(1.0, 0.0),
-                radius: 0.12,
-            });
-            if *closed {
-                p.push(line(&[(-1.0, 0.0), (1.0, -0.12)]));
-            } else {
-                p.push(line(&[(-1.0, 0.0), (0.85, -0.75)]));
+            for x in [-1.0, 1.0] {
+                p.push(Prim::Circle {
+                    center: pos2(x, 0.0),
+                    radius: 0.12,
+                });
             }
+            let bar = if *closed { -0.25 } else { -0.8 };
+            p.push(line(&[(-1.0, bar), (1.0, bar)]));
+            p.push(line(&[(0.0, bar), (0.0, bar - 0.7)]));
+            p.push(line(&[(-0.5, bar - 0.7), (0.5, bar - 0.7)]));
+            label = pos2(0.0, -2.2);
         }
+        ComponentKind::MultiSwitch { form, thrown, .. } => match form {
+            SwitchForm::Spdt => {
+                changeover_pole(&mut p, 0.0, -1.0, 1.0, *thrown);
+                label = pos2(0.0, -2.0);
+            }
+            SwitchForm::Dpst => {
+                let a = switch_pole(&mut p, -1.0, *thrown);
+                let b = switch_pole(&mut p, 1.0, *thrown);
+                p.push(line(&[(0.0, a), (0.0, b)]));
+                label = pos2(0.0, -2.2);
+            }
+            SwitchForm::Dpdt => {
+                let a = changeover_pole(&mut p, -2.0, -3.0, -1.0, *thrown);
+                let b = changeover_pole(&mut p, 2.0, 1.0, 3.0, *thrown);
+                p.push(line(&[(0.0, a), (0.0, b)]));
+                label = pos2(0.0, -4.0);
+            }
+        },
         ComponentKind::Gate { op, .. } => {
             gate_symbol(&mut p, *op);
             label = pos2(0.0, -2.2);
@@ -443,6 +507,17 @@ pub fn symbol_styled(kind: &ComponentKind, zener: bool) -> Symbol {
             }
             p.push(text(0.2, 0.0, "555", 0.9));
             label = pos2(2.6, -5.0);
+        }
+        ComponentKind::Cd4066 { .. } => {
+            p.push(rect(-3.0, -7.0, 3.0, 7.0));
+            for pin in kind.pins() {
+                let (x, y) = (pin.offset.x as f32, pin.offset.y as f32);
+                let left = x < 0.0;
+                p.push(line(&[(x, y), (if left { -3.0 } else { 3.0 }, y)]));
+                p.push(text(if left { -2.0 } else { 2.0 }, y, pin.name, 0.5));
+            }
+            p.push(text(0.0, 0.0, "4066", 0.9));
+            label = pos2(0.0, -8.0);
         }
         ComponentKind::Vcvs { .. }
         | ComponentKind::Vccs { .. }

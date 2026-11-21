@@ -2,7 +2,8 @@
 
 use approx::assert_relative_eq;
 use dunbrec_core::{
-    ComponentKind as K, ModelLibrary, NetlistBuilder, Point, Schematic, Waveform, build_netlist,
+    ComponentKind as K, ModelLibrary, NetlistBuilder, Point, Schematic, SwitchForm, Waveform,
+    build_netlist,
 };
 
 use crate::{Circuit, OperatingPoint, SimError, SimWarning, operating_point};
@@ -183,6 +184,71 @@ fn inductor_shorts_and_capacitor_opens_in_dc() {
     assert_eq!(op.current("C1"), Some(0.0));
 }
 
+fn multi(form: SwitchForm, thrown: bool) -> K {
+    K::MultiSwitch {
+        form,
+        thrown,
+        r_on: 1e-3,
+        r_off: 1e9,
+    }
+}
+
+#[test]
+fn changeover_switch_routes_the_common_pin() {
+    // 10 V on the common pin; a load on each throw.
+    for (thrown, live, dead) in [(false, "a", "b"), (true, "b", "a")] {
+        let op = solve(
+            NetlistBuilder::new()
+                .element("V1", v(10.0), &["c", "0"])
+                .element("S1", multi(SwitchForm::Spdt, thrown), &["c", "a", "b"])
+                .element("RA", r(1e3), &["a", "0"])
+                .element("RB", r(1e3), &["b", "0"]),
+        )
+        .unwrap();
+        assert_relative_eq!(volts(&op, live), 10.0, epsilon = 1e-3);
+        assert!(volts(&op, dead) < 1e-3, "{dead} should be off");
+    }
+}
+
+#[test]
+fn double_pole_switches_move_both_poles() {
+    // DPST: both contacts close together.
+    for thrown in [false, true] {
+        let op = solve(
+            NetlistBuilder::new()
+                .element("V1", v(10.0), &["in", "0"])
+                .element(
+                    "S1",
+                    multi(SwitchForm::Dpst, thrown),
+                    &["in", "o1", "in", "o2"],
+                )
+                .element("R1", r(1e3), &["o1", "0"])
+                .element("R2", r(1e3), &["o2", "0"]),
+        )
+        .unwrap();
+        let expect = if thrown { 10.0 } else { 0.0 };
+        assert_relative_eq!(volts(&op, "o1"), expect, epsilon = 1e-3);
+        assert_relative_eq!(volts(&op, "o2"), expect, epsilon = 1e-3);
+    }
+    // DPDT wired as a polarity reverser: pins C1 1A 1B C2 2A 2B, supply on
+    // 1A and 2B, ground on 1B and 2A, the load across the commons.
+    for (thrown, c1, c2) in [(false, 10.0, 0.0), (true, 0.0, 10.0)] {
+        let op = solve(
+            NetlistBuilder::new()
+                .element("V1", v(10.0), &["hi", "0"])
+                .element(
+                    "S1",
+                    multi(SwitchForm::Dpdt, thrown),
+                    &["c1", "hi", "0", "c2", "0", "hi"],
+                )
+                .element("RL", r(1e3), &["c1", "c2"]),
+        )
+        .unwrap();
+        assert_relative_eq!(volts(&op, "c1"), c1, epsilon = 1e-3);
+        assert_relative_eq!(volts(&op, "c2"), c2, epsilon = 1e-3);
+    }
+}
+
 #[test]
 fn potentiometer_and_switch() {
     let op = solve(
@@ -202,6 +268,7 @@ fn potentiometer_and_switch() {
                     closed: true,
                     r_on: 1e-3,
                     r_off: 1e9,
+                    momentary: false,
                 },
                 &["w", "sw"],
             )
@@ -211,6 +278,7 @@ fn potentiometer_and_switch() {
                     closed: false,
                     r_on: 1e-3,
                     r_off: 1e9,
+                    momentary: false,
                 },
                 &["w", "open"],
             )

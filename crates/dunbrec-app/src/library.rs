@@ -11,7 +11,7 @@
 
 use dunbrec_core::{
     ComponentKind, DEFAULT_LOGIC_DELAY, DeviceModel, GateOp, ModelKind, Polarity, Schematic,
-    Waveform,
+    SwitchForm, Waveform,
 };
 
 pub struct PaletteEntry {
@@ -19,6 +19,10 @@ pub struct PaletteEntry {
     pub group: &'static str,
     pub make: fn() -> ComponentKind,
 }
+
+/// Contact resistance of a closed and of an open switch (Ω).
+pub const SWITCH_R_ON: f64 = 0.01;
+pub const SWITCH_R_OFF: f64 = 1e9;
 
 pub const GENERIC_DIODE: &str = "DGEN";
 pub const GENERIC_ZENER: &str = "ZGEN5V1";
@@ -60,11 +64,62 @@ pub fn palette() -> &'static [PaletteEntry] {
         },
         PaletteEntry {
             name: "Switch",
-            group: "Passive",
+            group: "Switches",
             make: || ComponentKind::Switch {
                 closed: false,
-                r_on: 0.01,
-                r_off: 1e9,
+                r_on: SWITCH_R_ON,
+                r_off: SWITCH_R_OFF,
+                momentary: false,
+            },
+        },
+        PaletteEntry {
+            name: "SPDT switch",
+            group: "Switches",
+            make: || ComponentKind::MultiSwitch {
+                form: SwitchForm::Spdt,
+                thrown: false,
+                r_on: SWITCH_R_ON,
+                r_off: SWITCH_R_OFF,
+            },
+        },
+        PaletteEntry {
+            name: "DPST switch",
+            group: "Switches",
+            make: || ComponentKind::MultiSwitch {
+                form: SwitchForm::Dpst,
+                thrown: false,
+                r_on: SWITCH_R_ON,
+                r_off: SWITCH_R_OFF,
+            },
+        },
+        PaletteEntry {
+            name: "DPDT switch",
+            group: "Switches",
+            make: || ComponentKind::MultiSwitch {
+                form: SwitchForm::Dpdt,
+                thrown: false,
+                r_on: SWITCH_R_ON,
+                r_off: SWITCH_R_OFF,
+            },
+        },
+        PaletteEntry {
+            name: "Push button (normally open)",
+            group: "Switches",
+            make: || ComponentKind::Switch {
+                closed: false,
+                r_on: SWITCH_R_ON,
+                r_off: SWITCH_R_OFF,
+                momentary: true,
+            },
+        },
+        PaletteEntry {
+            name: "Push button (normally closed)",
+            group: "Switches",
+            make: || ComponentKind::Switch {
+                closed: true,
+                r_on: SWITCH_R_ON,
+                r_off: SWITCH_R_OFF,
+                momentary: true,
             },
         },
         PaletteEntry {
@@ -185,6 +240,13 @@ pub fn palette() -> &'static [PaletteEntry] {
             },
         },
         PaletteEntry {
+            name: "1N914 diode",
+            group: "Diodes",
+            make: || ComponentKind::Diode {
+                model: "1N914".into(),
+            },
+        },
+        PaletteEntry {
             name: "1N750 4.7 V zener",
             group: "Diodes",
             make: || ComponentKind::Diode {
@@ -193,15 +255,22 @@ pub fn palette() -> &'static [PaletteEntry] {
         },
         PaletteEntry {
             name: "741 op-amp",
-            group: "Integrated circuits",
+            group: "Linear",
             make: || ComponentKind::OpAmp {
                 part: "uA741".into(),
             },
         },
         PaletteEntry {
             name: "555 timer",
-            group: "Integrated circuits",
+            group: "Linear",
             make: || ComponentKind::Timer555,
+        },
+        PaletteEntry {
+            name: "CD4066 analog switch",
+            group: "Linear",
+            make: || ComponentKind::Cd4066 {
+                r_on: dunbrec_core::CD4066_DEFAULT_R_ON,
+            },
         },
         PaletteEntry {
             name: "AND gate",
@@ -450,12 +519,54 @@ mod tests {
     }
 
     #[test]
+    fn chips_are_either_linear_or_digital() {
+        let all = palette_groups("");
+        let group_of = |part: &str| {
+            all.iter()
+                .find(|(_, entries)| entries.iter().any(|e| e.name == part))
+                .map(|(g, _)| *g)
+        };
+        assert_eq!(group_of("741 op-amp"), Some("Linear"));
+        assert_eq!(group_of("555 timer"), Some("Linear"));
+        assert_eq!(group_of("CD4066 analog switch"), Some("Linear"));
+        assert_eq!(group_of("AND gate"), Some("Digital"));
+        assert!(all.iter().all(|(g, _)| *g != "Integrated circuits"));
+    }
+
+    #[test]
+    fn switches_have_their_own_group() {
+        let all = palette_groups("");
+        let switches = &all.iter().find(|(g, _)| *g == "Switches").unwrap().1;
+        let names: Vec<_> = switches.iter().map(|e| e.name).collect();
+        assert_eq!(
+            names,
+            [
+                "Switch",
+                "SPDT switch",
+                "DPST switch",
+                "DPDT switch",
+                "Push button (normally open)",
+                "Push button (normally closed)"
+            ]
+        );
+        // Searching by part type finds them.
+        assert!(
+            super::palette_groups("push")
+                .iter()
+                .any(|(g, _)| *g == "Switches")
+        );
+        // The plain switch is no longer a passive part.
+        let passive = &all.iter().find(|(g, _)| *g == "Passive").unwrap().1;
+        assert!(passive.iter().all(|e| e.name != "Switch"));
+    }
+
+    #[test]
     fn searching_matches_name_group_and_part_type() {
         // By part number.
         assert_eq!(names(&palette_groups("3904")), vec!["2N3904 NPN"]);
         // By group: every diode, generic and real.
         let diodes = names(&palette_groups("diode"));
-        for d in ["Diode", "Zener diode", "1N4148 diode"] {
+        for d in ["Diode", "Zener diode", "1N4148 diode", "1N914 diode"] {
             assert!(diodes.contains(&d), "{diodes:?}");
         }
         // By part type, which the name does not contain.

@@ -22,7 +22,7 @@ Files, adds a Start-menu shortcut and opens `.dbr` files with Dunbrec. Or run fr
 
 ```sh
 cargo run --release -p dunbrec-app                     # empty schematic
-cargo run --release -p dunbrec-app -- --example 2      # an example (1–14, see File → Open example)
+cargo run --release -p dunbrec-app -- --example 2      # an example (1–15, see File → Open example)
 cargo run --release -p dunbrec-app -- my.dbr           # open a file
 cargo run --release -p dunbrec-app -- amp.cir          # import a SPICE netlist
 cargo run --release -p dunbrec-app -- board.kicad_sch  # import a KiCad schematic
@@ -59,7 +59,7 @@ with each node's voltage shown on the schematic.
 the Speed box sets how much simulated time passes per second. Open instruments from the
 toolbar or the Instruments menu, click an input's 🔌 Probe button, then click a wire or pin
 (or a part, for current). Edits while running take effect at once: double-click a switch to
-flip it, drag a potentiometer's wiper, use the function generator, change a value. Changing the
+flip it (hold a push button to press it), drag a potentiometer's wiper, use the function generator, change a value. Changing the
 wiring restarts the run.
 
 | Instrument | What it does |
@@ -81,7 +81,7 @@ through 50 Ω with a 5 ns edge, inputs switch at 3.5 V rising and 1.5 V falling.
 drive a capacitor, an analog signal can clock a counter, and the scope works on any net. Try
 File → Open example → Logic gates or Binary counter (run with Speed at real time).
 
-**Integrated circuits.** The palette's *Integrated circuits* group has two classic chips:
+**Linear integrated circuits.** The palette's *Linear* group has three classic chips:
 
 - **741 op-amp** — the standard Boyle macromodel of the uA741 (as in the PSpice library):
   two input transistors, about 200 000 open-loop gain, 1 MHz gain-bandwidth, 0.5 V/µs slew
@@ -92,8 +92,15 @@ File → Open example → Logic gates or Binary counter (run with Speed at real 
   1/3 VCC and low when THR rises above CTRL, DIS shorts to GND while the output is low, and
   RESET below 0.7 V forces the output low. Astable and monostable circuits time to the usual
   formulas.
+- **CD4066 analog switch** — the CD4066B quad bilateral switch, in package pin order. Each of
+  its four switches passes a signal either way between its two pins while its control pin is
+  above half of VDD, and blocks it below (with a little hysteresis and a delay of tens of
+  nanoseconds); signals must stay between VSS and VDD. The on resistance is a property: the
+  data sheet's typical 470 Ω at 5 V, 180 Ω at 10 V and 125 Ω at 15 V, which it does not
+  follow automatically, so set it to match your supply (default 180 Ω). Changing it while
+  running restarts the simulation. Not exportable to SPICE. Tie unused controls to VSS.
 
-Try File → Open example → Op-amp inverting amplifier, 555 LED blinker or 555 one-shot (run the
+Try File → Open example → Op-amp inverting amplifier, 555 LED blinker, 555 one-shot or CD4066 gated tone (run the
 555 examples at real-time speed). Each chip is a *composite part*: one symbol that simulates as
 a small built-in circuit of ordinary devices, so more op-amps and similar chips can be added as
 data.
@@ -139,7 +146,7 @@ Press **Build**; compile errors are underlined on their lines and listed under t
 circuit runs the last build of exactly the text in the file, so build again after a change.
 
 **Parts library.** Besides generic parts, the palette has real ones: the 2N3904 and 2N3906
-transistors and the 1N4148 and 1N750 (4.7 V zener) diodes, using the published manufacturer
+transistors and the 1N4148, 1N914 and 1N750 (4.7 V zener) diodes, using the published manufacturer
 SPICE models. They sit in the group for what they are (Transistors, Diodes), after the generic
 parts, and are recognisable by part number. Palette groups fold open and shut, and the search
 box finds parts by name, group or type ("3904", "diode", "operational"); Enter picks the first

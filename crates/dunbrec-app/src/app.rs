@@ -52,6 +52,10 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("Esc", "Stop the current tool / clear the selection"),
     ("Space", "Run, pause or resume the simulation"),
     ("Double-click a switch", "Flip it (also while simulating)"),
+    (
+        "Hold a push button",
+        "Press it for as long as the mouse is down",
+    ),
     ("Mouse wheel / middle drag", "Zoom / pan"),
 ];
 
@@ -773,8 +777,31 @@ impl DunbrecApp {
         }
     }
 
+    /// Fill for the toolbar and status bar that says whether a simulation
+    /// is running (green) or paused (amber); `None` when there is none.
+    fn run_tint(&self, ctx: &egui::Context) -> Option<Color32> {
+        let live = self.live.as_ref()?;
+        let dark = ctx.style().visuals.dark_mode;
+        Some(match (live.paused, dark) {
+            (false, true) => Color32::from_rgb(22, 78, 42),
+            (false, false) => Color32::from_rgb(196, 232, 204),
+            (true, true) => Color32::from_rgb(88, 66, 18),
+            (true, false) => Color32::from_rgb(248, 228, 184),
+        })
+    }
+
+    /// A panel frame in the run tint, or the usual one when stopped.
+    fn run_frame(&self, ctx: &egui::Context) -> egui::Frame {
+        let frame = egui::Frame::side_top_panel(&ctx.style());
+        match self.run_tint(ctx) {
+            Some(fill) => frame.fill(fill),
+            None => frame,
+        }
+    }
+
     fn run_toolbar(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::top("run").show(ctx, |ui| {
+        let frame = self.run_frame(ctx);
+        egui::TopBottomPanel::top("run").frame(frame).show(ctx, |ui| {
             ui.horizontal(|ui| {
                 match &self.live {
                     None => {
@@ -804,17 +831,42 @@ impl DunbrecApp {
                     }
                 }
                 if self.live.is_some() {
-                    ui.label(RichText::new(format!("t = {}", format_value(self.live_time, "s"))).monospace());
-                    if self.live_keeping_up < 0.95 {
-                        ui.label(
-                            RichText::new(format!(
-                                "running at {:.0}% of the chosen speed",
-                                self.live_keeping_up * 100.0
-                            ))
-                            .color(Color32::from_rgb(230, 150, 40)),
-                        )
-                        .on_hover_text("The circuit takes longer to simulate than the speed allows. Choose a slower speed or a longer time/div.");
-                    }
+                    // Fixed-width slots: the text changes every frame, and
+                    // a label that grows or shrinks would shove everything
+                    // after it sideways.
+                    let height = ui.spacing().interact_size.y;
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(130.0, height),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            // The slot shrinks to its contents unless told not to.
+                            ui.set_min_size(egui::vec2(130.0, height));
+                            ui.label(
+                                RichText::new(format!("t = {}", format_value(self.live_time, "s")))
+                                    .monospace(),
+                            );
+                        },
+                    );
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(96.0, height),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            ui.set_min_size(egui::vec2(96.0, height));
+                            if self.live_keeping_up < 0.95 {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "⚠ {:.0}% speed",
+                                        self.live_keeping_up * 100.0
+                                    ))
+                                    .color(Color32::from_rgb(230, 150, 40)),
+                                )
+                                .on_hover_text(format!(
+                                    "Running at {:.0}% of the chosen speed: the circuit takes longer to simulate than the speed allows. Choose a slower speed or a longer time/div.",
+                                    self.live_keeping_up * 100.0
+                                ));
+                            }
+                        },
+                    );
                 }
                 ui.separator();
                 let probing = self.canvas.tool == Tool::Probe;
@@ -1280,7 +1332,8 @@ impl DunbrecApp {
     }
 
     fn status_bar(&self, ctx: &egui::Context) {
-        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
+        let frame = self.run_frame(ctx);
+        egui::TopBottomPanel::bottom("status").frame(frame).show(ctx, |ui| {
             ui.horizontal(|ui| {
                 let hint = match &self.canvas.tool {
                     Tool::Select => "Click to select · click a pin to start a wire · drag a wire corner to reshape it · drag to move · drag empty space to box-select · R rotate · X mirror · Del delete",
