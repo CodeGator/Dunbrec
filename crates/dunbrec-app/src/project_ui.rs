@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use egui::{Color32, RichText, Ui};
 
-use crate::project::{Entry, EntryKind, Project, normalize, relative_to, valid_name};
+use crate::project::{Entry, EntryKind, Project, path_eq, relative_to, valid_name};
 
 /// What a new item is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,7 +151,7 @@ pub struct ProjectPanel {
 }
 
 fn same(a: &Path, b: &Path) -> bool {
-    normalize(a) == normalize(b)
+    path_eq(a, b)
 }
 
 /// What a row says: a circuit by its name alone, any other file with its

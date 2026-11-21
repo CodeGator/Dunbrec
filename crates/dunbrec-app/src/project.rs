@@ -113,7 +113,7 @@ pub struct Project {
 
 /// True if `path` is `base` or inside it, by reading the paths.
 fn under(path: &Path, base: &Path) -> bool {
-    normalize(path).starts_with(normalize(base))
+    starts_with_ci(path, base)
 }
 
 impl Project {
@@ -124,8 +124,33 @@ impl Project {
             data,
             entries: Vec::new(),
         };
+        p.tidy();
         p.refresh();
         p
+    }
+
+    /// Write every listed path in its simplest relative form, so one that
+    /// wanders out of the folder and back in (`../../x/Folder/a.txt`) goes
+    /// back to `Folder/a.txt`, and repeats are dropped.
+    fn tidy(&mut self) {
+        let root = self.root.clone();
+        let simple = |listed: &String| relative_to(&root, &root.join(listed));
+        let mut seen = BTreeSet::new();
+        self.data.files = self
+            .data
+            .files
+            .iter()
+            .map(simple)
+            .filter(|f| seen.insert(f.to_lowercase()))
+            .collect();
+        let mut seen = BTreeSet::new();
+        self.data.folders = self
+            .data
+            .folders
+            .iter()
+            .map(simple)
+            .filter(|f| seen.insert(f.to_lowercase()))
+            .collect();
     }
 
     /// Read a project file.
@@ -224,8 +249,7 @@ impl Project {
 
     /// True if the project lists `path`.
     pub fn contains(&self, path: &Path) -> bool {
-        let path = normalize(path);
-        self.files().contains(&path)
+        self.files().iter().any(|f| path_eq(f, path))
     }
 
     /// List the files (those not listed yet). Returns how many were new.
@@ -233,7 +257,12 @@ impl Project {
         let mut added = 0;
         for path in paths {
             let listed = self.listed(path);
-            if !self.data.files.contains(&listed) {
+            if !self
+                .data
+                .files
+                .iter()
+                .any(|f| f.eq_ignore_ascii_case(&listed))
+            {
                 self.data.files.push(listed);
                 added += 1;
             }
@@ -283,7 +312,7 @@ impl Project {
         let root = self.root.clone();
         let remap = |listed: &mut String| {
             let abs = normalize(&root.join(&*listed));
-            if let Ok(rest) = abs.strip_prefix(&from) {
+            if let Some(rest) = strip_prefix_ci(&abs, &from) {
                 let new = if rest.as_os_str().is_empty() {
                     to.clone()
                 } else {
@@ -313,13 +342,17 @@ impl Project {
                 .split('/')
                 .filter(|p| !p.is_empty() && *p != ".")
                 .collect();
-            // A file outside the project's folder has no folders to sit in.
+            // A file outside the project's folder has no folders to sit in: it
+            // is listed by its own name.
             if parts.contains(&"..") || Path::new(file).is_absolute() {
                 let path = self.absolute(file);
+                let name = path
+                    .file_name()
+                    .map_or_else(|| file.clone(), |n| n.to_string_lossy().into_owned());
                 entries.push(Entry {
-                    name: file.clone(),
-                    kind: kind_of(file),
+                    kind: kind_of(&name),
                     missing: !path.exists(),
+                    name,
                     path,
                     children: Vec::new(),
                 });
@@ -417,13 +450,51 @@ pub fn normalize(path: &Path) -> PathBuf {
     out
 }
 
+/// True if two path components name the same thing: ignoring case where the
+/// file system does (Windows, macOS), so `Projects` and `projects` match.
+fn same_component(a: Component, b: Component) -> bool {
+    if cfg!(any(windows, target_os = "macos")) {
+        a.as_os_str().to_string_lossy().to_lowercase()
+            == b.as_os_str().to_string_lossy().to_lowercase()
+    } else {
+        a == b
+    }
+}
+
+/// What is left of `path` below `base`, if `path` is `base` or inside it.
+/// Like `Path::strip_prefix`, but ignoring case where the file system does,
+/// and reading `.` and `..` first.
+pub fn strip_prefix_ci(path: &Path, base: &Path) -> Option<PathBuf> {
+    let (path, base) = (normalize(path), normalize(base));
+    let (p, b): (Vec<_>, Vec<_>) = (path.components().collect(), base.components().collect());
+    if b.len() > p.len() || !p.iter().zip(&b).all(|(x, y)| same_component(*x, *y)) {
+        return None;
+    }
+    Some(p[b.len()..].iter().map(|c| c.as_os_str()).collect())
+}
+
+/// True if `path` is `base` or inside it (see [`strip_prefix_ci`]).
+pub fn starts_with_ci(path: &Path, base: &Path) -> bool {
+    strip_prefix_ci(path, base).is_some()
+}
+
+/// True if the two paths are the same place (see [`strip_prefix_ci`]).
+pub fn path_eq(a: &Path, b: &Path) -> bool {
+    strip_prefix_ci(a, b).is_some_and(|rest| rest.as_os_str().is_empty())
+        && strip_prefix_ci(b, a).is_some()
+}
+
 /// The path of `target` relative to the folder `from`, with `/` separators
 /// (`../main.asm`, `fw/blink.ino`). If the two share no root (another
 /// drive), the full path of `target`.
 pub fn relative_to(from: &Path, target: &Path) -> String {
     let (from, target) = (normalize(from), normalize(target));
     let (a, b): (Vec<_>, Vec<_>) = (from.components().collect(), target.components().collect());
-    let common = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
+    let common = a
+        .iter()
+        .zip(&b)
+        .take_while(|(x, y)| same_component(**x, **y))
+        .count();
     if common == 0 {
         return slashes(&target);
     }
@@ -707,7 +778,7 @@ pub fn rewrite_refs(
     let mut count = 0;
     let mapping = |name: &str| -> Option<String> {
         let old_abs = normalize(&dbr_dir_old.join(name));
-        let rest = old_abs.strip_prefix(&from).ok()?;
+        let rest = strip_prefix_ci(&old_abs, &from)?;
         let new_abs = if rest.as_os_str().is_empty() {
             to.clone()
         } else {
@@ -768,15 +839,15 @@ pub fn rename(
     let (from_n, to_n) = (normalize(from), normalize(to));
     let mut out = Renamed::default();
     for dbr_new in project.schematics() {
-        if open.is_some_and(|o| normalize(o) == normalize(&dbr_new)) {
+        if open.is_some_and(|o| path_eq(o, &dbr_new)) {
             continue;
         }
         // Where this schematic was before the rename (it moves with a
         // renamed folder).
-        let dbr_old = match normalize(&dbr_new).strip_prefix(&to_n) {
-            Ok(rest) if rest.as_os_str().is_empty() => from_n.clone(),
-            Ok(rest) => from_n.join(rest),
-            Err(_) => dbr_new.clone(),
+        let dbr_old = match strip_prefix_ci(&dbr_new, &to_n) {
+            Some(rest) if rest.as_os_str().is_empty() => from_n.clone(),
+            Some(rest) => from_n.join(rest),
+            None => dbr_new.clone(),
         };
         let none = Path::new("");
         let (old_dir, new_dir) = (
@@ -1180,6 +1251,55 @@ loop: rjmp loop
     }
 
     #[test]
+    #[cfg(any(windows, target_os = "macos"))]
+    fn a_path_in_other_letter_case_is_the_same_place() {
+        assert!(path_eq(
+            Path::new("/A/Projects/x"),
+            Path::new("/a/projects/X")
+        ));
+        assert!(starts_with_ci(
+            Path::new("/A/Projects/Test 1/f"),
+            Path::new("/a/projects/test 1")
+        ));
+        assert_eq!(
+            relative_to(
+                Path::new("/a/Projects/Test 1"),
+                Path::new("/a/projects/Test 1/Folder 1/n.txt")
+            ),
+            "Folder 1/n.txt"
+        );
+        assert!(!path_eq(Path::new("/a/b"), Path::new("/a/c")));
+    }
+
+    #[test]
+    fn a_wandering_path_in_the_project_file_is_tidied_into_its_folder() {
+        let root = scratch("tidy");
+        std::fs::create_dir_all(root.join("Folder 1")).unwrap();
+        std::fs::write(root.join("Folder 1").join("n.txt"), "").unwrap();
+        let name = root.file_name().unwrap().to_string_lossy().into_owned();
+        // As if the file had been added by a path that went up and back down.
+        let wander = format!("../{name}/Folder 1/n.txt");
+        let file = root.join("T.dbrproj");
+        std::fs::write(
+            &file,
+            format!("{{\"version\": 1, \"files\": [\"{wander}\", \"Folder 1/n.txt\"]}}"),
+        )
+        .unwrap();
+        let project = Project::open(&file).unwrap();
+        // One entry, in its folder, by its own name.
+        assert_eq!(project.entries.len(), 1);
+        assert_eq!(project.entries[0].name, "Folder 1");
+        let inner: Vec<&str> = project.entries[0]
+            .children
+            .iter()
+            .map(|e| e.name.as_str())
+            .collect();
+        assert_eq!(inner, ["n.txt"]);
+        assert!(!project.entries[0].children[0].missing);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn only_listed_files_show_and_the_tree_follows_their_folders() {
         let root = scratch("tree");
         std::fs::write(root.join("not mine.txt"), "").unwrap();
@@ -1257,7 +1377,13 @@ loop: rjmp loop
         std::fs::write(&outside, "").unwrap();
         project.add_file(&outside).unwrap();
         assert!(project.contains(&outside));
-        assert!(project.entries.iter().any(|e| e.name.starts_with("../")));
+        // ... and shows by its own name, with no path.
+        assert!(
+            project
+                .entries
+                .iter()
+                .any(|e| e.name == "outside-dunbrec.asm")
+        );
         std::fs::remove_file(&outside).unwrap();
         // Delete takes it off the disk too.
         delete(&mut project, &root.join("new.asm")).unwrap();

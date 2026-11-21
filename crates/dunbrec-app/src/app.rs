@@ -667,10 +667,10 @@ impl DunbrecApp {
         if let Some(open) = open {
             let none = std::path::Path::new("");
             let old_dir = open.parent().unwrap_or(none).to_path_buf();
-            let new_open = match project::normalize(&open).strip_prefix(project::normalize(from)) {
-                Ok(rest) if rest.as_os_str().is_empty() => to.to_path_buf(),
-                Ok(rest) => to.join(rest),
-                Err(_) => open.clone(),
+            let new_open = match project::strip_prefix_ci(&open, from) {
+                Some(rest) if rest.as_os_str().is_empty() => to.to_path_buf(),
+                Some(rest) => to.join(rest),
+                None => open.clone(),
             };
             let new_dir = new_open.parent().unwrap_or(none).to_path_buf();
             let mut probe = self.doc.schematic().clone();
@@ -705,7 +705,7 @@ impl DunbrecApp {
                 .sources
                 .keys()
                 .filter(|n| project::is_file_source(n))
-                .filter(|n| project::normalize(&dir.join(n)).starts_with(&gone))
+                .filter(|n| project::starts_with_ci(&dir.join(n), &gone))
                 .cloned()
                 .collect();
             for name in dead {
@@ -715,7 +715,7 @@ impl DunbrecApp {
         if self
             .doc
             .path()
-            .is_some_and(|p| project::normalize(p).starts_with(&gone))
+            .is_some_and(|p| project::starts_with_ci(p, &gone))
         {
             self.message = Some(Message::info(
                 "The open schematic's file is gone",
