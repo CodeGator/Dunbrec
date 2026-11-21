@@ -463,7 +463,7 @@ Right-click to add to the project",
 }
 
 /// Focus a text box and select what is in it, so typing replaces it.
-fn select_all(ui: &Ui, response: &egui::Response, text: &str) {
+pub fn select_all(ui: &Ui, response: &egui::Response, text: &str) {
     response.request_focus();
     if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), response.id) {
         let end = egui::text::CCursor::new(text.chars().count());

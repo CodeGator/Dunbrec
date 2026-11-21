@@ -137,9 +137,9 @@ part for the session; *Clear all breakpoints* removes them all.
 
 **Projects.** A project is a folder that keeps a design's schematics and firmware source files
 together: any number of `.dbr` schematics, and the `.asm` / `.ino` sources they use, as ordinary
-files that other editors, Git and `arduino-cli` see as they are. File → *New project…* opens a
-folder dialog (it has a button to make a new folder); the folder you pick must be empty, and gets a
-first circuit, `Circuit 1`; *Open project…* (and *Open
+files that other editors, Git and `arduino-cli` see as they are. File → *New project…* asks where
+to make it (a folder dialog) and then for the project's name; that becomes a new folder with a
+first circuit, `Circuit 1`, in it; *Open project…* (and *Open
 recent project*) picks an existing folder, and the app reopens the last project at start.
 A project can be taken off the recent list (✕ beside it) or the whole list cleared. The
 **Project** panel (View → Panels; it opens beside the palette) shows the folder as a tree.

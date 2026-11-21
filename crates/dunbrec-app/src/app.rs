@@ -77,6 +77,17 @@ enum Pending {
     Quit,
 }
 
+/// The "New project" dialog: where the project folder is made, and what it
+/// is called.
+struct NewProject {
+    parent: PathBuf,
+    name: String,
+    /// Why the last attempt failed.
+    error: Option<String>,
+    /// Select the name when the dialog first draws.
+    fresh: bool,
+}
+
 /// DC operating point shown on the canvas and in the results panel.
 struct DcResults {
     generation: u64,
@@ -143,6 +154,8 @@ pub struct DunbrecApp {
     // ---- projects ----
     /// The open project folder.
     project: Option<Project>,
+    /// The name being asked for a new project, once its place is chosen.
+    new_project: Option<NewProject>,
     project_panel: ProjectPanel,
     /// Whether the window had the focus last frame: getting it back
     /// rescans the project and picks up edits made in other programs.
@@ -217,6 +230,7 @@ impl DunbrecApp {
             .and_then(|root| Project::open(root).ok());
         let mut app = Self {
             project,
+            new_project: None,
             project_panel: ProjectPanel::default(),
             was_focused: true,
             dock,
@@ -507,22 +521,37 @@ impl DunbrecApp {
         }
     }
 
-    /// Ask for the project's folder (the dialog can make a new one), put a
-    /// first circuit in it, and open them.
+    /// First step of a new project: choose the folder it will be made in.
+    /// (The system folder dialog only picks folders that exist, so the
+    /// project's own name is asked for next, in the app.)
     fn new_project(&mut self) {
-        let Some(dir) = rfd::FileDialog::new()
-            .set_title("New project: choose an empty folder (or make a new one)")
+        let Some(parent) = rfd::FileDialog::new()
+            .set_title("New project: choose the folder to make it in")
             .pick_folder()
         else {
             return;
         };
+        self.new_project = Some(NewProject {
+            name: project::suggest_project_name(&parent),
+            parent,
+            error: None,
+            fresh: true,
+        });
+    }
+
+    /// Second step: make the project folder with a first circuit in it, and
+    /// open them. On failure the reason is kept for the dialog.
+    fn create_project(&mut self, form: &mut NewProject) -> bool {
+        let dir = form.parent.join(form.name.trim());
         match project::create_project(&dir) {
             Ok(first) => {
                 self.open_project(&dir);
                 self.request(Pending::OpenPath(first));
+                true
             }
             Err(e) => {
-                self.message = Some(Message::error("Could not create the project", e));
+                form.error = Some(e);
+                false
             }
         }
     }
@@ -1670,6 +1699,72 @@ impl DunbrecApp {
                 if let (0, Some(at), false) = (choice, at, name.is_empty()) {
                     self.doc.edit(|s| s.add_label(name, at));
                 }
+            }
+        }
+
+        if let Some(mut form) = self.new_project.take() {
+            let mut keep = true;
+            let answer = Dialog {
+                id: "new_project",
+                kind: dialog::Kind::Question,
+                title: "New project",
+                buttons: &["Create", "Cancel"],
+                default: 0,
+                cancel: Some(1),
+            }
+            .show(ctx, |ui| {
+                dialog::paragraph(ui, "Name the project. It is a folder, made in:");
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(form.parent.display().to_string())
+                            .monospace()
+                            .weak(),
+                    );
+                    if ui.small_button("Change…").clicked()
+                        && let Some(parent) = rfd::FileDialog::new()
+                            .set_title("New project: choose the folder to make it in")
+                            .set_directory(&form.parent)
+                            .pick_folder()
+                    {
+                        form.parent = parent;
+                        form.error = None;
+                    }
+                });
+                ui.add_space(8.0);
+                let r = ui.add(
+                    egui::TextEdit::singleline(&mut form.name)
+                        .hint_text("project name")
+                        .desired_width(f32::INFINITY),
+                );
+                if std::mem::take(&mut form.fresh) {
+                    project_ui::select_all(ui, &r, &form.name);
+                }
+                if r.changed() {
+                    form.error = None;
+                }
+                let problem = match (&form.error, project::valid_name(&form.name)) {
+                    (Some(e), _) => Some(e.clone()),
+                    (None, false) if !form.name.trim().is_empty() => Some(format!(
+                        "“{}” cannot be used as a folder name.",
+                        form.name.trim()
+                    )),
+                    _ => None,
+                };
+                if let Some(p) = problem {
+                    ui.add_space(6.0);
+                    ui.label(RichText::new(p).color(Color32::from_rgb(225, 70, 70)));
+                }
+            });
+            match answer {
+                Some(0) if project::valid_name(&form.name) => {
+                    keep = !self.create_project(&mut form);
+                }
+                Some(0) => form.error = Some("Type a name for the project folder.".into()),
+                Some(_) => keep = false,
+                None => {}
+            }
+            if keep {
+                self.new_project = Some(form);
             }
         }
 

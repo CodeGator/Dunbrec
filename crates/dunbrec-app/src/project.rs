@@ -292,6 +292,15 @@ pub fn with_extension(name: &str, ext: &str) -> String {
     }
 }
 
+/// A name for a new project folder in `parent` that nothing there has yet:
+/// `Project 1`, `Project 2`, and so on.
+pub fn suggest_project_name(parent: &Path) -> String {
+    (1..)
+        .map(|n| format!("Project {n}"))
+        .find(|name| !parent.join(name).exists())
+        .expect("a free number")
+}
+
 /// Name of the first circuit of a new project.
 pub const FIRST_CIRCUIT: &str = "Circuit 1";
 
@@ -313,8 +322,8 @@ pub fn create_project(dir: &Path) -> Result<PathBuf, String> {
                 .is_none();
         if !empty {
             return Err(format!(
-                "{} is not empty. Choose an empty folder (the folder dialog has a button to make \
-                 a new one), or use Open project for a folder that already holds a project.",
+                "{} already exists and is not empty. Choose another name, or use Open project \
+                 to open it as a project.",
                 dir.display()
             ));
         }
@@ -746,6 +755,16 @@ mod tests {
         std::fs::create_dir(root.join("Empty")).unwrap();
         assert!(create_project(&root.join("Empty")).is_ok());
         assert!(create_project(&root.join("bad:name")).is_err());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn new_projects_are_suggested_a_free_folder_name() {
+        let root = scratch("suggest");
+        assert_eq!(suggest_project_name(&root), "Project 1");
+        std::fs::create_dir(root.join("Project 1")).unwrap();
+        std::fs::create_dir(root.join("Project 3")).unwrap();
+        assert_eq!(suggest_project_name(&root), "Project 2");
         std::fs::remove_dir_all(&root).unwrap();
     }
 
