@@ -45,7 +45,7 @@ notation (`4k7`, `10u`, `2.2M`). Help → Keyboard shortcuts lists everything.
 
 **Crossing wires.** Wires that cross are *not* connected, and are drawn with a small hop in the
 horizontal wire to show it. To connect two crossing wires, place a **Junction** (palette group
-*Wiring*) on the crossing: it joins every wire through its point, is drawn as a dot, and has no
+*Wiring*, or press J and click) on the crossing: it joins every wire through its point, is drawn as a dot, and has no
 other effect (no designator, nothing in the simulation or the SPICE export). A wire that ends on
 another wire, or a pin on a wire, is connected without one and gets a dot where three or more
 connections meet.

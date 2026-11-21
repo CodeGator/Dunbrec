@@ -48,6 +48,10 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("S", "Select tool"),
     ("W", "Wire tool"),
     ("L", "Net label tool"),
+    (
+        "J",
+        "Junction: click to place, joining wires that cross there",
+    ),
     ("P", "Probe tool"),
     ("Esc", "Stop the current tool / clear the selection"),
     ("Space", "Run, pause or resume the simulation"),
@@ -544,6 +548,9 @@ impl DunbrecApp {
         }
         if plain(Key::P) {
             self.canvas.tool = Tool::Probe;
+        }
+        if plain(Key::J) {
+            self.canvas.tool = junction_tool();
         }
         if plain(Key::Space) {
             self.toggle_run();
@@ -1390,6 +1397,15 @@ fn describe_diagnostic(schematic: &Schematic, d: &Diagnostic) -> String {
     }
 }
 
+/// Placing junctions: what the J key picks.
+fn junction_tool() -> Tool {
+    Tool::Place {
+        kind: dunbrec_core::ComponentKind::Junction,
+        rotation: dunbrec_core::Rotation::R0,
+        mirrored: false,
+    }
+}
+
 /// What placing `entry` looks like to the canvas.
 fn place_tool(entry: &PaletteEntry) -> Tool {
     Tool::Place {
@@ -1723,5 +1739,25 @@ impl eframe::App for DunbrecApp {
         });
 
         self.dialogs(ctx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::library::palette;
+
+    #[test]
+    fn the_j_key_picks_the_same_tool_as_the_palette_junction() {
+        let entry = palette()
+            .iter()
+            .find(|e| matches!((e.make)(), dunbrec_core::ComponentKind::Junction))
+            .expect("a junction in the palette");
+        assert_eq!(junction_tool(), place_tool(entry));
+    }
+
+    #[test]
+    fn the_j_key_is_listed_in_the_shortcuts() {
+        assert!(SHORTCUTS.iter().any(|(key, _)| *key == "J"));
     }
 }
