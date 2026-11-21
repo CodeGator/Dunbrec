@@ -139,7 +139,7 @@ Press **Build**; compile errors are underlined on their lines and listed under t
 circuit runs the last build of exactly the text in the file, so build again after a change.
 
 **Parts library.** Besides generic parts, the palette has real ones: the 2N3904 and 2N3906
-transistors and the 1N4148 and 1N750 (4.7 V zener) diodes, using the published manufacturer
+transistors and the 1N4148, 1N914 and 1N750 (4.7 V zener) diodes, using the published manufacturer
 SPICE models. They sit in the group for what they are (Transistors, Diodes), after the generic
 parts, and are recognisable by part number. Palette groups fold open and shut, and the search
 box finds parts by name, group or type ("3904", "diode", "operational"); Enter picks the first

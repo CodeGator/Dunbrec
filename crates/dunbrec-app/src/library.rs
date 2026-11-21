@@ -240,6 +240,13 @@ pub fn palette() -> &'static [PaletteEntry] {
             },
         },
         PaletteEntry {
+            name: "1N914 diode",
+            group: "Diodes",
+            make: || ComponentKind::Diode {
+                model: "1N914".into(),
+            },
+        },
+        PaletteEntry {
             name: "1N750 4.7 V zener",
             group: "Diodes",
             make: || ComponentKind::Diode {
@@ -537,7 +544,7 @@ mod tests {
         assert_eq!(names(&palette_groups("3904")), vec!["2N3904 NPN"]);
         // By group: every diode, generic and real.
         let diodes = names(&palette_groups("diode"));
-        for d in ["Diode", "Zener diode", "1N4148 diode"] {
+        for d in ["Diode", "Zener diode", "1N4148 diode", "1N914 diode"] {
             assert!(diodes.contains(&d), "{diodes:?}");
         }
         // By part type, which the name does not contain.

@@ -113,6 +113,21 @@ pub fn standard_parts() -> Vec<LibraryPart> {
             ),
         },
         LibraryPart {
+            description: "Small-signal switching diode (100 V, 200 mA); the same die and SPICE model as the 1N4148",
+            model: m(
+                "1N914",
+                ModelKind::Diode,
+                &[
+                    ("IS", 2.52e-9),
+                    ("RS", 0.568),
+                    ("N", 1.752),
+                    ("CJO", 4e-12),
+                    ("M", 0.4),
+                    ("TT", 20e-9),
+                ],
+            ),
+        },
+        LibraryPart {
             description: "4.7 V zener diode (500 mW)",
             model: m(
                 "1N750",
@@ -154,6 +169,7 @@ mod tests {
     fn lookup() {
         assert_eq!(standard_model("2n3904").unwrap().kind, ModelKind::Npn);
         assert_eq!(standard_model("1N750").unwrap().get_or("BV", 0.0), 4.7);
+        assert_eq!(standard_model("1n914").unwrap().kind, ModelKind::Diode);
         assert!(standard_model("BC999").is_none());
     }
 }

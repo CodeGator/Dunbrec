@@ -160,9 +160,19 @@ fn q2n3904_transition_frequency() {
 
 #[test]
 fn d1n4148_meets_datasheet() {
+    switching_diode_meets_datasheet("1N4148");
+}
+
+#[test]
+fn d1n914_meets_datasheet() {
+    switching_diode_meets_datasheet("1N914");
+}
+
+/// VF and leakage limits shared by the 1N914 and 1N4148 datasheets.
+fn switching_diode_meets_datasheet(model: &str) {
     let lib = library();
     let diode = K::Diode {
-        model: "1N4148".into(),
+        model: model.into(),
     };
     // VF ≤ 1 V at IF = 10 mA.
     let fwd = NetlistBuilder::new()
