@@ -797,7 +797,7 @@ checksum = "d8b14ccef22fc6f5a8f4d7d768562a182c04ce9a3b3157b91390b52ddfdf1a76"
 
 [[package]]
 name = "dunbrec-app"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dunbrec-core",
  "dunbrec-instruments",
@@ -817,7 +817,7 @@ dependencies = [
 
 [[package]]
 name = "dunbrec-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "approx",
  "serde",
@@ -826,14 +826,14 @@ dependencies = [
 
 [[package]]
 name = "dunbrec-instruments"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "approx",
 ]
 
 [[package]]
 name = "dunbrec-io"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dunbrec-core",
  "dunbrec-sim",
@@ -844,11 +844,11 @@ dependencies = [
 
 [[package]]
 name = "dunbrec-mcu"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "dunbrec-sim"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "approx",
  "dunbrec-core",

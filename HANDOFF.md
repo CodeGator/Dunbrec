@@ -9,7 +9,8 @@ State of the project for whoever picks it up next. User-facing documentation is 
 
 All eleven planned phases are done and committed on `main` (one commit per phase, "Phase N: …"),
 plus Phase 12 (integrated circuits) and a fix for probes failing after opening a document.
-Version is `0.1.0`; nothing has been released or pushed by this work.
+Version 0.1.0 was released on 2026-11-21 (tag `v0.1.0`, merged to `main`). Work branches are
+named after the application version and merged into `main`; this one is `0.2.0`.
 
 | Phase | Content |
 |---|---|
@@ -103,7 +104,7 @@ Key mechanisms worth knowing before changing the engine:
 - GUI egui/eframe; own Rust simulation engine. ngspice is a dev-time reference only and is
   never shipped.
 - Publisher CodeGator; **GPL-3.0-only** licence (changed from MIT on 2026-11-21; earlier commits
-  were published under MIT); version stays 0.1.0 for now.
+  were published under MIT).
 - Microcontrollers:
   - Own AVR emulator; simavr was rejected because it is GPL (that reason lapsed when the
     project became GPL-3.0; the in-house emulator stays).
