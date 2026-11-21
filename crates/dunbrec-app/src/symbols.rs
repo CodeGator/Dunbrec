@@ -390,6 +390,25 @@ pub fn symbol_styled(kind: &ComponentKind, zener: bool) -> Symbol {
             }
             label = pos2(0.0, 1.6);
         }
+        ComponentKind::Mcu { .. } => {
+            p.push(rect(-4.0, -10.0, 4.0, 10.0));
+            // Pin-1 notch.
+            p.push(Prim::Line(arc(
+                (0.0, -10.0),
+                0.6,
+                0.0,
+                std::f32::consts::PI,
+            )));
+            for pin in kind.pins() {
+                let (x, y) = (pin.offset.x as f32, pin.offset.y as f32);
+                let (edge, tx) = if x < 0.0 { (-4.0, -3.0) } else { (4.0, 3.0) };
+                p.push(line(&[(x, y), (edge, y)]));
+                p.push(text(tx, y, pin.name, 0.6));
+            }
+            p.push(text(0.0, -0.5, "ATmega", 0.6));
+            p.push(text(0.0, 0.5, "328P", 0.6));
+            label = pos2(0.0, -10.9);
+        }
         ComponentKind::Vcvs { .. }
         | ComponentKind::Vccs { .. }
         | ComponentKind::Ccvs { .. }

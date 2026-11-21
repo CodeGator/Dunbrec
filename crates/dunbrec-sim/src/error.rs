@@ -35,6 +35,9 @@ pub enum SimError {
     #[error("invalid analysis settings: {0}")]
     InvalidOptions(String),
 
+    #[error("{designator}: {message}")]
+    Firmware { designator: String, message: String },
+
     #[error(
         "the time step became too small at t = {time} s; the circuit may be changing too abruptly"
     )]

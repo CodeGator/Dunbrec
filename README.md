@@ -4,8 +4,9 @@ A desktop electronics workbench written in Rust: draw or import a schematic, sim
 watch any node live with virtual instruments — oscilloscope, multimeter, function generator,
 Bode plotter and curve tracer.
 
-Circuits can mix analog parts (discrete components, sources, diodes, transistors) with digital
-logic (gates, flip-flops, counters, clocks) in one simulation; microcontrollers come next.
+Circuits can mix analog parts (discrete components, sources, diodes, transistors), digital
+logic (gates, flip-flops, counters, clocks) and microcontrollers running real firmware (an
+ATmega328P, as on the Arduino Uno) in one simulation.
 
 ## Installing
 
@@ -20,7 +21,7 @@ Files, adds a Start-menu shortcut and opens `.dbr` files with Dunbrec. Or run fr
 
 ```sh
 cargo run --release -p dunbrec-app                     # empty schematic
-cargo run --release -p dunbrec-app -- --example 2      # an example (1–6, see File → Open example)
+cargo run --release -p dunbrec-app -- --example 2      # an example (1–11, see File → Open example)
 cargo run --release -p dunbrec-app -- my.dbr           # open a file
 cargo run --release -p dunbrec-app -- amp.cir          # import a SPICE netlist
 cargo run --release -p dunbrec-app -- board.kicad_sch  # import a KiCad schematic
@@ -55,6 +56,7 @@ wiring restarts the run.
 | DC transfer | Sweeps a source and plots a node's voltage |
 | Curve tracer | Characteristic curves of a diode, BJT or MOSFET in the schematic |
 | Logic analyser | 8 channels of logic levels over time, with frequency read-outs |
+| Serial monitor | Text a microcontroller prints on its serial port (`Serial.print`) |
 
 **Digital logic.** The palette's *Digital* group has AND, OR, NAND, NOR, XOR and XNOR gates,
 an inverter, a D flip-flop, a 4-bit counter, a clock, a logic switch (double-click to flip) and
@@ -63,6 +65,18 @@ part, and meets the analog circuit at its pins like real 5 V CMOS: outputs drive
 through 50 Ω with a 5 ns edge, inputs switch at 3.5 V rising and 1.5 V falling. So a gate can
 drive a capacitor, an analog signal can clock a counter, and the scope works on any net. Try
 File → Open example → Logic gates or Binary counter (run with Speed at real time).
+
+**Microcontrollers.** The palette's *Microcontrollers* group has an ATmega328P with the Arduino
+pin names (D0–D13, A0–A5) and an implicit 5 V supply. It runs real compiled firmware cycle by
+cycle: digital I/O with pull-ups, pin-change and external interrupts, timers 0/1/2 (so
+`millis()`, `delay()` and `analogWrite` PWM work), the ADC (`analogRead`) and serial transmit.
+In the Arduino IDE use *Sketch → Export Compiled Binary* and pick the `.hex` file (not the
+`with_bootloader` one) in the part's properties; relative paths are relative to the schematic,
+and the file is reloaded each time the simulation starts, so rebuild and press Run again. Pins
+meet the circuit like the real chip: outputs drive through about 25 Ω, pull-ups are 35 kΩ,
+inputs switch at 3.0 V rising and 1.5 V falling, and the ADC samples the net's voltage. Built-in
+demo programs (`blink`, `fade`, `pot-pwm-serial`) need no toolchain; try File → Open example →
+Arduino blink, Arduino PWM fade, or Arduino pot, PWM and serial.
 
 **Parts library.** Besides generic parts, the palette's *Real parts* group has the 2N3904 and
 2N3906 transistors and the 1N4148 and 1N750 (4.7 V zener) diodes, using the published
@@ -83,6 +97,7 @@ imported is listed. File → Export SPICE netlist writes a netlist ngspice can r
 | `dunbrec-core` | Schematic data model, units, device models, parts library, netlister |
 | `dunbrec-io` | `.dbr` format, SPICE import/export, KiCad import, automatic layout |
 | `dunbrec-sim` | Simulation engine: MNA, Newton-Raphson, DC/sweep/AC/transient, device models |
+| `dunbrec-mcu` | ATmega328P emulator (AVR core and peripherals), Intel HEX, a small assembler |
 | `dunbrec-instruments` | Oscilloscope and multimeter signal processing |
 | `dunbrec-app` | egui/eframe desktop application |
 
@@ -98,10 +113,12 @@ imported is listed. File → Export SPICE netlist writes a netlist ngspice can r
 8. DC sweep, AC analysis, Bode plotter, curve tracer, function generator ✅
 9. Polish: parts library, examples, copy/paste, settings, icon, installer ✅
 10. Digital logic: gates, flip-flops, counters, clocks, logic analyser ✅
-11. Microcontrollers (post-v1)
+11. Microcontrollers: ATmega328P emulation, `.hex` firmware, GPIO/timers/PWM/ADC/serial ✅
 
 Known limits: fixed temperature (27 °C); MOSFETs are level 1 only; one logic family (5 V
-CMOS-style); logic parts are not exported to SPICE; KiCad hierarchical sheets, SPICE `.param`
+CMOS-style); logic parts and microcontrollers are not exported to SPICE; the ATmega328P has no
+SPI, I²C, EEPROM, watchdog, serial receive or sleep-mode power differences yet, and only the
+ATmega328P is available; KiCad hierarchical sheets, SPICE `.param`
 expressions and EXP/SFFM sources are not supported yet.
 
 ## Development

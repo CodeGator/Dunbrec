@@ -131,15 +131,15 @@ pub fn gate(op: GateOp, a: Logic, b: Logic) -> Logic {
 
 /// A linear ramp from `from` (at `t0`) to `to` (at `t0 + edge`).
 #[derive(Debug, Clone, Copy, PartialEq)]
-struct Ramp {
-    t0: f64,
-    from: f64,
-    to: f64,
-    edge: f64,
+pub(crate) struct Ramp {
+    pub t0: f64,
+    pub from: f64,
+    pub to: f64,
+    pub edge: f64,
 }
 
 impl Ramp {
-    fn at(&self, t: f64) -> f64 {
+    pub(crate) fn at(&self, t: f64) -> f64 {
         if t <= self.t0 {
             self.from
         } else if t >= self.t0 + self.edge {

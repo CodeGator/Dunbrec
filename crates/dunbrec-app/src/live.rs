@@ -6,12 +6,13 @@
 //! sends batches of samples back about 60 times a second and accepts
 //! commands: pause, resume, speed, resolution, and live parameter edits.
 
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use dunbrec_core::{Element, ModelLibrary, Netlist};
-use dunbrec_sim::{Circuit, Sample, Transient, TransientOptions};
+use dunbrec_sim::{Circuit, Sample, SerialByte, Transient, TransientOptions};
 
 pub enum Command {
     Pause,
@@ -25,6 +26,8 @@ pub enum Command {
 
 pub enum Event {
     Samples(Vec<Sample>),
+    /// Bytes sent on microcontroller serial ports.
+    Serial(Vec<SerialByte>),
     /// Progress: simulated time, and how fast it is running relative to the
     /// requested speed (1.0 = keeping up).
     Status {
@@ -54,14 +57,19 @@ pub struct LiveSim {
 
 impl LiveSim {
     /// Build the circuit and initial operating point here (so errors are
-    /// reported at once), then start the worker.
+    /// reported at once), then start the worker. Relative microcontroller
+    /// firmware paths are resolved against `firmware_dir`.
     pub fn start(
         netlist: Netlist,
         models: ModelLibrary,
         max_step: f64,
         speed: f64,
+        firmware_dir: Option<PathBuf>,
     ) -> Result<Self, String> {
-        let circuit = Circuit::from_netlist(&netlist, &models).map_err(|e| e.to_string())?;
+        let mut circuit = Circuit::from_netlist(&netlist, &models).map_err(|e| e.to_string())?;
+        if let Some(dir) = firmware_dir {
+            circuit.set_firmware_dir(dir);
+        }
         let sim = Transient::new(circuit, TransientOptions::free_running(max_step))
             .map_err(|e| e.to_string())?;
         let (command_tx, command_rx) = mpsc::channel();
@@ -112,6 +120,7 @@ fn run(mut sim: Transient, mut speed: f64, commands: Receiver<Command>, events: 
     let mut wall_start = Instant::now();
     let mut sim_start = sim.time();
     let mut batch: Vec<Sample> = vec![sim.sample()];
+    let mut serial: Vec<SerialByte> = Vec::new();
     let mut last_flush = Instant::now();
     let mut keeping_up = 1.0;
 
@@ -170,12 +179,15 @@ fn run(mut sim: Transient, mut speed: f64, commands: Receiver<Command>, events: 
                     Ok(Some(step)) => batch.push(step.sample),
                     Ok(None) => break,
                     Err(e) => {
+                        serial.extend(sim.take_serial());
                         let _ = events.send(Event::Samples(std::mem::take(&mut batch)));
+                        let _ = events.send(Event::Serial(std::mem::take(&mut serial)));
                         let _ = events.send(Event::Error(e.to_string()));
                         return;
                     }
                 }
             }
+            serial.extend(sim.take_serial());
             // If the circuit is too heavy to keep up, slow down gracefully
             // instead of building an ever-growing backlog.
             let lag = target - sim.time();
@@ -200,6 +212,13 @@ fn run(mut sim: Transient, mut speed: f64, commands: Receiver<Command>, events: 
             if !batch.is_empty()
                 && events
                     .send(Event::Samples(std::mem::take(&mut batch)))
+                    .is_err()
+            {
+                return;
+            }
+            if !serial.is_empty()
+                && events
+                    .send(Event::Serial(std::mem::take(&mut serial)))
                     .is_err()
             {
                 return;
@@ -265,7 +284,8 @@ mod tests {
     fn runs_paced_and_accepts_live_edits() {
         // 0.1 s of simulated time per real second.
         let netlist = rc();
-        let mut live = LiveSim::start(netlist.clone(), ModelLibrary::new(), 1e-5, 0.1).unwrap();
+        let mut live =
+            LiveSim::start(netlist.clone(), ModelLibrary::new(), 1e-5, 0.1, None).unwrap();
         let samples = wait_for(&live, 5e-3);
         assert!(samples.windows(2).all(|w| w[1].time > w[0].time));
         let out = netlist.node_by_name("out").unwrap().0;
@@ -288,7 +308,7 @@ mod tests {
 
     #[test]
     fn pause_stops_time_and_errors_are_reported_up_front() {
-        let mut live = LiveSim::start(rc(), ModelLibrary::new(), 1e-5, 0.1).unwrap();
+        let mut live = LiveSim::start(rc(), ModelLibrary::new(), 1e-5, 0.1, None).unwrap();
         wait_for(&live, 1e-3);
         live.send(Command::Pause);
         thread::sleep(Duration::from_millis(50));
@@ -314,6 +334,47 @@ mod tests {
         let bad = NetlistBuilder::new()
             .element("R1", K::Resistor { resistance: 0.0 }, &["a", "0"])
             .build();
-        assert!(LiveSim::start(bad, ModelLibrary::new(), 1e-5, 1.0).is_err());
+        assert!(LiveSim::start(bad, ModelLibrary::new(), 1e-5, 1.0, None).is_err());
+    }
+
+    #[test]
+    fn microcontroller_serial_output_arrives() {
+        let pins: Vec<&str> = dunbrec_mcu::ARDUINO_NAMES.to_vec();
+        let netlist = NetlistBuilder::new()
+            .element(
+                "V1",
+                K::VoltageSource {
+                    waveform: Waveform::Dc(2.5),
+                },
+                &["A0", "0"],
+            )
+            .element(
+                "U1",
+                K::Mcu {
+                    firmware: "builtin:pot-pwm-serial".into(),
+                    clock: 16e6,
+                },
+                &pins,
+            )
+            .build();
+        let live = LiveSim::start(netlist, ModelLibrary::new(), 1e-4, 1.0, None).unwrap();
+        let mut text = String::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        // Wait for the banner and one complete reading line.
+        while Instant::now() < deadline && text.matches('\n').count() < 2 {
+            for e in live.poll() {
+                match e {
+                    Event::Serial(bytes) => {
+                        assert!(bytes.iter().all(|b| b.element == 1));
+                        text.extend(bytes.iter().map(|b| b.byte as char));
+                    }
+                    Event::Error(e) => panic!("{e}"),
+                    _ => {}
+                }
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(text.starts_with("Dunbrec AVR demo"), "{text:?}");
+        assert!(text.contains("A0 = 05"), "{text:?}");
     }
 }

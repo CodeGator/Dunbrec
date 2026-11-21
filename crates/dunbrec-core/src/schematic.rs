@@ -96,6 +96,9 @@ pub enum PinDomain {
     DigitalIn,
     /// A logic output: drives its net to the logic level.
     DigitalOut,
+    /// A microcontroller I/O pin: output, input or input with pull-up,
+    /// as the firmware decides.
+    DigitalIo,
 }
 
 /// Static description of one pin of a component kind.
@@ -157,6 +160,39 @@ const COUNTER4: &[PinDef] = &[
     dout("Q3", 3, 3),
 ];
 const LOGIC_SOURCE: &[PinDef] = &[dout("Y", 3, 0)];
+
+const fn dio(name: &'static str, x: i32, y: i32) -> PinDef {
+    PinDef {
+        name,
+        offset: Point::new(x, y),
+        domain: PinDomain::DigitalIo,
+    }
+}
+
+/// ATmega328P I/O pins in Arduino order: D0–D9 down the left side,
+/// D10–D13 and A0–A5 down the right.
+const MCU: &[PinDef] = &[
+    dio("D0", -6, -9),
+    dio("D1", -6, -7),
+    dio("D2", -6, -5),
+    dio("D3", -6, -3),
+    dio("D4", -6, -1),
+    dio("D5", -6, 1),
+    dio("D6", -6, 3),
+    dio("D7", -6, 5),
+    dio("D8", -6, 7),
+    dio("D9", -6, 9),
+    dio("D10", 6, -9),
+    dio("D11", 6, -7),
+    dio("D12", 6, -5),
+    dio("D13", 6, -3),
+    dio("A0", 6, -1),
+    dio("A1", 6, 1),
+    dio("A2", 6, 3),
+    dio("A3", 6, 5),
+    dio("A4", 6, 7),
+    dio("A5", 6, 9),
+];
 const LOGIC_LED: &[PinDef] = &[din("A", -3, 0)];
 
 const CONTROLLED: &[PinDef] = &[
@@ -424,6 +460,24 @@ pub enum ComponentKind {
     },
     /// Lights up when its input is high.
     LogicLed,
+
+    // ---- Microcontrollers ----
+    /// ATmega328P (Arduino Uno/Nano) running firmware from `firmware`: the
+    /// path of an Intel HEX file (relative to the schematic's folder, or
+    /// absolute) or `builtin:<name>`. Powered at 5 V implicitly.
+    Mcu {
+        firmware: String,
+        /// Clock frequency (Hz); must match what the firmware was built for.
+        #[serde(default = "default_mcu_clock")]
+        clock: f64,
+    },
+}
+
+/// Clock of an Arduino Uno (Hz).
+pub const DEFAULT_MCU_CLOCK: f64 = 16e6;
+
+fn default_mcu_clock() -> f64 {
+    DEFAULT_MCU_CLOCK
 }
 
 impl ComponentKind {
@@ -450,6 +504,7 @@ impl ComponentKind {
             ComponentKind::Counter4 { .. } => COUNTER4,
             ComponentKind::Clock { .. } | ComponentKind::LogicSwitch { .. } => LOGIC_SOURCE,
             ComponentKind::LogicLed => LOGIC_LED,
+            ComponentKind::Mcu { .. } => MCU,
         }
     }
 
@@ -474,15 +529,16 @@ impl ComponentKind {
             ComponentKind::Gate { .. }
             | ComponentKind::Inverter { .. }
             | ComponentKind::DFlipFlop { .. }
-            | ComponentKind::Counter4 { .. } => "U",
+            | ComponentKind::Counter4 { .. }
+            | ComponentKind::Mcu { .. } => "U",
             ComponentKind::Clock { .. } => "CLK",
             ComponentKind::LogicSwitch { .. } => "SW",
             ComponentKind::LogicLed => "LED",
         }
     }
 
-    /// True for logic parts, which are simulated by the event-driven
-    /// digital engine and meet the analog circuit at their pins.
+    /// True for logic parts and microcontrollers, which are simulated by
+    /// event-driven engines and meet the analog circuit at their pins.
     pub fn is_digital(&self) -> bool {
         matches!(
             self,
@@ -493,6 +549,7 @@ impl ComponentKind {
                 | ComponentKind::Clock { .. }
                 | ComponentKind::LogicSwitch { .. }
                 | ComponentKind::LogicLed
+                | ComponentKind::Mcu { .. }
         )
     }
 

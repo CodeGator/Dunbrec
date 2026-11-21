@@ -14,6 +14,7 @@ path = "src/main.rs"
 dunbrec-core.workspace = true
 dunbrec-io.workspace = true
 dunbrec-sim.workspace = true
+dunbrec-mcu.workspace = true
 dunbrec-instruments.workspace = true
 eframe = { version = "0.33", features = ["persistence"] }
 egui = "0.33"

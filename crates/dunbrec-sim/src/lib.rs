@@ -30,6 +30,7 @@ pub mod device;
 pub mod digital;
 pub mod error;
 pub mod linalg;
+pub mod mcu;
 mod newton;
 pub mod semiconductor;
 pub mod stamp;
@@ -41,6 +42,7 @@ pub use ac::{AcResult, ac_analysis, log_frequencies};
 pub use circuit::Circuit;
 pub use dc::{OperatingPoint, operating_point};
 pub use error::{SimError, SimWarning};
+pub use mcu::SerialByte;
 pub use sweep::{DcSweeper, dc_sweep, linear_steps};
 pub use transient::{
     Crossing, Edge, Sample, StepResult, Transient, TransientOptions, TransientResult, Watch,
@@ -51,6 +53,8 @@ pub use transient::{
 mod ac_tests;
 #[cfg(test)]
 mod digital_tests;
+#[cfg(test)]
+mod mcu_tests;
 #[cfg(test)]
 mod nonlinear_tests;
 #[cfg(test)]

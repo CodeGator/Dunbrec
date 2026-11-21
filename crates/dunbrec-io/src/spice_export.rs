@@ -23,7 +23,10 @@ const POT_MIN_SEGMENT: f64 = 1e-3;
 pub enum ExportError {
     #[error("the schematic has problems that must be fixed before exporting: {0:?}")]
     Netlist(Vec<String>),
-    #[error("logic parts cannot be written as a plain SPICE netlist: {}", .0.join(", "))]
+    #[error(
+        "logic parts and microcontrollers cannot be written as a plain SPICE netlist: {}",
+        .0.join(", ")
+    )]
     Digital(Vec<String>),
 }
 
@@ -168,7 +171,8 @@ fn write_netlist(
             | K::Counter4 { .. }
             | K::Clock { .. }
             | K::LogicSwitch { .. }
-            | K::LogicLed => continue,
+            | K::LogicLed
+            | K::Mcu { .. } => continue,
             K::Resistor { resistance } => {
                 format!(
                     "{} {} {} {}",

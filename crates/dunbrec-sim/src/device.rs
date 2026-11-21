@@ -137,6 +137,10 @@ pub trait Device: Send + std::fmt::Debug {
     /// digital output drivers respond.
     fn drive(&self, _time: f64, _level: f64) {}
 
+    /// Set what a microcontroller pin does, from `time` (`f64::INFINITY`
+    /// means at once). Only microcontroller pins respond.
+    fn drive_pin(&self, _time: f64, _drive: dunbrec_mcu::PinDrive) {}
+
     /// Write this device's equations for the given analysis.
     fn stamp(&self, s: &mut Stamper, ctx: &StampContext);
 

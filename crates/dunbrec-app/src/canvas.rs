@@ -225,10 +225,11 @@ pub fn node_tag_positions(s: &Schematic, netlist: &Netlist) -> Vec<TagPlace> {
             },
         ));
     }
+    let unused = netlist.unused_io_nets();
     let mut out: Vec<TagPlace> = best
         .into_values()
         .map(|(_, place)| place)
-        .filter(|place| !place.node.is_ground())
+        .filter(|place| !place.node.is_ground() && !unused.contains(&place.node))
         .collect();
     out.sort_by_key(|place| place.node);
     out
@@ -633,7 +634,20 @@ pub fn value_text(kind: &ComponentKind) -> String {
         | ComponentKind::LogicLed => String::new(),
         ComponentKind::Clock { frequency, .. } => format_value(*frequency, "Hz"),
         ComponentKind::LogicSwitch { high } => (if *high { "high" } else { "low" }).into(),
+        ComponentKind::Mcu { firmware, .. } => firmware_label(firmware),
     }
+}
+
+/// Short name of a firmware reference: the built-in program or file name.
+pub fn firmware_label(firmware: &str) -> String {
+    let firmware = firmware.trim();
+    if let Some(name) = firmware.strip_prefix(dunbrec_mcu::firmware::BUILTIN_PREFIX) {
+        return name.to_string();
+    }
+    std::path::Path::new(firmware)
+        .file_name()
+        .map(|f| f.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "no firmware".into())
 }
 
 // ----------------------------------------------------------- drawing ---

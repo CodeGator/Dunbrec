@@ -27,6 +27,7 @@ use crate::dc::OperatingPoint;
 use crate::device::{Integration, StampContext, Tolerances};
 use crate::digital::{CMOS_5V, DigitalSystem, Logic, settle_dc};
 use crate::error::SimError;
+use crate::mcu::{MCU_VIH, MCU_VIL, McuSystem, SerialByte};
 use crate::newton::{TRANSIENT_MAX_ITERATIONS, Workspace, dc_solve, newton};
 use crate::stamp::{SolutionView, node_rows};
 
@@ -121,6 +122,21 @@ pub struct StepResult {
     pub crossings: Vec<Crossing>,
 }
 
+/// What a threshold watch feeds.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum WatchTarget {
+    /// Added by the caller: crossings are reported.
+    Caller,
+    /// A logic input: (part, input, level it signals).
+    Logic(usize, usize, Logic),
+    /// A microcontroller pin: (part, pin, level it signals).
+    Mcu(usize, usize, bool),
+}
+
+/// Limits on how far ahead a microcontroller may run before syncing with
+/// the circuit when nothing happens (s).
+const MCU_HORIZON: (f64, f64) = (1e-5, 1e-3);
+
 pub struct Transient {
     circuit: Circuit,
     options: TransientOptions,
@@ -145,9 +161,10 @@ pub struct Transient {
     span: f64,
     /// The circuit's logic, if it has any.
     digital: Option<DigitalSystem>,
-    /// For each watch: the digital input it feeds (part, input, level it
-    /// signals), or `None` for a watch added by the caller.
-    watch_targets: Vec<Option<(usize, usize, Logic)>>,
+    /// The circuit's microcontrollers, if it has any.
+    mcu: Option<McuSystem>,
+    /// What each watch feeds.
+    watch_targets: Vec<WatchTarget>,
 }
 
 impl Transient {
@@ -217,13 +234,40 @@ impl Transient {
                         level,
                         edge,
                     });
-                    watch_targets.push(Some((part, input, value)));
+                    watch_targets.push(WatchTarget::Logic(part, input, value));
                 }
             }
             sys.start(0.0);
         }
 
-        Ok(Self {
+        // Microcontroller pins watch their nets the same way.
+        let mut mcu = if circuit.mcus.is_empty() {
+            None
+        } else {
+            Some(McuSystem::new(
+                &circuit.mcus,
+                circuit.firmware_dir.as_deref(),
+            )?)
+        };
+        if let Some(m) = &mut mcu {
+            m.sync_inputs(|n| sol.voltage(n));
+            for (part, pin, node) in m.inputs() {
+                for (level, edge, high) in [
+                    (MCU_VIH, Edge::Rising, true),
+                    (MCU_VIL, Edge::Falling, false),
+                ] {
+                    watches.push(Watch {
+                        p: node,
+                        n: NodeId::GROUND,
+                        level,
+                        edge,
+                    });
+                    watch_targets.push(WatchTarget::Mcu(part, pin, high));
+                }
+            }
+        }
+
+        let mut sim = Self {
             circuit,
             initial,
             time: 0.0,
@@ -239,9 +283,12 @@ impl Transient {
             finished: false,
             span,
             digital,
+            mcu,
             watch_targets,
             options,
-        })
+        };
+        sim.run_mcu();
+        Ok(sim)
     }
 
     fn max_step_for(circuit: &Circuit, options: &TransientOptions) -> f64 {
@@ -282,6 +329,13 @@ impl Transient {
         element: &dunbrec_core::Element,
         models: &dunbrec_core::ModelLibrary,
     ) -> Result<bool, SimError> {
+        // A microcontroller cannot be changed while running (new firmware
+        // or clock): restart. Unchanged parameters need nothing.
+        if let Some(m) = &self.mcu
+            && let Some(part) = m.part_of_element(index)
+        {
+            return Ok(m.spec(part).kind == element.kind);
+        }
         if !self.circuit.replace_device(index, element, models)? {
             return Ok(false);
         }
@@ -321,21 +375,58 @@ impl Transient {
 
     pub fn add_watch(&mut self, watch: Watch) -> WatchId {
         self.watches.push(watch);
-        self.watch_targets.push(None);
+        self.watch_targets.push(WatchTarget::Caller);
         WatchId(self.watches.len() - 1)
     }
 
     /// Fire due digital events and update the output drivers.
+    /// Fire due logic events and microcontroller stops, updating the
+    /// devices they drive.
     fn run_digital(&mut self) {
-        let Some(sys) = &mut self.digital else { return };
-        let changes = sys.advance(self.time);
-        let family = sys.family;
-        for (driver, level) in &changes {
-            self.circuit.devices[*driver].drive(self.time, level.voltage(&family));
+        if let Some(sys) = &mut self.digital {
+            let changes = sys.advance(self.time);
+            let family = sys.family;
+            for (driver, level) in &changes {
+                self.circuit.devices[*driver].drive(self.time, level.voltage(&family));
+            }
+            if !changes.is_empty() {
+                // An output starts to ramp: a kink, like a breakpoint.
+                self.restart = true;
+            }
+        }
+        self.run_mcu();
+    }
+
+    /// Commit microcontroller runs that have reached the present time,
+    /// update their pins, and let them run ahead to their next events.
+    fn run_mcu(&mut self) {
+        let Some(m) = &mut self.mcu else { return };
+        let x = &self.x;
+        let rows = node_rows(self.circuit.node_count());
+        let voltage = |n: NodeId| SolutionView { x, node_rows: rows }.voltage(n);
+        let changes = m.commit_due(self.time, &voltage);
+        for &(device, drive) in &changes {
+            self.circuit.devices[device].drive_pin(self.time, drive);
         }
         if !changes.is_empty() {
-            // An output starts to ramp: a kink, like a breakpoint.
             self.restart = true;
+        }
+        let span = self.h_max.clamp(MCU_HORIZON.0, MCU_HORIZON.1);
+        m.run_ahead(self.time + span);
+    }
+
+    /// Bytes sent on microcontroller serial ports since the last call.
+    pub fn take_serial(&mut self) -> Vec<SerialByte> {
+        self.mcu
+            .as_mut()
+            .map(|m| m.take_serial())
+            .unwrap_or_default()
+    }
+
+    fn mcu_fault(&self) -> Result<(), SimError> {
+        match self.mcu.as_ref().and_then(|m| m.fault()) {
+            Some(e) => Err(e),
+            None => Ok(()),
         }
     }
 
@@ -363,18 +454,26 @@ impl Transient {
         }
     }
 
-    fn next_breakpoint(&self) -> f64 {
+    /// The next time a step must land on, and whether the circuit changes
+    /// abruptly there (a breakpoint) or it is only a sync point for a
+    /// microcontroller.
+    fn next_breakpoint(&self) -> (f64, bool) {
         let digital = self
             .digital
             .as_ref()
             .and_then(|s| s.next_event_time())
             .filter(|&t| t > self.time);
-        self.circuit
+        let t = self
+            .circuit
             .devices
             .iter()
             .filter_map(|d| d.next_breakpoint(self.time))
             .chain(digital)
-            .fold(self.options.stop_time, f64::min)
+            .fold(self.options.stop_time, f64::min);
+        match self.mcu.as_ref().and_then(|m| m.next_event()) {
+            Some((tm, kink)) if tm.max(self.time) < t => (tm.max(self.time), kink),
+            _ => (t, true),
+        }
     }
 
     /// Advance to the next accepted time point. Returns `None` once the stop
@@ -383,14 +482,15 @@ impl Transient {
         if self.finished {
             return Ok(None);
         }
-        let target = self.next_breakpoint();
+        let (target, kink) = self.next_breakpoint();
         if target - self.time <= self.h_min * 10.0 {
             // The target is within rounding of now (e.g. a clock edge that
             // accumulated rounding over many periods): treat it as reached.
-            self.time = target;
-            self.restart = true;
+            self.time = target.max(self.time);
+            self.restart |= kink;
             self.finished = target >= self.options.stop_time;
             self.run_digital();
+            self.mcu_fault()?;
             return Ok(Some(StepResult {
                 sample: self.sample(),
                 crossings: Vec::new(),
@@ -462,7 +562,9 @@ impl Transient {
                 }
             }
 
-            return Ok(Some(self.accept(h, h_error, ctx, crossings, target)));
+            let result = self.accept(h, h_error, ctx, crossings, target, kink);
+            self.mcu_fault()?;
+            return Ok(Some(result));
         }
         Err(SimError::TimestepTooSmall { time: self.time })
     }
@@ -496,8 +598,9 @@ impl Transient {
         h: f64,
         h_error: f64,
         ctx: StampContext,
-        crossings: Vec<(usize, f64, Edge)>,
+        mut crossings: Vec<(usize, f64, Edge)>,
         target: f64,
+        kink: bool,
     ) -> StepResult {
         let start = self.time;
         {
@@ -510,23 +613,6 @@ impl Transient {
             }
         }
         std::mem::swap(&mut self.x, &mut self.trial);
-        // Crossings of digital input thresholds become input events; the
-        // rest are reported to the caller.
-        let mut reported = Vec::new();
-        for (i, frac, edge) in crossings {
-            let time = start + frac * h;
-            match (self.watch_targets[i], &mut self.digital) {
-                (Some((part, input, value)), Some(sys)) => {
-                    sys.input_event(time, part, input, value)
-                }
-                _ => reported.push(Crossing {
-                    watch: WatchId(i),
-                    time,
-                    edge,
-                }),
-            }
-        }
-        let crossings = reported;
 
         // An infinite target (free-running, no breakpoint ahead) is never hit.
         let hit_target = target.is_finite()
@@ -538,15 +624,49 @@ impl Transient {
         if hit_target {
             if target >= self.options.stop_time {
                 self.finished = true;
-            } else {
+            } else if kink {
                 self.restart = true;
                 self.h_next = (h * BREAKPOINT_SHRINK).max(self.h_min * 10.0);
             }
         }
+
+        // Crossings of logic and microcontroller input thresholds become
+        // input events, in time order; the rest are reported to the caller.
+        crossings.sort_by(|a, b| a.1.total_cmp(&b.1));
+        let rows = node_rows(self.circuit.node_count());
+        let mut reported = Vec::new();
+        for (i, frac, edge) in crossings {
+            let time = start + frac * h;
+            match self.watch_targets[i] {
+                WatchTarget::Logic(part, input, value) => {
+                    if let Some(sys) = &mut self.digital {
+                        sys.input_event(time, part, input, value);
+                    }
+                }
+                WatchTarget::Mcu(part, pin, high) => {
+                    let Some(m) = &mut self.mcu else { continue };
+                    let x = &self.x;
+                    let voltage = |n: NodeId| SolutionView { x, node_rows: rows }.voltage(n);
+                    let changes = m.input_event(time, part, pin, high, &voltage);
+                    for &(device, drive) in &changes {
+                        self.circuit.devices[device].drive_pin(self.time, drive);
+                    }
+                    if !changes.is_empty() {
+                        self.restart = true;
+                    }
+                }
+                WatchTarget::Caller => reported.push(Crossing {
+                    watch: WatchId(i),
+                    time,
+                    edge,
+                }),
+            }
+        }
+
         self.run_digital();
         StepResult {
             sample: self.sample(),
-            crossings,
+            crossings: reported,
         }
     }
 }
@@ -562,6 +682,8 @@ pub struct TransientResult {
     /// `currents[device][sample]`, current entering the device's first pin.
     pub currents: Vec<Vec<f64>>,
     pub crossings: Vec<Crossing>,
+    /// Bytes sent on microcontroller serial ports.
+    pub serial: Vec<SerialByte>,
 }
 
 impl TransientResult {
@@ -610,6 +732,7 @@ pub fn run(mut sim: Transient) -> Result<TransientResult, SimError> {
         voltages: first.voltages.iter().map(|&v| vec![v]).collect(),
         currents: first.currents.iter().map(|&i| vec![i]).collect(),
         crossings: Vec::new(),
+        serial: Vec::new(),
     };
     while let Some(step) = sim.step()? {
         result.times.push(step.sample.time);
@@ -620,6 +743,7 @@ pub fn run(mut sim: Transient) -> Result<TransientResult, SimError> {
             trace.push(i);
         }
         result.crossings.extend(step.crossings);
+        result.serial.extend(sim.take_serial());
     }
     Ok(result)
 }

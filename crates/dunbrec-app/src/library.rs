@@ -275,6 +275,14 @@ pub fn palette() -> &'static [PaletteEntry] {
             make: || ComponentKind::LogicLed,
         },
         PaletteEntry {
+            name: "ATmega328P (Arduino)",
+            group: "Microcontrollers",
+            make: || ComponentKind::Mcu {
+                firmware: "builtin:blink".into(),
+                clock: dunbrec_core::DEFAULT_MCU_CLOCK,
+            },
+        },
+        PaletteEntry {
             name: "VCVS (E)",
             group: "Controlled sources",
             make: || ComponentKind::Vcvs { gain: 10.0 },

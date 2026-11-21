@@ -45,7 +45,94 @@ pub fn examples() -> &'static [Example] {
             name: "Binary counter",
             build: binary_counter,
         },
+        Example {
+            name: "Arduino blink",
+            build: arduino_blink,
+        },
+        Example {
+            name: "Arduino PWM fade",
+            build: arduino_fade,
+        },
+        Example {
+            name: "Arduino pot, PWM and serial",
+            build: arduino_pot_serial,
+        },
     ]
+}
+
+fn mcu(program: &str) -> K {
+    K::Mcu {
+        firmware: format!("{}{program}", dunbrec_mcu::firmware::BUILTIN_PREFIX),
+        clock: dunbrec_core::DEFAULT_MCU_CLOCK,
+    }
+}
+
+/// D6 → 10 kΩ → 10 µF to ground: averages the PWM into a voltage.
+/// Pin D6 of an MCU at the origin is at (-6, 3).
+fn pwm_filter(s: &mut Schematic) {
+    place(s, r(10e3), -10, 3, Rotation::R0); // (-12,3) (-8,3)
+    place(s, c(10e-6), -14, 5, Rotation::R90); // (-14,3) (-14,7)
+    place(s, K::Ground, -14, 8, Rotation::R0);
+    wire(s, &[(-8, 3), (-6, 3)]);
+    wire(s, &[(-12, 3), (-14, 3)]);
+    wire(s, &[(-14, 7), (-14, 8)]);
+    s.add_label("PWM", Point::new(-7, 3));
+    s.add_label("VOUT", Point::new(-13, 3));
+}
+
+/// An ATmega328P running the built-in blink program: D13 toggles every
+/// 0.5 s and lights the LED. Run at real-time speed to watch it.
+pub fn arduino_blink() -> Schematic {
+    let mut s = Schematic::new();
+    place(&mut s, mcu("blink"), 0, 0, Rotation::R0); // D13 (6,-3)
+    place(&mut s, K::LogicLed, 12, -3, Rotation::R0); // input (9,-3)
+    wire(&mut s, &[(6, -3), (9, -3)]);
+    s.add_label("D13", Point::new(7, -3));
+    s
+}
+
+/// PWM on D6 fading up and down, smoothed by an RC filter: scope VOUT
+/// to see the voltage ramp, PWM to see the duty cycle change.
+pub fn arduino_fade() -> Schematic {
+    let mut s = Schematic::new();
+    place(&mut s, mcu("fade"), 0, 0, Rotation::R0);
+    pwm_filter(&mut s);
+    s
+}
+
+/// A potentiometer into A0; the firmware mirrors it as PWM on D6
+/// (filtered to VOUT) and prints the reading on the serial monitor.
+/// Drag the wiper while it runs.
+pub fn arduino_pot_serial() -> Schematic {
+    let mut s = Schematic::new();
+    place(&mut s, mcu("pot-pwm-serial"), 0, 0, Rotation::R0); // A0 (6,-1)
+    place(
+        &mut s,
+        K::Potentiometer {
+            resistance: 10e3,
+            wiper: 0.5,
+        },
+        12,
+        3,
+        Rotation::R270,
+    ); // A (12,5) B (12,1) W (10,3)
+    place(
+        &mut s,
+        K::VoltageSource {
+            waveform: Waveform::Dc(5.0),
+        },
+        18,
+        3,
+        Rotation::R0,
+    ); // + (18,1) - (18,5)
+    place(&mut s, K::Ground, 18, 6, Rotation::R0);
+    wire(&mut s, &[(10, 3), (8, 3), (8, -1), (6, -1)]);
+    wire(&mut s, &[(12, 1), (18, 1)]);
+    wire(&mut s, &[(12, 5), (18, 5)]);
+    wire(&mut s, &[(18, 5), (18, 6)]);
+    s.add_label("POT", Point::new(8, 1));
+    pwm_filter(&mut s);
+    s
 }
 
 fn logic_gate(op: dunbrec_core::GateOp) -> K {
@@ -394,6 +481,10 @@ mod tests {
             let circuit = Circuit::from_netlist(&netlist, &s.models).unwrap();
             let op = operating_point(&circuit).unwrap();
             let high = |n: &str| op.voltage_by_name(n).unwrap() > 2.5;
+            if ex.name.starts_with("Arduino") {
+                // Pins float until the firmware runs; see `arduino_examples_run`.
+                continue;
+            }
             match ex.name {
                 // A = 1, B = 0.
                 "Logic gates" => {
@@ -422,5 +513,26 @@ mod tests {
                 other => panic!("no expectation for {other}"),
             }
         }
+    }
+
+    #[test]
+    fn arduino_examples_run() {
+        use dunbrec_sim::{TransientOptions, transient};
+        let run = |s: &Schematic, t: f64| {
+            let netlist = build_netlist(s);
+            let circuit = Circuit::from_netlist(&netlist, &s.models).unwrap();
+            transient(circuit, TransientOptions::new(t).with_max_step(1e-3)).unwrap()
+        };
+        let res = run(&arduino_blink(), 0.6);
+        assert!(*res.voltage("D13").unwrap().last().unwrap() > 4.5);
+        let res = run(&arduino_fade(), 0.6);
+        let v = *res.voltage("VOUT").unwrap().last().unwrap();
+        assert!(v > 0.5 && v < 4.5, "VOUT = {v}");
+        let res = run(&arduino_pot_serial(), 0.6);
+        let v = *res.voltage("VOUT").unwrap().last().unwrap();
+        assert!((v - 2.5).abs() < 0.1, "VOUT = {v}");
+        let text: String = res.serial.iter().map(|b| b.byte as char).collect();
+        // 2.5 V sits on the 511/512 code boundary.
+        assert!(text.contains("A0 = 051"), "{text:?}");
     }
 }

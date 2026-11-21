@@ -19,6 +19,7 @@ use crate::instruments_ui::{Bench, MeterSignal, Signals};
 use crate::library::palette;
 use crate::live::{Command, Event, LiveSim};
 use crate::properties::Properties;
+use crate::serial_ui::SerialMonitor;
 use crate::settings::{STORAGE_KEY, Settings, Theme};
 
 /// Keyboard shortcuts shown under Help.
@@ -103,6 +104,8 @@ pub struct DunbrecApp {
     node_map: (u64, NodeMap, Vec<TagPlace>),
     /// Bode plotter, curve tracer, DC transfer, function generator.
     analyses: Analyses,
+    /// Microcontroller serial output.
+    serial: SerialMonitor,
 }
 
 /// True if two netlists have the same nodes and connections, so a running
@@ -162,6 +165,7 @@ impl DunbrecApp {
         Self {
             node_map: (doc.generation(), node_map, tags),
             analyses: Analyses::default(),
+            serial: SerialMonitor::default(),
             signals: ((u64::MAX, 0), Signals::default()),
             bench: Bench::default(),
             live: None,
@@ -397,8 +401,10 @@ impl DunbrecApp {
                             place,
                         })
                         .collect();
+                    let unused = netlist.unused_io_nets();
                     let voltages = (1..circuit.node_count())
                         .map(NodeId)
+                        .filter(|n| !unused.contains(n))
                         .map(|n| (circuit.node_name(n).to_string(), op.voltage(n)))
                         .filter(|(name, _)| !name.contains('#'))
                         .collect();
@@ -602,7 +608,14 @@ impl DunbrecApp {
         self.bench.clear_readings();
         let speed = self.bench.speed.value(&self.bench.scope);
         let models = self.doc.schematic().models.clone();
-        match LiveSim::start(netlist, models, self.bench.max_step(), speed) {
+        // Relative firmware paths are relative to the schematic's folder.
+        let firmware_dir = self
+            .doc
+            .path()
+            .and_then(|p| p.parent())
+            .map(|d| d.to_path_buf());
+        self.serial.clear();
+        match LiveSim::start(netlist, models, self.bench.max_step(), speed, firmware_dir) {
             Ok(live) => {
                 self.live = Some(live);
                 self.live_generation = self.doc.generation();
@@ -665,6 +678,13 @@ impl DunbrecApp {
                 Event::Status { time, keeping_up } => {
                     self.live_time = time;
                     self.live_keeping_up = keeping_up;
+                }
+                Event::Serial(bytes) => {
+                    for b in bytes {
+                        if let Some(e) = live.netlist.elements.get(b.element) {
+                            self.serial.push(&e.designator, &[b.byte]);
+                        }
+                    }
                 }
                 Event::NeedsRestart => restart = true,
                 Event::Error(e) => error = Some(e),
@@ -818,6 +838,7 @@ impl DunbrecApp {
                 self.bench
                     .logic_window(ctx, s, &self.netlist.1, &self.node_map.1, probing);
         }
+        self.serial.window(ctx);
         if probe_clicked {
             self.canvas.tool = Tool::Probe;
         }
@@ -974,6 +995,7 @@ impl DunbrecApp {
                     ui.checkbox(&mut self.bench.show_meter, "🔢 Multimeter");
                     ui.checkbox(&mut self.bench.show_logic, "📊 Logic analyser");
                     ui.checkbox(&mut self.analyses.show_fgen, "〰 Function generator");
+                    ui.checkbox(&mut self.serial.show, "⌨ Serial monitor");
                     ui.separator();
                     ui.checkbox(
                         &mut self.analyses.show_bode,
@@ -1103,9 +1125,13 @@ impl DunbrecApp {
                         egui::ScrollArea::vertical()
                             .id_salt("live")
                             .show(&mut cols[1], |ui| {
+                                let unused = self.netlist.1.unused_io_nets();
                                 egui::Grid::new("live_table").striped(true).show(ui, |ui| {
                                     for (i, node) in self.netlist.1.nodes.iter().enumerate().skip(1)
                                     {
+                                        if unused.contains(&NodeId(i)) {
+                                            continue;
+                                        }
                                         if let Some(v) = sample.voltages.get(i) {
                                             ui.monospace(format!("V({})", node.name));
                                             ui.monospace(format_value(*v, "V"));

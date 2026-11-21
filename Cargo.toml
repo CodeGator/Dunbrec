@@ -4,6 +4,7 @@ members = [
     "crates/dunbrec-core",
     "crates/dunbrec-io",
     "crates/dunbrec-sim",
+    "crates/dunbrec-mcu",
     "crates/dunbrec-instruments",
     "crates/dunbrec-app",
 ]
@@ -18,6 +19,7 @@ rust-version = "1.90"
 dunbrec-core = { path = "crates/dunbrec-core" }
 dunbrec-io = { path = "crates/dunbrec-io" }
 dunbrec-sim = { path = "crates/dunbrec-sim" }
+dunbrec-mcu = { path = "crates/dunbrec-mcu" }
 dunbrec-instruments = { path = "crates/dunbrec-instruments" }
 serde = { version = "1", features = ["derive"] }
 ron = "0.10"

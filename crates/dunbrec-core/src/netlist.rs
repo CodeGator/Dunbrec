@@ -108,6 +108,25 @@ impl Netlist {
             .any(|d| d.severity() == Severity::Error)
     }
 
+    /// Nets made of nothing but one unused microcontroller I/O pin (no
+    /// other pin, no label): not worth showing voltages for.
+    pub fn unused_io_nets(&self) -> std::collections::HashSet<NodeId> {
+        let mut pins: HashMap<NodeId, (usize, bool)> = HashMap::new();
+        for e in &self.elements {
+            for (pin, &n) in e.kind.pins().iter().zip(&e.nodes) {
+                let entry = pins.entry(n).or_default();
+                entry.0 += 1;
+                entry.1 |= pin.domain == crate::schematic::PinDomain::DigitalIo;
+            }
+        }
+        pins.into_iter()
+            .filter(|(n, (count, io))| {
+                *count == 1 && *io && !n.is_ground() && !self.nodes[n.0].labelled
+            })
+            .map(|(n, _)| n)
+            .collect()
+    }
+
     pub fn node_by_name(&self, name: &str) -> Option<NodeId> {
         self.nodes.iter().position(|n| n.name == name).map(NodeId)
     }
@@ -363,9 +382,14 @@ pub fn build_netlist(schematic: &Schematic) -> Netlist {
 
     // Unconnected pins: a non-ground node touched by only one pin and not
     // labelled (a labelled stub is intentional, e.g. a probe point).
+    // Microcontroller I/O pins are often left unused, like on a real board.
     for e in &elements {
         for (pin, node) in e.kind.pins().iter().zip(&e.nodes) {
-            if !node.is_ground() && pin_count_by_node[node] == 1 && !nodes[node.0].labelled {
+            if pin.domain != crate::schematic::PinDomain::DigitalIo
+                && !node.is_ground()
+                && pin_count_by_node[node] == 1
+                && !nodes[node.0].labelled
+            {
                 diagnostics.push(Diagnostic::UnconnectedPin {
                     component: e.component,
                     pin: pin.name.to_string(),

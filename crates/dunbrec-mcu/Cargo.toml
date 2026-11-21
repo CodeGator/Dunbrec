@@ -1,0 +1,9 @@
+[package]
+name = "dunbrec-mcu"
+description = "Dunbrec microcontroller emulation: an ATmega328P (AVR) core with its peripherals"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]

@@ -18,6 +18,7 @@ mod live;
 mod logic_ui;
 mod plot;
 mod properties;
+mod serial_ui;
 mod settings;
 mod symbols;
 

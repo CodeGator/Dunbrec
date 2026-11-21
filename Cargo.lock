@@ -802,6 +802,7 @@ dependencies = [
  "dunbrec-core",
  "dunbrec-instruments",
  "dunbrec-io",
+ "dunbrec-mcu",
  "dunbrec-sim",
  "eframe",
  "egui",
@@ -838,11 +839,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "dunbrec-mcu"
+version = "0.1.0"
+
+[[package]]
 name = "dunbrec-sim"
 version = "0.1.0"
 dependencies = [
  "approx",
  "dunbrec-core",
+ "dunbrec-mcu",
  "num-complex",
  "thiserror 2.0.21",
 ]

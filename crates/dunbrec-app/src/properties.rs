@@ -217,6 +217,61 @@ impl Properties {
                         r
                     }
                     ComponentKind::LogicLed => false,
+                    ComponentKind::Mcu { firmware, clock } => {
+                        let mut changed = false;
+                        if let Some(f) =
+                            self.text_field(ui, &key(id, "firmware"), "Firmware", firmware)
+                        {
+                            *firmware = f.trim().to_string();
+                            changed = true;
+                        }
+                        ui.label("");
+                        ui.horizontal(|ui| {
+                            if ui
+                                .button("Browse…")
+                                .on_hover_text("Choose an Intel HEX file")
+                                .clicked()
+                                && let Some(path) = rfd::FileDialog::new()
+                                    .add_filter("Intel HEX", &["hex", "ihx"])
+                                    .add_filter("All files", &["*"])
+                                    .pick_file()
+                            {
+                                *firmware = path.display().to_string();
+                                changed = true;
+                            }
+                            egui::ComboBox::from_id_salt(("builtin", id))
+                                .selected_text("Built-in demo")
+                                .show_ui(ui, |ui| {
+                                    for (name, about) in dunbrec_mcu::programs::BUILTIN {
+                                        if ui
+                                            .selectable_label(false, *name)
+                                            .on_hover_text(*about)
+                                            .clicked()
+                                        {
+                                            *firmware = format!(
+                                                "{}{name}",
+                                                dunbrec_mcu::firmware::BUILTIN_PREFIX
+                                            );
+                                            changed = true;
+                                        }
+                                    }
+                                });
+                        });
+                        ui.end_row();
+                        let clock_changed = self.value(ui, id, "Clock", "Hz", clock);
+                        ui.label("");
+                        ui.label(
+                            egui::RichText::new(
+                                "Arduino IDE: Sketch → Export Compiled Binary, then pick the \
+                                 .hex without \"with_bootloader\". The file is reloaded each \
+                                 time the simulation starts.",
+                            )
+                            .small()
+                            .weak(),
+                        );
+                        ui.end_row();
+                        changed | clock_changed
+                    }
                 };
                 if changed {
                     edit = set_kind(k);
@@ -598,6 +653,7 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
         ComponentKind::Clock { .. } => "Clock",
         ComponentKind::LogicSwitch { .. } => "Logic switch",
         ComponentKind::LogicLed => "Logic LED",
+        ComponentKind::Mcu { .. } => "Microcontroller (ATmega328P)",
     }
 }
 

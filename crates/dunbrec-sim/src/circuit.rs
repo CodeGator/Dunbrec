@@ -12,6 +12,7 @@ use crate::device::{
 use crate::digital::{CMOS_5V, DigitalDriver, NullDevice, PartSpec};
 use crate::error::{SimError, SimWarning};
 use crate::linalg::{DenseMatrix, LinearSolver};
+use crate::mcu::{McuPin, McuSpec};
 use crate::semiconductor::{Bjt, BjtParams, Diode, DiodeParams, Mosfet, MosfetParams};
 use crate::stamp::{BranchId, Stamper, node_rows};
 
@@ -32,6 +33,11 @@ pub struct Circuit {
     /// Digital parts and how they are wired (their drivers follow the
     /// netlist elements in `devices`).
     pub(crate) digital: Vec<PartSpec>,
+    /// Microcontrollers and how they are wired (their pin devices follow
+    /// the netlist elements in `devices`).
+    pub(crate) mcus: Vec<McuSpec>,
+    /// Folder relative firmware paths are resolved against.
+    pub(crate) firmware_dir: Option<std::path::PathBuf>,
     pub(crate) warnings: Vec<SimWarning>,
 }
 
@@ -81,8 +87,28 @@ impl Circuit {
         // Digital parts: one analog driver per output, after the elements
         // so device indices still match netlist element indices.
         let mut digital = Vec::new();
+        let mut mcus = Vec::new();
         for (index, element) in netlist.elements.iter().enumerate() {
             if !element.kind.is_digital() {
+                continue;
+            }
+            if matches!(element.kind, ComponentKind::Mcu { .. }) {
+                let mut drivers = Vec::new();
+                for (pin, &node) in element.kind.pins().iter().zip(&element.nodes) {
+                    drivers.push(devices.len());
+                    devices.push(Box::new(McuPin::new(
+                        format!("{}:{}", element.designator, pin.name),
+                        node,
+                    )));
+                    slots.push((None, None));
+                }
+                mcus.push(McuSpec {
+                    element: index,
+                    designator: element.designator.clone(),
+                    kind: element.kind.clone(),
+                    nodes: element.nodes.clone(),
+                    drivers,
+                });
                 continue;
             }
             let mut input_nodes = Vec::new();
@@ -101,7 +127,7 @@ impl Circuit {
                         )));
                         slots.push((None, None));
                     }
-                    dunbrec_core::PinDomain::Analog => {}
+                    dunbrec_core::PinDomain::Analog | dunbrec_core::PinDomain::DigitalIo => {}
                 }
             }
             digital.push(PartSpec {
@@ -121,6 +147,8 @@ impl Circuit {
             warnings: Vec::new(),
             slots,
             digital,
+            mcus,
+            firmware_dir: None,
         };
         circuit.check_topology()?;
         Ok(circuit)
@@ -132,6 +160,17 @@ impl Circuit {
 
     pub fn node_name(&self, n: NodeId) -> &str {
         &self.node_names[n.0]
+    }
+
+    /// Folder against which relative microcontroller firmware paths are
+    /// resolved (normally the schematic's folder).
+    pub fn set_firmware_dir(&mut self, dir: impl Into<std::path::PathBuf>) {
+        self.firmware_dir = Some(dir.into());
+    }
+
+    /// True if the circuit contains microcontrollers.
+    pub fn has_mcus(&self) -> bool {
+        !self.mcus.is_empty()
     }
 
     pub fn warnings(&self) -> &[SimWarning] {
@@ -326,6 +365,10 @@ fn make_device(e: &Element, models: &ModelLibrary) -> Result<Box<dyn Device>, Si
                     return Err(invalid(e, "duty cycle must be between 0 and 1"));
                 }
             }
+            Box::new(NullDevice { name })
+        }
+        ComponentKind::Mcu { clock, .. } => {
+            check_positive(e, "clock frequency", *clock)?;
             Box::new(NullDevice { name })
         }
         ComponentKind::Resistor { resistance } => {
