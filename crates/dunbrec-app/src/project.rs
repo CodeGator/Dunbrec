@@ -1,12 +1,15 @@
-//! Projects: a folder that holds a project's schematics and firmware source
-//! files together.
+//! Projects: a file that lists a design's schematics and firmware source
+//! files, so they are kept together.
 //!
-//! A project is just a folder. Every `.dbr` in it (and its subfolders) is a
-//! schematic of the project, and firmware sources are ordinary files beside
-//! them (`.asm`, `.s`, `.ino`, `.cpp`), so other editors, version control and
-//! `arduino-cli` see them as they are.
+//! A project is a small file (`My amp.dbrproj`) that the user makes wherever
+//! they like. It holds the list of the files that belong to the project,
+//! as paths relative to the project file's own folder. Anything else in that
+//! folder is simply not part of the project and is never shown. The files
+//! themselves are ordinary files (`.dbr` schematics, `.asm` and `.ino`
+//! sources), so other editors, version control and `arduino-cli` see them as
+//! they are.
 //!
-//! A source file is known to a schematic by its path relative to the
+//! A firmware source is known to a schematic by its path relative to the
 //! schematic's own folder, with `/` separators (`main.asm`, `fw/blink.ino`).
 //! A microcontroller's firmware field holds that path, and while the schematic
 //! is open the file's text sits in [`Schematic::sources`] under the same
@@ -22,8 +25,13 @@ use std::path::{Component, Path, PathBuf};
 use dunbrec_core::{
     ComponentKind, SOURCE_PREFIX, Schematic, SourceFile, SourceLanguage, source_language_of,
 };
+use serde::{Deserialize, Serialize};
 
-/// What a project entry is, for the icon and for what a double-click does.
+/// Extension of a project file.
+pub const EXTENSION: &str = "dbrproj";
+
+/// What an entry of the project is, for the icon and for what a
+/// double-click does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntryKind {
     Folder,
@@ -45,6 +53,8 @@ pub struct Entry {
     pub kind: EntryKind,
     /// The folder's contents (empty for files).
     pub children: Vec<Entry>,
+    /// The project lists it, but it is not on the disk.
+    pub missing: bool,
 }
 
 /// What an entry named `name` is, going by its extension.
@@ -64,68 +74,7 @@ pub fn kind_of(name: &str) -> EntryKind {
     }
 }
 
-/// Folders that are never listed: hidden ones and build output of other tools.
-fn skipped(name: &str) -> bool {
-    name.starts_with('.') || matches!(name, "target" | "node_modules")
-}
-
-const MAX_DEPTH: usize = 8;
-const MAX_ENTRIES: usize = 5000;
-
-/// The contents of `root` as a tree: folders first, then files, each
-/// alphabetical without regard to case.
-pub fn scan(root: &Path) -> Vec<Entry> {
-    let mut budget = MAX_ENTRIES;
-    scan_dir(root, 0, &mut budget)
-}
-
-fn scan_dir(dir: &Path, depth: usize, budget: &mut usize) -> Vec<Entry> {
-    let Ok(read) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let mut entries = Vec::new();
-    for item in read.flatten() {
-        if *budget == 0 {
-            break;
-        }
-        let name = item.file_name().to_string_lossy().into_owned();
-        let path = item.path();
-        let is_dir = item.file_type().is_ok_and(|t| t.is_dir());
-        if is_dir {
-            if skipped(&name) || depth >= MAX_DEPTH {
-                continue;
-            }
-            *budget -= 1;
-            let children = scan_dir(&path, depth + 1, budget);
-            entries.push(Entry {
-                name,
-                path,
-                kind: EntryKind::Folder,
-                children,
-            });
-        } else {
-            if name.starts_with('.') {
-                continue;
-            }
-            *budget -= 1;
-            entries.push(Entry {
-                kind: kind_of(&name),
-                name,
-                path,
-                children: Vec::new(),
-            });
-        }
-    }
-    entries.sort_by(|a, b| {
-        let folder = |e: &Entry| e.kind != EntryKind::Folder;
-        folder(a)
-            .cmp(&folder(b))
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-    });
-    entries
-}
-
-/// Every `.dbr` under `entries`, depth first.
+/// Every schematic under `entries`, depth first.
 pub fn schematics(entries: &[Entry]) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for e in entries {
@@ -138,43 +87,314 @@ pub fn schematics(entries: &[Entry]) -> Vec<PathBuf> {
     out
 }
 
-/// An open project: its folder and what was in it at the last scan.
+/// What the project file holds.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct ProjectData {
+    version: u32,
+    /// The project's files, relative to the project file's folder (`/`).
+    files: Vec<String>,
+    /// Folders to show even with nothing in them (relative, `/`).
+    folders: Vec<String>,
+}
+
+const FORMAT_VERSION: u32 = 1;
+
+/// An open project: its file, and the tree of what it lists.
 #[derive(Debug, Clone)]
 pub struct Project {
+    /// The project file.
+    pub file: PathBuf,
+    /// The folder the project file is in; listed paths are relative to it.
     pub root: PathBuf,
+    data: ProjectData,
     pub entries: Vec<Entry>,
 }
 
+/// True if `path` is `base` or inside it, by reading the paths.
+fn under(path: &Path, base: &Path) -> bool {
+    normalize(path).starts_with(normalize(base))
+}
+
 impl Project {
-    pub fn open(root: &Path) -> Result<Self, String> {
-        if !root.is_dir() {
-            return Err(format!("{} is not a folder", root.display()));
+    fn from_data(file: &Path, data: ProjectData) -> Self {
+        let mut p = Self {
+            file: file.to_path_buf(),
+            root: file.parent().unwrap_or(Path::new("")).to_path_buf(),
+            data,
+            entries: Vec::new(),
+        };
+        p.refresh();
+        p
+    }
+
+    /// Read a project file.
+    pub fn open(file: &Path) -> Result<Self, String> {
+        let text = std::fs::read_to_string(file)
+            .map_err(|e| format!("cannot read {}: {e}", file.display()))?;
+        let data: ProjectData = serde_json::from_str(&text).map_err(|e| {
+            format!(
+                "{} is not a Dunbrec project file ({e})",
+                file.file_name().map_or_else(
+                    || file.display().to_string(),
+                    |n| n.to_string_lossy().into_owned()
+                )
+            )
+        })?;
+        if data.version > FORMAT_VERSION {
+            return Err(format!(
+                "{} was made by a newer Dunbrec; update the program to open it",
+                file.display()
+            ));
         }
-        Ok(Self {
-            root: root.to_path_buf(),
-            entries: scan(root),
-        })
+        Ok(Self::from_data(file, data))
     }
 
-    pub fn refresh(&mut self) {
-        self.entries = scan(&self.root);
+    /// Make a new project: write the project file `file` (`.dbrproj` is added
+    /// if missing) and a first, empty circuit beside it, `Circuit 1.dbr` or the
+    /// next name nothing there has. Returns the project and the circuit.
+    pub fn create(file: &Path) -> Result<(Self, PathBuf), String> {
+        let mut file = file.to_path_buf();
+        if file
+            .extension()
+            .is_none_or(|e| !e.eq_ignore_ascii_case(EXTENSION))
+        {
+            let name = file.file_name().map(|n| n.to_string_lossy().into_owned());
+            if let Some(name) = name {
+                file.set_file_name(with_extension(&name, EXTENSION));
+            }
+        }
+        let name = file
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if !valid_name(&name) {
+            return Err(format!("“{name}” cannot be used as a file name"));
+        }
+        ensure_free(&file).map_err(|e| format!("{e}. Use Open project to open it."))?;
+        let dir = file.parent().unwrap_or(Path::new("")).to_path_buf();
+        let circuit = free_circuit_in(&dir);
+        dunbrec_io::dbr::save(&Schematic::new(), &circuit).map_err(|e| e.to_string())?;
+        let mut project = Self::from_data(
+            &file,
+            ProjectData {
+                version: FORMAT_VERSION,
+                ..ProjectData::default()
+            },
+        );
+        project.add_file(&circuit)?;
+        Ok((project, circuit))
     }
 
+    /// Write the project file.
+    pub fn save(&self) -> Result<(), String> {
+        let mut data = self.data.clone();
+        data.version = FORMAT_VERSION;
+        let text = serde_json::to_string_pretty(&data).map_err(|e| e.to_string())?;
+        std::fs::write(&self.file, text + "\n")
+            .map_err(|e| format!("cannot write {}: {e}", self.file.display()))
+    }
+
+    /// The project's name: its file's name without the extension.
     pub fn name(&self) -> String {
-        self.root.file_name().map_or_else(
-            || self.root.display().to_string(),
+        self.file.file_stem().map_or_else(
+            || self.file.display().to_string(),
             |n| n.to_string_lossy().into_owned(),
         )
     }
 
+    /// Where a listed path really is.
+    fn absolute(&self, listed: &str) -> PathBuf {
+        normalize(&self.root.join(listed))
+    }
+
+    fn listed(&self, path: &Path) -> String {
+        relative_to(&self.root, path)
+    }
+
+    /// Every listed file, as a path.
+    pub fn files(&self) -> Vec<PathBuf> {
+        self.data.files.iter().map(|f| self.absolute(f)).collect()
+    }
+
+    /// The listed `.dbr` schematics.
     pub fn schematics(&self) -> Vec<PathBuf> {
         schematics(&self.entries)
     }
 
-    /// True if `path` is inside the project folder.
+    /// True if the project lists `path`.
     pub fn contains(&self, path: &Path) -> bool {
-        normalize(path).starts_with(normalize(&self.root))
+        let path = normalize(path);
+        self.files().contains(&path)
     }
+
+    /// List the files (those not listed yet). Returns how many were new.
+    pub fn add_files(&mut self, paths: &[PathBuf]) -> Result<usize, String> {
+        let mut added = 0;
+        for path in paths {
+            let listed = self.listed(path);
+            if !self.data.files.contains(&listed) {
+                self.data.files.push(listed);
+                added += 1;
+            }
+        }
+        if added > 0 {
+            self.refresh();
+            self.save()?;
+        }
+        Ok(added)
+    }
+
+    /// List one file. Returns true if it was new.
+    pub fn add_file(&mut self, path: &Path) -> Result<bool, String> {
+        Ok(self.add_files(&[path.to_path_buf()])? > 0)
+    }
+
+    /// Show a folder, even while nothing in it is listed.
+    pub fn add_folder(&mut self, path: &Path) -> Result<(), String> {
+        let listed = self.listed(path);
+        if !self.data.folders.contains(&listed) {
+            self.data.folders.push(listed);
+            self.refresh();
+            self.save()?;
+        }
+        Ok(())
+    }
+
+    /// Take `path` out of the project: the file, or the folder with
+    /// everything listed under it. The disk is not touched. Returns how many
+    /// listed files went.
+    pub fn remove(&mut self, path: &Path) -> Result<usize, String> {
+        let before = self.data.files.len();
+        let (root, path) = (self.root.clone(), path.to_path_buf());
+        let gone = |listed: &String| under(&root.join(listed), &path);
+        self.data.files.retain(|f| !gone(f));
+        self.data.folders.retain(|f| !gone(f));
+        let removed = before - self.data.files.len();
+        self.refresh();
+        self.save()?;
+        Ok(removed)
+    }
+
+    /// Follow a file or folder that was renamed or moved on the disk: what
+    /// the project listed at or under `from` is now under `to`.
+    pub fn moved(&mut self, from: &Path, to: &Path) -> Result<(), String> {
+        let (from, to) = (normalize(from), normalize(to));
+        let root = self.root.clone();
+        let remap = |listed: &mut String| {
+            let abs = normalize(&root.join(&*listed));
+            if let Ok(rest) = abs.strip_prefix(&from) {
+                let new = if rest.as_os_str().is_empty() {
+                    to.clone()
+                } else {
+                    to.join(rest)
+                };
+                *listed = relative_to(&root, &new);
+            }
+        };
+        self.data.files.iter_mut().for_each(remap);
+        self.data.folders.iter_mut().for_each(remap);
+        self.refresh();
+        self.save()
+    }
+
+    /// Rebuild the tree from the list (and look again at what is on disk).
+    pub fn refresh(&mut self) {
+        let mut entries = Vec::new();
+        for folder in &self.data.folders {
+            let parts: Vec<&str> = folder
+                .split('/')
+                .filter(|p| !p.is_empty() && *p != ".")
+                .collect();
+            insert(&mut entries, &self.root, &parts, false);
+        }
+        for file in &self.data.files {
+            let parts: Vec<&str> = file
+                .split('/')
+                .filter(|p| !p.is_empty() && *p != ".")
+                .collect();
+            // A file outside the project's folder has no folders to sit in.
+            if parts.contains(&"..") || Path::new(file).is_absolute() {
+                let path = self.absolute(file);
+                entries.push(Entry {
+                    name: file.clone(),
+                    kind: kind_of(file),
+                    missing: !path.exists(),
+                    path,
+                    children: Vec::new(),
+                });
+            } else {
+                insert(&mut entries, &self.root, &parts, true);
+            }
+        }
+        sort_entries(&mut entries);
+        self.entries = entries;
+    }
+
+    /// Read the project file again (it was edited by hand or by another
+    /// program).
+    pub fn reload(&mut self) -> Result<(), String> {
+        *self = Self::open(&self.file)?;
+        Ok(())
+    }
+}
+
+/// Put the file or folder `parts` (below `dir`) into the tree.
+fn insert(entries: &mut Vec<Entry>, dir: &Path, parts: &[&str], is_file: bool) {
+    let Some((first, rest)) = parts.split_first() else {
+        return;
+    };
+    let path = dir.join(first);
+    if rest.is_empty() && is_file {
+        entries.push(Entry {
+            name: first.to_string(),
+            kind: kind_of(first),
+            missing: !path.exists(),
+            path,
+            children: Vec::new(),
+        });
+        return;
+    }
+    let at = match entries
+        .iter()
+        .position(|e| e.kind == EntryKind::Folder && e.name == *first)
+    {
+        Some(i) => i,
+        None => {
+            entries.push(Entry {
+                name: first.to_string(),
+                kind: EntryKind::Folder,
+                missing: !path.is_dir(),
+                path: path.clone(),
+                children: Vec::new(),
+            });
+            entries.len() - 1
+        }
+    };
+    if !rest.is_empty() {
+        insert(&mut entries[at].children, &path, rest, is_file);
+    }
+}
+
+/// Folders first, then files, each alphabetical without regard to case.
+fn sort_entries(entries: &mut [Entry]) {
+    entries.sort_by(|a, b| {
+        let file = |e: &Entry| e.kind != EntryKind::Folder;
+        file(a)
+            .cmp(&file(b))
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    for e in entries {
+        sort_entries(&mut e.children);
+    }
+}
+
+/// `Circuit 1.dbr`, or the next number, in `dir`: a path nothing is at.
+fn free_circuit_in(dir: &Path) -> PathBuf {
+    (1..)
+        .map(|n| dir.join(format!("Circuit {n}.dbr")))
+        .find(|p| !p.exists())
+        .expect("a free number")
 }
 
 // ----------------------------------------------------------- paths ---
@@ -290,48 +510,6 @@ pub fn with_extension(name: &str, ext: &str) -> String {
     } else {
         format!("{name}.{ext}")
     }
-}
-
-/// A name for a new project folder in `parent` that nothing there has yet:
-/// `Project 1`, `Project 2`, and so on.
-pub fn suggest_project_name(parent: &Path) -> String {
-    (1..)
-        .map(|n| format!("Project {n}"))
-        .find(|name| !parent.join(name).exists())
-        .expect("a free number")
-}
-
-/// Name of the first circuit of a new project.
-pub const FIRST_CIRCUIT: &str = "Circuit 1";
-
-/// Create the project folder `dir` (it may exist if it is empty) and a first
-/// circuit in it, `Circuit 1.dbr`. Returns the circuit's path.
-pub fn create_project(dir: &Path) -> Result<PathBuf, String> {
-    let name = dir
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .ok_or("choose a name for the project folder")?;
-    if !valid_name(&name) {
-        return Err(format!("“{name}” cannot be used as a folder name"));
-    }
-    if dir.exists() {
-        let empty = dir.is_dir()
-            && std::fs::read_dir(dir)
-                .map_err(|e| e.to_string())?
-                .next()
-                .is_none();
-        if !empty {
-            return Err(format!(
-                "{} already exists and is not empty. Choose another name, or use Open project \
-                 to open it as a project.",
-                dir.display()
-            ));
-        }
-    }
-    std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-    let path = dir.join(format!("{FIRST_CIRCUIT}.dbr"));
-    dunbrec_io::dbr::save(&Schematic::new(), &path).map_err(|e| e.to_string())?;
-    Ok(path)
 }
 
 fn ensure_free(path: &Path) -> Result<(), String> {
@@ -570,20 +748,26 @@ pub struct Renamed {
     pub rewritten: Vec<PathBuf>,
 }
 
-/// Rename `from` to `to` (in the same folder, or any other free path), then
-/// make every schematic of the project that referred to it, or to something
-/// in it, refer to the new place. `open` is the schematic open in the app,
-/// which is left alone: the caller updates it in memory with
-/// [`rewrite_refs`].
-pub fn rename(root: &Path, from: &Path, to: &Path, open: Option<&Path>) -> Result<Renamed, String> {
+/// Rename `from` to `to` on the disk (in the same folder, or any other free
+/// path), make the project list the new place, and make every schematic of
+/// the project that referred to it, or to something in it, refer to the new
+/// place. `open` is the schematic open in the app, which is left alone: the
+/// caller updates it in memory with [`rewrite_refs`].
+pub fn rename(
+    project: &mut Project,
+    from: &Path,
+    to: &Path,
+    open: Option<&Path>,
+) -> Result<Renamed, String> {
     ensure_free(to)?;
     if let Some(parent) = to.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     std::fs::rename(from, to).map_err(|e| format!("cannot rename {}: {e}", from.display()))?;
+    project.moved(from, to)?;
     let (from_n, to_n) = (normalize(from), normalize(to));
     let mut out = Renamed::default();
-    for dbr_new in scan_schematics(root) {
+    for dbr_new in project.schematics() {
         if open.is_some_and(|o| normalize(o) == normalize(&dbr_new)) {
             continue;
         }
@@ -594,9 +778,10 @@ pub fn rename(root: &Path, from: &Path, to: &Path, open: Option<&Path>) -> Resul
             Ok(rest) => from_n.join(rest),
             Err(_) => dbr_new.clone(),
         };
+        let none = Path::new("");
         let (old_dir, new_dir) = (
-            dbr_old.parent().unwrap_or(Path::new("")).to_path_buf(),
-            dbr_new.parent().unwrap_or(Path::new("")).to_path_buf(),
+            dbr_old.parent().unwrap_or(none).to_path_buf(),
+            dbr_new.parent().unwrap_or(none).to_path_buf(),
         );
         let Ok(mut s) = dunbrec_io::dbr::load(&dbr_new) else {
             continue;
@@ -609,18 +794,17 @@ pub fn rename(root: &Path, from: &Path, to: &Path, open: Option<&Path>) -> Resul
     Ok(out)
 }
 
-fn scan_schematics(root: &Path) -> Vec<PathBuf> {
-    schematics(&scan(root))
-}
-
-/// Delete a file, or a folder with everything in it.
-pub fn delete(path: &Path) -> Result<(), String> {
+/// Delete a file, or a folder with everything in it, from the disk, and take
+/// it out of the project.
+pub fn delete(project: &mut Project, path: &Path) -> Result<(), String> {
     let result = if path.is_dir() {
         std::fs::remove_dir_all(path)
     } else {
         std::fs::remove_file(path)
     };
-    result.map_err(|e| format!("cannot delete {}: {e}", path.display()))
+    result.map_err(|e| format!("cannot delete {}: {e}", path.display()))?;
+    project.remove(path)?;
+    Ok(())
 }
 
 /// Move the sources kept inside `s` by older versions into files in `dir`:
@@ -743,75 +927,6 @@ mod tests {
     }
 
     #[test]
-    fn a_new_project_has_a_folder_and_a_first_schematic() {
-        let root = scratch("new");
-        let dir = root.join("Blinker");
-        let first = create_project(&dir).unwrap();
-        assert_eq!(first, dir.join("Circuit 1.dbr"));
-        assert!(dunbrec_io::dbr::load(&first).unwrap().components.is_empty());
-        // Not on top of something that is already there.
-        assert!(create_project(&dir).unwrap_err().contains("not empty"));
-        // An empty existing folder is fine.
-        std::fs::create_dir(root.join("Empty")).unwrap();
-        assert!(create_project(&root.join("Empty")).is_ok());
-        assert!(create_project(&root.join("bad:name")).is_err());
-        std::fs::remove_dir_all(&root).unwrap();
-    }
-
-    #[test]
-    fn new_projects_are_suggested_a_free_folder_name() {
-        let root = scratch("suggest");
-        assert_eq!(suggest_project_name(&root), "Project 1");
-        std::fs::create_dir(root.join("Project 1")).unwrap();
-        std::fs::create_dir(root.join("Project 3")).unwrap();
-        assert_eq!(suggest_project_name(&root), "Project 2");
-        std::fs::remove_dir_all(&root).unwrap();
-    }
-
-    #[test]
-    fn the_tree_lists_folders_first_and_knows_each_kind() {
-        let root = scratch("scan");
-        std::fs::create_dir_all(root.join("fw")).unwrap();
-        std::fs::create_dir_all(root.join(".git")).unwrap();
-        std::fs::create_dir_all(root.join("target")).unwrap();
-        for (path, text) in [
-            ("b.dbr", ""),
-            ("A.dbr", ""),
-            ("fw/blink.ino", ""),
-            ("fw/blink.hex", ""),
-            ("fw/util.h", ""),
-            ("main.asm", ""),
-            ("notes.txt", ""),
-            (".hidden", ""),
-            (".git/config", ""),
-            ("target/x.dbr", ""),
-        ] {
-            std::fs::write(root.join(path), text).unwrap();
-        }
-        let tree = scan(&root);
-        let names: Vec<&str> = tree.iter().map(|e| e.name.as_str()).collect();
-        assert_eq!(names, ["fw", "A.dbr", "b.dbr", "main.asm", "notes.txt"]);
-        let fw = &tree[0];
-        assert_eq!(fw.kind, EntryKind::Folder);
-        let inner: Vec<(&str, EntryKind)> = fw
-            .children
-            .iter()
-            .map(|e| (e.name.as_str(), e.kind))
-            .collect();
-        assert_eq!(
-            inner,
-            [
-                ("blink.hex", EntryKind::Hex),
-                ("blink.ino", EntryKind::Source(SourceLanguage::Cpp)),
-                ("util.h", EntryKind::Header),
-            ]
-        );
-        assert_eq!(tree[3].kind, EntryKind::Source(SourceLanguage::Asm));
-        assert_eq!(schematics(&tree).len(), 2);
-        std::fs::remove_dir_all(&root).unwrap();
-    }
-
-    #[test]
     fn new_files_get_the_right_extension_and_starter() {
         let root = scratch("create");
         let a = new_source(&root, "blink", NewSource::Assembly).unwrap();
@@ -918,108 +1033,6 @@ loop: rjmp loop
     }
 
     #[test]
-    fn renaming_a_source_keeps_every_schematic_pointing_at_it() {
-        let root = scratch("rename");
-        std::fs::create_dir_all(root.join("sub")).unwrap();
-        std::fs::write(root.join("main.asm"), "nop\n").unwrap();
-        // Three schematics: two in the root and one in a subfolder, all
-        // using main.asm, and one using a different file.
-        let top = root.join("top.dbr");
-        let other = root.join("other.dbr");
-        let deep = root.join("sub").join("deep.dbr");
-        let unrelated = root.join("unrelated.dbr");
-        dunbrec_io::dbr::save(&schematic_with("main.asm"), &top).unwrap();
-        dunbrec_io::dbr::save(&schematic_with("main.asm"), &other).unwrap();
-        dunbrec_io::dbr::save(&schematic_with("../main.asm"), &deep).unwrap();
-        dunbrec_io::dbr::save(&schematic_with("builtin:blink"), &unrelated).unwrap();
-
-        let renamed = rename(
-            &root,
-            &root.join("main.asm"),
-            &root.join("blink.asm"),
-            Some(&top),
-        )
-        .unwrap();
-        assert!(root.join("blink.asm").is_file() && !root.join("main.asm").exists());
-        // The open schematic is left for the caller; the others follow.
-        let mut files: Vec<_> = renamed
-            .rewritten
-            .iter()
-            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
-            .collect();
-        files.sort();
-        assert_eq!(files, ["deep.dbr", "other.dbr"]);
-        assert_eq!(
-            firmware_of(&dunbrec_io::dbr::load(&other).unwrap()),
-            "blink.asm"
-        );
-        assert_eq!(
-            firmware_of(&dunbrec_io::dbr::load(&deep).unwrap()),
-            "../blink.asm"
-        );
-        assert_eq!(
-            firmware_of(&dunbrec_io::dbr::load(&unrelated).unwrap()),
-            "builtin:blink"
-        );
-        assert_eq!(
-            firmware_of(&dunbrec_io::dbr::load(&top).unwrap()),
-            "main.asm"
-        );
-
-        // The caller does the open one in memory, with its open source.
-        let mut s = dunbrec_io::dbr::load(&top).unwrap();
-        s.sources.insert(
-            "main.asm".into(),
-            SourceFile {
-                language: SourceLanguage::Asm,
-                text: "nop\n".into(),
-            },
-        );
-        let n = rewrite_refs(
-            &mut s,
-            &root,
-            &root,
-            &root.join("main.asm"),
-            &root.join("blink.asm"),
-        );
-        assert_eq!(n, 2);
-        assert_eq!(firmware_of(&s), "blink.asm");
-        assert!(s.sources.contains_key("blink.asm") && !s.sources.contains_key("main.asm"));
-        std::fs::remove_dir_all(&root).unwrap();
-    }
-
-    #[test]
-    fn renaming_a_folder_updates_references_into_it() {
-        let root = scratch("rename-dir");
-        std::fs::create_dir_all(root.join("fw")).unwrap();
-        std::fs::write(root.join("fw").join("blink.asm"), "nop\n").unwrap();
-        // One schematic outside the folder, one inside it using a file
-        // outside the folder and one inside.
-        std::fs::write(root.join("lib.asm"), "nop\n").unwrap();
-        let outside = root.join("a.dbr");
-        let inside = root.join("fw").join("b.dbr");
-        let mut both = schematic_with("blink.asm");
-        both.add_component(mcu("../lib.asm"), Point::new(10, 0));
-        dunbrec_io::dbr::save(&schematic_with("fw/blink.asm"), &outside).unwrap();
-        dunbrec_io::dbr::save(&both, &inside).unwrap();
-
-        let r = rename(&root, &root.join("fw"), &root.join("firmware"), None).unwrap();
-        assert_eq!(r.rewritten, std::slice::from_ref(&outside));
-        assert_eq!(
-            firmware_of(&dunbrec_io::dbr::load(&outside).unwrap()),
-            "firmware/blink.asm"
-        );
-        // Inside the folder both references still work unchanged.
-        let moved = dunbrec_io::dbr::load(root.join("firmware").join("b.dbr")).unwrap();
-        assert_eq!(
-            referenced_files(&moved),
-            BTreeSet::from(["blink.asm".to_string(), "../lib.asm".to_string()])
-        );
-        assert!(rename(&root, &root.join("a.dbr"), &root.join("firmware"), None).is_err());
-        std::fs::remove_dir_all(&root).unwrap();
-    }
-
-    #[test]
     fn old_embedded_sources_move_out_into_files() {
         let root = scratch("extract");
         let mut s = schematic_with("source:main");
@@ -1075,6 +1088,314 @@ loop: rjmp loop
         );
         assert_eq!(embedded_count(&s), 0);
         assert!(s.sources.contains_key("main2.asm") && s.sources.contains_key("fade.ino"));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A project in a scratch folder, with `Circuit 1` and the files named.
+    fn project_in(root: &Path, files: &[&str]) -> Project {
+        let file = root.join("Test.dbrproj");
+        let (mut project, _) = Project::create(&file).unwrap();
+        for name in files {
+            let path = root.join(name);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            if !path.exists() {
+                std::fs::write(&path, "").unwrap();
+            }
+            project.add_file(&path).unwrap();
+        }
+        project
+    }
+
+    #[test]
+    fn a_new_project_is_a_file_with_a_first_circuit_beside_it() {
+        let root = scratch("new");
+        let file = root.join("Blinker");
+        let (project, circuit) = Project::create(&file).unwrap();
+        // The extension is added, and the circuit sits beside the project file.
+        assert_eq!(project.file, root.join("Blinker.dbrproj"));
+        assert_eq!(circuit, root.join("Circuit 1.dbr"));
+        assert!(project.file.is_file() && circuit.is_file());
+        assert_eq!(project.name(), "Blinker");
+        assert!(
+            dunbrec_io::dbr::load(&circuit)
+                .unwrap()
+                .components
+                .is_empty()
+        );
+        assert_eq!(project.files(), std::slice::from_ref(&circuit));
+        // Open again: the same list.
+        let again = Project::open(&project.file).unwrap();
+        assert_eq!(again.files(), project.files());
+        // Never on top of an existing project, and never over other files in
+        // the folder: the next circuit name is used.
+        assert!(
+            Project::create(&root.join("Blinker.dbrproj"))
+                .unwrap_err()
+                .contains("already exists")
+        );
+        let (_, second) = Project::create(&root.join("Second")).unwrap();
+        assert_eq!(second, root.join("Circuit 2.dbr"));
+        assert!(Project::create(&root.join("bad:name")).is_err());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn the_project_file_is_readable_and_checked() {
+        let root = scratch("file");
+        let (project, _) = Project::create(&root.join("P")).unwrap();
+        let text = std::fs::read_to_string(&project.file).unwrap();
+        assert!(
+            text.contains("\"files\"") && text.contains("Circuit 1.dbr"),
+            "{text}"
+        );
+        // Not a project file, and one from the future.
+        std::fs::write(root.join("junk.dbrproj"), "hello").unwrap();
+        assert!(
+            Project::open(&root.join("junk.dbrproj"))
+                .unwrap_err()
+                .contains("not a Dunbrec project")
+        );
+        std::fs::write(root.join("new.dbrproj"), "{\"version\": 99}").unwrap();
+        assert!(
+            Project::open(&root.join("new.dbrproj"))
+                .unwrap_err()
+                .contains("newer")
+        );
+        assert!(
+            Project::open(&root.join("missing.dbrproj"))
+                .unwrap_err()
+                .contains("cannot read")
+        );
+        // A project file with only some fields still opens.
+        std::fs::write(root.join("min.dbrproj"), "{}").unwrap();
+        assert!(
+            Project::open(&root.join("min.dbrproj"))
+                .unwrap()
+                .files()
+                .is_empty()
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn only_listed_files_show_and_the_tree_follows_their_folders() {
+        let root = scratch("tree");
+        std::fs::write(root.join("not mine.txt"), "").unwrap();
+        std::fs::write(root.join("other.dbr"), "").unwrap();
+        let mut project = project_in(
+            &root,
+            &[
+                "fw/blink.ino",
+                "fw/blink.hex",
+                "fw/util.h",
+                "main.asm",
+                "notes.txt",
+                "Aaa.dbr",
+            ],
+        );
+        let names: Vec<&str> = project.entries.iter().map(|e| e.name.as_str()).collect();
+        // Folders first; the files the folder holds that are not listed are absent.
+        assert_eq!(
+            names,
+            ["fw", "Aaa.dbr", "Circuit 1.dbr", "main.asm", "notes.txt"]
+        );
+        let inner: Vec<(&str, EntryKind)> = project.entries[0]
+            .children
+            .iter()
+            .map(|e| (e.name.as_str(), e.kind))
+            .collect();
+        assert_eq!(
+            inner,
+            [
+                ("blink.hex", EntryKind::Hex),
+                ("blink.ino", EntryKind::Source(SourceLanguage::Cpp)),
+                ("util.h", EntryKind::Header),
+            ]
+        );
+        assert_eq!(project.schematics().len(), 2);
+        assert!(project.contains(&root.join("fw").join("blink.ino")));
+        assert!(!project.contains(&root.join("other.dbr")));
+        // A listed file that is gone shows as missing; a folder with
+        // nothing listed shows when it was added.
+        std::fs::remove_file(root.join("main.asm")).unwrap();
+        std::fs::create_dir(root.join("empty")).unwrap();
+        project.add_folder(&root.join("empty")).unwrap();
+        let find = |p: &Project, name: &str| p.entries.iter().find(|e| e.name == name).cloned();
+        assert!(find(&project, "main.asm").unwrap().missing);
+        assert!(!find(&project, "notes.txt").unwrap().missing);
+        assert_eq!(find(&project, "empty").unwrap().kind, EntryKind::Folder);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn files_are_added_and_removed_without_touching_the_disk() {
+        let root = scratch("addremove");
+        let mut project = project_in(&root, &["a.asm", "sub/b.asm", "sub/c.ino"]);
+        assert_eq!(project.files().len(), 4);
+        // Adding what is listed already changes nothing.
+        assert!(!project.add_file(&root.join("a.asm")).unwrap());
+        std::fs::write(root.join("new.asm"), "").unwrap();
+        assert_eq!(
+            project
+                .add_files(&[root.join("a.asm"), root.join("new.asm")])
+                .unwrap(),
+            1
+        );
+        // Remove one file, then a folder with what is listed in it.
+        assert_eq!(project.remove(&root.join("a.asm")).unwrap(), 1);
+        assert!(root.join("a.asm").is_file(), "the file stays on disk");
+        assert_eq!(project.remove(&root.join("sub")).unwrap(), 2);
+        assert!(root.join("sub").join("b.asm").is_file());
+        assert!(project.entries.iter().all(|e| e.name != "sub"));
+        // The list is saved each time.
+        let again = Project::open(&project.file).unwrap();
+        assert_eq!(again.files(), project.files());
+        // A file outside the project's folder is listed with a relative path.
+        let outside = root.parent().unwrap().join("outside-dunbrec.asm");
+        std::fs::write(&outside, "").unwrap();
+        project.add_file(&outside).unwrap();
+        assert!(project.contains(&outside));
+        assert!(project.entries.iter().any(|e| e.name.starts_with("../")));
+        std::fs::remove_file(&outside).unwrap();
+        // Delete takes it off the disk too.
+        delete(&mut project, &root.join("new.asm")).unwrap();
+        assert!(!root.join("new.asm").exists() && !project.contains(&root.join("new.asm")));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn renaming_a_source_keeps_the_project_and_every_schematic_pointing_at_it() {
+        let root = scratch("rename");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("main.asm"), "nop\n").unwrap();
+        // Schematics using main.asm: two beside it, one in a subfolder; plus
+        // one that does not use it.
+        let top = root.join("top.dbr");
+        let other = root.join("other.dbr");
+        let deep = root.join("sub").join("deep.dbr");
+        let unrelated = root.join("unrelated.dbr");
+        dunbrec_io::dbr::save(&schematic_with("main.asm"), &top).unwrap();
+        dunbrec_io::dbr::save(&schematic_with("main.asm"), &other).unwrap();
+        dunbrec_io::dbr::save(&schematic_with("../main.asm"), &deep).unwrap();
+        dunbrec_io::dbr::save(&schematic_with("builtin:blink"), &unrelated).unwrap();
+        let mut project = project_in(&root, &[]);
+        let all = [&top, &other, &deep, &unrelated, &root.join("main.asm")];
+        project.add_files(&all.map(|p| p.to_path_buf())).unwrap();
+
+        let renamed = rename(
+            &mut project,
+            &root.join("main.asm"),
+            &root.join("blink.asm"),
+            Some(&top),
+        )
+        .unwrap();
+        assert!(root.join("blink.asm").is_file() && !root.join("main.asm").exists());
+        // The project lists the new name.
+        assert!(
+            project.contains(&root.join("blink.asm")) && !project.contains(&root.join("main.asm"))
+        );
+        assert!(
+            Project::open(&project.file)
+                .unwrap()
+                .contains(&root.join("blink.asm"))
+        );
+        // The open schematic is left for the caller; the others follow.
+        let mut files: Vec<_> = renamed
+            .rewritten
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        files.sort();
+        assert_eq!(files, ["deep.dbr", "other.dbr"]);
+        assert_eq!(
+            firmware_of(&dunbrec_io::dbr::load(&other).unwrap()),
+            "blink.asm"
+        );
+        assert_eq!(
+            firmware_of(&dunbrec_io::dbr::load(&deep).unwrap()),
+            "../blink.asm"
+        );
+        assert_eq!(
+            firmware_of(&dunbrec_io::dbr::load(&unrelated).unwrap()),
+            "builtin:blink"
+        );
+        assert_eq!(
+            firmware_of(&dunbrec_io::dbr::load(&top).unwrap()),
+            "main.asm"
+        );
+
+        // The caller does the open one in memory, with its open source.
+        let mut s = dunbrec_io::dbr::load(&top).unwrap();
+        s.sources.insert(
+            "main.asm".into(),
+            SourceFile {
+                language: SourceLanguage::Asm,
+                text: "nop\n".into(),
+            },
+        );
+        let n = rewrite_refs(
+            &mut s,
+            &root,
+            &root,
+            &root.join("main.asm"),
+            &root.join("blink.asm"),
+        );
+        assert_eq!(n, 2);
+        assert_eq!(firmware_of(&s), "blink.asm");
+        assert!(s.sources.contains_key("blink.asm") && !s.sources.contains_key("main.asm"));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn renaming_a_folder_updates_the_list_and_references_into_it() {
+        let root = scratch("rename-dir");
+        std::fs::create_dir_all(root.join("fw")).unwrap();
+        std::fs::write(root.join("fw").join("blink.asm"), "nop\n").unwrap();
+        std::fs::write(root.join("lib.asm"), "nop\n").unwrap();
+        // One schematic outside the folder, one inside it using a file
+        // outside the folder and one inside.
+        let outside = root.join("a.dbr");
+        let inside = root.join("fw").join("b.dbr");
+        let mut both = schematic_with("blink.asm");
+        both.add_component(mcu("../lib.asm"), Point::new(10, 0));
+        dunbrec_io::dbr::save(&schematic_with("fw/blink.asm"), &outside).unwrap();
+        dunbrec_io::dbr::save(&both, &inside).unwrap();
+        let mut project = project_in(&root, &[]);
+        project
+            .add_files(&[
+                outside.clone(),
+                inside.clone(),
+                root.join("fw").join("blink.asm"),
+                root.join("lib.asm"),
+            ])
+            .unwrap();
+
+        let r = rename(&mut project, &root.join("fw"), &root.join("firmware"), None).unwrap();
+        assert_eq!(r.rewritten, std::slice::from_ref(&outside));
+        assert_eq!(
+            firmware_of(&dunbrec_io::dbr::load(&outside).unwrap()),
+            "firmware/blink.asm"
+        );
+        // The list followed the folder.
+        assert!(project.contains(&root.join("firmware").join("b.dbr")));
+        assert!(!project.contains(&root.join("fw").join("b.dbr")));
+        // Inside the folder both references still work unchanged.
+        let moved = dunbrec_io::dbr::load(root.join("firmware").join("b.dbr")).unwrap();
+        assert_eq!(
+            referenced_files(&moved),
+            BTreeSet::from(["blink.asm".to_string(), "../lib.asm".to_string()])
+        );
+        assert!(
+            rename(
+                &mut project,
+                &root.join("a.dbr"),
+                &root.join("firmware"),
+                None
+            )
+            .is_err()
+        );
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

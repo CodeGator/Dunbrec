@@ -105,7 +105,12 @@ pub enum Command {
         from: PathBuf,
         to: PathBuf,
     },
+    /// Take a file or folder out of the project, leaving it on the disk.
+    RemoveFromProject(PathBuf),
+    /// Delete a file or folder from the disk (and so from the project).
     Delete(PathBuf),
+    /// Pick existing files to add to the project.
+    AddExisting,
     Refresh,
     MoveSourcesToFiles,
     /// Take a project off the recent list.
@@ -182,27 +187,34 @@ impl ProjectPanel {
                     .sense(egui::Sense::click()),
             )
             .on_hover_text(format!(
-                "{}
-Right-click to add to the project",
-                project.root.display()
+                "{}\nRight-click to add to the project",
+                project.file.display()
             ))
-            .context_menu(|ui| self.new_menu(ui, &project.root));
+            .context_menu(|ui| {
+                if let Some(command) = self.root_menu(ui, &project.root) {
+                    out = Some(command);
+                }
+            });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
                     .small_button("✕")
-                    .on_hover_text("Close the project (its files stay where they are)")
+                    .on_hover_text("Close the project (no file is touched)")
                     .clicked()
                 {
                     out = Some(Command::CloseProject);
                 }
                 if ui
                     .small_button("⟳")
-                    .on_hover_text("Look at the folder again")
+                    .on_hover_text("Read the project file and look at the disk again")
                     .clicked()
                 {
                     out = Some(Command::Refresh);
                 }
-                ui.menu_button("＋ New", |ui| self.new_menu(ui, &project.root));
+                ui.menu_button("＋ Add", |ui| {
+                    if let Some(command) = self.new_menu(ui, &project.root) {
+                        out = Some(command);
+                    }
+                });
             });
         });
         ui.separator();
@@ -240,7 +252,11 @@ Right-click to add to the project",
             ui.id().with("project_background"),
             egui::Sense::click(),
         )
-        .context_menu(|ui| self.new_menu(ui, &project.root));
+        .context_menu(|ui| {
+            if let Some(command) = self.root_menu(ui, &project.root) {
+                out = Some(command);
+            }
+        });
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -268,13 +284,35 @@ Right-click to add to the project",
                     out = Some(command);
                 }
                 header.header_response.context_menu(|ui| {
-                    self.new_menu(ui, &e.path);
+                    if let Some(command) = self.new_menu(ui, &e.path) {
+                        out = Some(command);
+                    }
                     ui.separator();
-                    self.rename_delete(ui, e);
+                    if let Some(command) = self.rename_delete(ui, e) {
+                        out = Some(command);
+                    }
                 });
                 continue;
             }
             let selected = current.is_some_and(|c| same(c, &e.path));
+            if e.missing {
+                // Listed, but not on the disk: all that can be done is to
+                // take it out of the project.
+                let row = ui
+                    .selectable_label(
+                        false,
+                        RichText::new(format!("⚠ {}", e.name))
+                            .color(Color32::from_rgb(225, 70, 70)),
+                    )
+                    .on_hover_text("This file is in the project but not on the disk");
+                row.context_menu(|ui| {
+                    if ui.button("Remove from project").clicked() {
+                        out = Some(Command::RemoveFromProject(e.path.clone()));
+                        ui.close();
+                    }
+                });
+                continue;
+            }
             let openable = matches!(e.kind, EntryKind::Schematic | EntryKind::Source(_));
             let mut label = RichText::new(format!("{} {}", icon(e.kind), shown_name(e)));
             if !openable {
@@ -303,14 +341,18 @@ Right-click to add to the project",
                     out = Some(command);
                     ui.close();
                 }
-                self.rename_delete(ui, e);
+                if let Some(command) = self.rename_delete(ui, e) {
+                    out = Some(command);
+                }
             });
         }
         out
     }
 
-    /// The entries that add something to the folder `dir`.
-    fn new_menu(&mut self, ui: &mut Ui, dir: &Path) {
+    /// The entries that add something to the project, in the folder `dir`:
+    /// a new file or folder, or a file that exists already.
+    fn new_menu(&mut self, ui: &mut Ui, dir: &Path) -> Option<Command> {
+        let mut out = None;
         for what in Create::ALL {
             if ui.button(what.menu_label()).clicked() {
                 self.form = Some(Form::Create {
@@ -322,9 +364,32 @@ Right-click to add to the project",
                 ui.close();
             }
         }
+        ui.separator();
+        if ui
+            .button("Add existing file…")
+            .on_hover_text("List files that are already on the disk as part of the project")
+            .clicked()
+        {
+            out = Some(Command::AddExisting);
+            ui.close();
+        }
+        out
     }
 
-    fn rename_delete(&mut self, ui: &mut Ui, e: &Entry) {
+    /// The menu of the project's name and of empty space.
+    fn root_menu(&mut self, ui: &mut Ui, root: &Path) -> Option<Command> {
+        let mut out = self.new_menu(ui, root);
+        ui.separator();
+        if ui.button("Close project").clicked() {
+            out = Some(Command::CloseProject);
+            ui.close();
+        }
+        out
+    }
+
+    /// Rename, take out of the project, and delete from the disk.
+    fn rename_delete(&mut self, ui: &mut Ui, e: &Entry) -> Option<Command> {
+        let mut out = None;
         if ui.button("Rename…").clicked() {
             self.form = Some(Form::Rename {
                 path: e.path.clone(),
@@ -333,12 +398,21 @@ Right-click to add to the project",
             });
             ui.close();
         }
-        if ui.button("Delete…").clicked() {
+        if ui
+            .button("Remove from project")
+            .on_hover_text("The file stays on the disk")
+            .clicked()
+        {
+            out = Some(Command::RemoveFromProject(e.path.clone()));
+            ui.close();
+        }
+        if ui.button("Delete from disk…").clicked() {
             self.form = Some(Form::Delete {
                 path: e.path.clone(),
             });
             ui.close();
         }
+        out
     }
 
     /// The small form for a name or a confirmation, above the tree.
@@ -484,8 +558,8 @@ fn no_project(ui: &mut Ui, recent: &[PathBuf]) -> Option<Command> {
     ui.label(RichText::new("No project open").strong());
     ui.label(
         RichText::new(
-            "A project is a folder that keeps a design's schematics and firmware source \
-             files together.",
+            "A project is a file that lists a design's schematics and firmware source \
+             files, so they are kept together. The files can be anywhere you like.",
         )
         .weak(),
     );
@@ -509,7 +583,7 @@ fn no_project(ui: &mut Ui, recent: &[PathBuf]) -> Option<Command> {
             }
         });
         for path in recent {
-            let name = path.file_name().map_or_else(
+            let name = path.file_stem().map_or_else(
                 || path.display().to_string(),
                 |n| n.to_string_lossy().into_owned(),
             );
@@ -576,7 +650,15 @@ mod tests {
         assert_eq!(draw(&mut panel, &none), None);
 
         let dir = scratch();
-        let project = Project::open(&dir).unwrap();
+        let (mut project, _) = Project::create(&dir.join("P")).unwrap();
+        project
+            .add_files(&[
+                dir.join("fw").join("main.asm"),
+                dir.join("fw").join("blink.ino"),
+                dir.join("a.dbr"),
+                dir.join("gone.asm"),
+            ])
+            .unwrap();
         let view = View {
             project: Some(&project),
             recent: &recent,
@@ -617,6 +699,7 @@ mod tests {
             path: PathBuf::from(name),
             kind: crate::project::kind_of(name),
             children: Vec::new(),
+            missing: false,
         };
         assert_eq!(shown_name(&entry("Blinker.dbr")), "Blinker");
         assert_eq!(shown_name(&entry("main.asm")), "main.asm");

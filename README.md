@@ -18,7 +18,7 @@ powershell -ExecutionPolicy Bypass -File tools\build-installer.ps1
 ```
 
 This produces `target\installer\Dunbrec-<version>-x64.msi`, which installs Dunbrec to Program
-Files, adds a Start-menu shortcut and opens `.dbr` files with Dunbrec. Or run from source:
+Files, adds a Start-menu shortcut and opens `.dbr` and `.dbrproj` files with Dunbrec. Or run from source:
 
 ```sh
 cargo run --release -p dunbrec-app                     # empty schematic
@@ -135,22 +135,30 @@ time, the 32 registers (changed ones highlighted), and a view of data memory. It
 the circuit has seen at the stop, not a live view of a running chip. Breakpoints are kept per
 part for the session; *Clear all breakpoints* removes them all.
 
-**Projects.** A project is a folder that keeps a design's schematics and firmware source files
-together: any number of `.dbr` schematics, and the `.asm` / `.ino` sources they use, as ordinary
-files that other editors, Git and `arduino-cli` see as they are. File → *New project…* asks where
-to make it (a folder dialog) and then for the project's name; that becomes a new folder with a
-first circuit, `Circuit 1`, in it; *Open project…* (and *Open
-recent project*) picks an existing folder, and the app reopens the last project at start.
-A project can be taken off the recent list (✕ beside it) or the whole list cleared. The
-**Project** panel (View → Panels; it opens beside the palette) shows the folder as a tree.
-Circuits are listed by name, sources with their extension. Double-click a circuit to open it, or
-a source file to open it in the Code panel. Right-click the project's name, a folder or empty
-space to add a circuit, assembly file, Arduino sketch or folder (the ＋ New button does the same);
-right-click a file or folder to rename or delete it (circuits that use a renamed source are
-updated to the new name, a folder rename included).
-Coming back to the window rescans the folder and takes up edits made in other programs, unless
-the open schematic has unsaved changes. Schematics saved by older versions keep their sources
-inside the `.dbr`; the panel offers *Move to files in this folder* for those.
+**Projects.** A project is a small file (`My amp.dbrproj`) that lists a design's circuits and
+firmware source files, so they are kept together. You make it wherever you like; the files it
+lists can be in its folder, in subfolders, or anywhere else, and anything else in that folder is
+simply not part of the project and is never shown. The files are ordinary files (`.dbr` circuits,
+`.asm` and `.ino` sources) that other editors, Git and `arduino-cli` see as they are. File → *New
+project…* is a Save dialog: pick or make a folder and name the project; it creates the project
+file and a first circuit, `Circuit 1`, beside it. *Open project…* (and *Open recent project*)
+opens a `.dbrproj` (double-clicking one does too, once installed), and the app reopens the last
+project at start. A project can be taken off the recent list (✕ beside it) or the whole list
+cleared.
+
+The **Project** panel (View → Panels; it opens beside the palette) shows the project's name and
+the files it lists, in folders as they are on disk. Circuits are listed by name, sources with
+their extension. Double-click a circuit to open it, or a source file to open it in the Code
+panel. Right-click the project's name, a folder or empty space to add: a new circuit, assembly
+file, Arduino sketch or folder (made on disk and listed), or *Add existing file…* for files that
+are already there (the ＋ Add button does the same). Right-click a file or folder to rename it
+(circuits that use a renamed source are updated, a folder rename included), to **Remove from
+project** (the file stays on disk), or to **Delete from disk**. A listed file that has gone from
+the disk shows in red with a ⚠. New source files made from the Code panel are added to the project
+when the schematic is saved. Coming back to the window re-reads the project file and takes up
+edits made to the sources in other programs, unless the open schematic has unsaved changes.
+Schematics saved by older versions keep their sources inside the `.dbr`; the panel offers *Move
+to files in this folder* for those.
 
 **Writing firmware in assembly.** View → Panels → *Code* opens an editor tab beside the
 schematic for AVR assembly. A source is a file beside the schematic (`main.asm`, or in a

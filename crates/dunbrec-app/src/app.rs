@@ -77,17 +77,6 @@ enum Pending {
     Quit,
 }
 
-/// The "New project" dialog: where the project folder is made, and what it
-/// is called.
-struct NewProject {
-    parent: PathBuf,
-    name: String,
-    /// Why the last attempt failed.
-    error: Option<String>,
-    /// Select the name when the dialog first draws.
-    fresh: bool,
-}
-
 /// DC operating point shown on the canvas and in the results panel.
 struct DcResults {
     generation: u64,
@@ -154,8 +143,6 @@ pub struct DunbrecApp {
     // ---- projects ----
     /// The open project folder.
     project: Option<Project>,
-    /// The name being asked for a new project, once its place is chosen.
-    new_project: Option<NewProject>,
     project_panel: ProjectPanel,
     /// Whether the window had the focus last frame: getting it back
     /// rescans the project and picks up edits made in other programs.
@@ -197,8 +184,9 @@ impl DunbrecApp {
     pub fn new(
         cc: &eframe::CreationContext<'_>,
         initial: Option<(Schematic, Option<PathBuf>)>,
+        initial_project: Option<PathBuf>,
     ) -> Self {
-        let settings: Settings = cc
+        let mut settings: Settings = cc
             .storage
             .and_then(|s| eframe::get_value(s, STORAGE_KEY))
             .unwrap_or_default();
@@ -224,13 +212,18 @@ impl DunbrecApp {
         let netlist = build_netlist(doc.schematic());
         let node_map = NodeMap::new(doc.schematic(), &netlist);
         let tags = node_tag_positions(doc.schematic(), &netlist);
-        let project = settings
-            .project
-            .as_deref()
-            .and_then(|root| Project::open(root).ok());
+        let project = match settings.project.clone() {
+            Some(file) => match Project::open(&file) {
+                Ok(p) => Some(p),
+                Err(_) => {
+                    settings.forget_project(&file);
+                    None
+                }
+            },
+            None => None,
+        };
         let mut app = Self {
             project,
-            new_project: None,
             project_panel: ProjectPanel::default(),
             was_focused: true,
             dock,
@@ -269,6 +262,9 @@ impl DunbrecApp {
         };
         if app.project.is_some() {
             dock::open(&mut app.dock, Pane::Project);
+        }
+        if let Some(file) = initial_project {
+            app.open_project_and_schematic(&file);
         }
         if !startup_problems.is_empty() {
             app.message = Some(source_problems(&startup_problems));
@@ -457,17 +453,25 @@ impl DunbrecApp {
         }
         // Firmware source files are saved as files beside the schematic, and
         // the schematic itself keeps only the names.
-        if let Some(dir) = path.parent()
-            && let Err(e) = project::write_sources(self.doc.schematic(), dir)
-        {
-            self.message = Some(Message::error("Could not save the source files", e));
-            return false;
+        let mut written = Vec::new();
+        if let Some(dir) = path.parent() {
+            match project::write_sources(self.doc.schematic(), dir) {
+                Ok(names) => written = names.into_iter().map(|n| dir.join(n)).collect(),
+                Err(e) => {
+                    self.message = Some(Message::error("Could not save the source files", e));
+                    return false;
+                }
+            }
         }
         match dunbrec_io::dbr::save(&project::for_saving(self.doc.schematic()), &path) {
             Ok(()) => {
                 self.settings.remember(&path);
-                self.doc.mark_saved(path);
+                self.doc.mark_saved(path.clone());
+                // New source files of a schematic in the project are the project's.
                 if let Some(p) = &mut self.project {
+                    if p.contains(&path) && !written.is_empty() {
+                        let _ = p.add_files(&written);
+                    }
                     p.refresh();
                 }
                 true
@@ -481,28 +485,30 @@ impl DunbrecApp {
 
     // ------------------------------------------------------ projects ---
 
-    /// Make `root` the open project and show its panel.
-    fn open_project(&mut self, root: &std::path::Path) {
-        match Project::open(root) {
-            Ok(p) => {
-                self.settings.remember_project(root);
-                self.project = Some(p);
-                dock::open(&mut self.dock, Pane::Project);
-                if let Some(at) = self.dock.find_tab(&Pane::Project) {
-                    self.dock.set_active_tab(at);
-                }
-            }
+    /// Make the project file `file` the open project and show its panel.
+    fn open_project(&mut self, file: &std::path::Path) {
+        match Project::open(file) {
+            Ok(p) => self.show_project(p),
             Err(e) => {
-                self.settings.forget_project(root);
+                self.settings.forget_project(file);
                 self.message = Some(Message::error("Could not open the project", e));
             }
         }
     }
 
-    /// Open a project folder; if it holds a single schematic and none of
-    /// the project is open yet, open that too.
-    fn open_project_and_schematic(&mut self, root: &std::path::Path) {
-        self.open_project(root);
+    fn show_project(&mut self, project: Project) {
+        self.settings.remember_project(&project.file);
+        self.project = Some(project);
+        dock::open(&mut self.dock, Pane::Project);
+        if let Some(at) = self.dock.find_tab(&Pane::Project) {
+            self.dock.set_active_tab(at);
+        }
+    }
+
+    /// Open a project file; if it lists a single schematic and none of the
+    /// project is open yet, open that too.
+    fn open_project_and_schematic(&mut self, file: &std::path::Path) {
+        self.open_project(file);
         let Some(project) = &self.project else { return };
         let inside = self.doc.path().is_some_and(|p| project.contains(p));
         if let [only] = project.schematics().as_slice()
@@ -513,45 +519,34 @@ impl DunbrecApp {
     }
 
     fn pick_and_open_project(&mut self) {
-        if let Some(dir) = rfd::FileDialog::new()
-            .set_title("Open project folder")
-            .pick_folder()
+        if let Some(file) = rfd::FileDialog::new()
+            .set_title("Open project")
+            .add_filter("Dunbrec project", &[project::EXTENSION])
+            .pick_file()
         {
-            self.open_project_and_schematic(&dir);
+            self.open_project_and_schematic(&file);
         }
     }
 
-    /// First step of a new project: choose the folder it will be made in.
-    /// (The system folder dialog only picks folders that exist, so the
-    /// project's own name is asked for next, in the app.)
+    /// Make a project: the usual Save dialog (which can make a folder, or
+    /// pick any existing one) names the project file; a first circuit is made
+    /// beside it and both are opened.
     fn new_project(&mut self) {
-        let Some(parent) = rfd::FileDialog::new()
-            .set_title("New project: choose the folder to make it in")
-            .pick_folder()
+        let Some(file) = rfd::FileDialog::new()
+            .set_title("New project")
+            .add_filter("Dunbrec project", &[project::EXTENSION])
+            .set_file_name("My project")
+            .save_file()
         else {
             return;
         };
-        self.new_project = Some(NewProject {
-            name: project::suggest_project_name(&parent),
-            parent,
-            error: None,
-            fresh: true,
-        });
-    }
-
-    /// Second step: make the project folder with a first circuit in it, and
-    /// open them. On failure the reason is kept for the dialog.
-    fn create_project(&mut self, form: &mut NewProject) -> bool {
-        let dir = form.parent.join(form.name.trim());
-        match project::create_project(&dir) {
-            Ok(first) => {
-                self.open_project(&dir);
+        match Project::create(&file) {
+            Ok((project, first)) => {
+                self.show_project(project);
                 self.request(Pending::OpenPath(first));
-                true
             }
             Err(e) => {
-                form.error = Some(e);
-                false
+                self.message = Some(Message::error("Could not create the project", e));
             }
         }
     }
@@ -580,8 +575,16 @@ impl DunbrecApp {
                 };
                 match made {
                     Ok(path) => {
+                        // What is made here belongs to the project.
                         if let Some(p) = &mut self.project {
-                            p.refresh();
+                            let listed = match what {
+                                Create::Folder => p.add_folder(&path),
+                                _ => p.add_file(&path).map(|_| ()),
+                            };
+                            if let Err(e) = listed {
+                                self.message =
+                                    Some(Message::error("Could not update the project file", e));
+                            }
                         }
                         match what {
                             Create::Schematic => self.request(Pending::OpenPath(path)),
@@ -592,12 +595,37 @@ impl DunbrecApp {
                     Err(e) => self.message = Some(Message::error("Could not create it", e)),
                 }
             }
+            C::AddExisting => self.add_existing_files(),
+            C::RemoveFromProject(path) => {
+                if let Some(p) = &mut self.project
+                    && let Err(e) = p.remove(&path)
+                {
+                    self.message = Some(Message::error("Could not update the project file", e));
+                }
+            }
             C::Rename { from, to } => self.rename_in_project(&from, &to),
             C::Delete(path) => self.delete_in_project(&path),
             C::Refresh => self.refresh_project(),
             C::MoveSourcesToFiles => self.move_sources_to_files(),
             C::ForgetProject(path) => self.settings.forget_project(&path),
             C::ClearRecentProjects => self.settings.clear_recent_projects(),
+        }
+    }
+
+    /// Pick files that exist and list them in the project.
+    fn add_existing_files(&mut self) {
+        let Some(project) = self.project.as_mut() else {
+            return;
+        };
+        let Some(paths) = rfd::FileDialog::new()
+            .set_title("Add files to the project")
+            .set_directory(&project.root)
+            .pick_files()
+        else {
+            return;
+        };
+        if let Err(e) = project.add_files(&paths) {
+            self.message = Some(Message::error("Could not update the project file", e));
         }
     }
 
@@ -626,11 +654,11 @@ impl DunbrecApp {
     }
 
     fn rename_in_project(&mut self, from: &std::path::Path, to: &std::path::Path) {
-        let Some(root) = self.project.as_ref().map(|p| p.root.clone()) else {
+        let open = self.doc.path().map(|p| p.to_path_buf());
+        let Some(project) = self.project.as_mut() else {
             return;
         };
-        let open = self.doc.path().map(|p| p.to_path_buf());
-        if let Err(e) = project::rename(&root, from, to, open.as_deref()) {
+        if let Err(e) = project::rename(project, from, to, open.as_deref()) {
             self.message = Some(Message::error("Could not rename it", e));
             return;
         }
@@ -661,7 +689,10 @@ impl DunbrecApp {
     }
 
     fn delete_in_project(&mut self, path: &std::path::Path) {
-        if let Err(e) = project::delete(path) {
+        let Some(project) = self.project.as_mut() else {
+            return;
+        };
+        if let Err(e) = project::delete(project, path) {
             self.message = Some(Message::error("Could not delete it", e));
             return;
         }
@@ -699,8 +730,12 @@ impl DunbrecApp {
     /// schematic's source files elsewhere (unless it has unsaved changes,
     /// which win).
     fn refresh_project(&mut self) {
-        if let Some(p) = &mut self.project {
+        if let Some(p) = &mut self.project
+            && let Err(e) = p.reload()
+        {
+            // Keep what is open; say why it could not be read again.
             p.refresh();
+            self.message = Some(Message::error("Could not read the project file", e));
         }
         if !self.doc.is_dirty()
             && let Some(dir) = self.firmware_dir()
@@ -729,6 +764,12 @@ impl DunbrecApp {
             Ok(moved) if moved.is_empty() => {}
             Ok(moved) => {
                 self.doc.edit(|s| *s = copy);
+                if let Some(p) = &mut self.project
+                    && self.doc.path().is_some_and(|d| p.contains(d))
+                {
+                    let files: Vec<PathBuf> = moved.iter().map(|(_, f)| dir.join(f)).collect();
+                    let _ = p.add_files(&files);
+                }
                 let list: Vec<String> = moved
                     .iter()
                     .map(|(old, file)| format!("• {old} → {file}"))
@@ -1699,72 +1740,6 @@ impl DunbrecApp {
                 if let (0, Some(at), false) = (choice, at, name.is_empty()) {
                     self.doc.edit(|s| s.add_label(name, at));
                 }
-            }
-        }
-
-        if let Some(mut form) = self.new_project.take() {
-            let mut keep = true;
-            let answer = Dialog {
-                id: "new_project",
-                kind: dialog::Kind::Question,
-                title: "New project",
-                buttons: &["Create", "Cancel"],
-                default: 0,
-                cancel: Some(1),
-            }
-            .show(ctx, |ui| {
-                dialog::paragraph(ui, "Name the project. It is a folder, made in:");
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new(form.parent.display().to_string())
-                            .monospace()
-                            .weak(),
-                    );
-                    if ui.small_button("Change…").clicked()
-                        && let Some(parent) = rfd::FileDialog::new()
-                            .set_title("New project: choose the folder to make it in")
-                            .set_directory(&form.parent)
-                            .pick_folder()
-                    {
-                        form.parent = parent;
-                        form.error = None;
-                    }
-                });
-                ui.add_space(8.0);
-                let r = ui.add(
-                    egui::TextEdit::singleline(&mut form.name)
-                        .hint_text("project name")
-                        .desired_width(f32::INFINITY),
-                );
-                if std::mem::take(&mut form.fresh) {
-                    project_ui::select_all(ui, &r, &form.name);
-                }
-                if r.changed() {
-                    form.error = None;
-                }
-                let problem = match (&form.error, project::valid_name(&form.name)) {
-                    (Some(e), _) => Some(e.clone()),
-                    (None, false) if !form.name.trim().is_empty() => Some(format!(
-                        "“{}” cannot be used as a folder name.",
-                        form.name.trim()
-                    )),
-                    _ => None,
-                };
-                if let Some(p) = problem {
-                    ui.add_space(6.0);
-                    ui.label(RichText::new(p).color(Color32::from_rgb(225, 70, 70)));
-                }
-            });
-            match answer {
-                Some(0) if project::valid_name(&form.name) => {
-                    keep = !self.create_project(&mut form);
-                }
-                Some(0) => form.error = Some("Type a name for the project folder.".into()),
-                Some(_) => keep = false,
-                None => {}
-            }
-            if keep {
-                self.new_project = Some(form);
             }
         }
 

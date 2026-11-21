@@ -152,35 +152,45 @@ Key mechanisms worth knowing before changing the engine:
    - MCU: SPI, I²C, EEPROM, watchdog, serial receive and other chips.
    - Simulation: a fixed temperature of 27 °C, MOSFET level 1 only, and a single logic family.
    - Import: KiCad hierarchical sheets, SPICE `.param` expressions and EXP/SFFM sources.
-8. **Projects** (built in 0.3.0; **not seen on screen yet**). A project is a plain folder; every
-   `.dbr` in it is one of its schematics, and firmware sources are real files beside them.
-   - `project.rs` (no UI, tested against a scratch folder): `scan` the tree, `Project`, create
-     project / schematic / source / folder, `rename` (renames on disk, then rewrites the firmware
-     references in every other `.dbr` of the project with `rewrite_refs`; the open schematic is
-     updated in memory by the app), `delete`, and the source plumbing below.
+8. **Projects** (built in 0.3.0; **not seen on screen yet**). A project is a *file*,
+   `<name>.dbrproj` (JSON, `project::EXTENSION`), listing the project's files relative to its
+   own folder (`files`) and any folders to show while empty (`folders`); `version` 1. The
+   `.dbr` circuits and the `.asm`/`.ino` sources are ordinary files, and the project view shows
+   only what the file lists, so other files in the same folder stay out of it. (The first design
+   was a plain folder; the user preferred a file, because the system folder dialog cannot pick a
+   folder that does not exist yet and a file lets other files share the folder.)
+   - `project.rs` (no UI, tested against a scratch folder): `Project` (`create` writes the
+     project file and `Circuit 1.dbr` beside it, or the next free name; `open`, `save`, `reload`,
+     `add_files`, `add_folder`, `remove` (list only), `moved`, `refresh` which builds the `Entry`
+     tree and marks listed-but-missing files), `rename` (renames on disk, updates the list, then
+     rewrites the firmware references in every other listed `.dbr` with `rewrite_refs`; the open
+     schematic is updated in memory by the app), `delete` (disk and list), and the source
+     plumbing below.
    - **Source files.** A source whose name ends in `.asm`, `.s`, `.ino` or `.cpp`
      (`dunbrec_core::source_language_of`) is a *file*: its key in `Schematic.sources` is its path
      relative to the schematic's folder, with `/`, and a microcontroller's firmware field holds
      the same string. `hydrate` reads the files a schematic refers to when it opens;
      `for_saving` leaves them out of the `.dbr`; `write_sources` writes them on Save (only if the
-     text differs); `sync_from_disk` takes up outside edits. Sources named without such an
-     extension are the older embedded kind (`source:<name>`), still supported;
-     `extract_embedded` moves them into files (the panel's *Move to files* button).
+     text differs; the app then lists new ones in the project); `sync_from_disk` takes up
+     outside edits. Sources named without such an extension are the older embedded kind
+     (`source:<name>`), still supported; `extract_embedded` moves them into files (the panel's
+     *Move to files* button).
    - `dunbrec_sim::load_firmware` accepts `source:<name>`, a path of a source file (from
      `sources` if open, else read from disk beside the schematic) and `.hex`/`builtin:` as before.
    - `project_ui.rs` is the panel (`Pane::Project`, a tab beside the palette): tree, a small
-     form for new/rename/delete, and it returns a `Command` that `DunbrecApp::run_project_command`
-     carries out. File → New project / Open project / Open recent project / Close project. The last
-     project is saved in `Settings.project` and reopened at start. Focus returning to the window
-     rescans (`refresh_project`).
-   - Decisions taken with the user: plain folder (no project file), real source files, a file-tree
-     panel, several schematics per project.
+     form for new/rename/delete, context menus on the name, folders, files and empty space, and it
+     returns a `Command` that `DunbrecApp::run_project_command` carries out. File → New project
+     (Save dialog) / Open project / Open recent project / Close project. The last project file is
+     saved in `Settings.project` and reopened at start (one that cannot be read is forgotten);
+     `dunbrec.exe <file>.dbrproj` opens a project, and the installer associates `.dbrproj`.
+     Focus returning to the window re-reads the file and the sources (`refresh_project`).
    - **Not done yet:** multi-file C++ builds (a sketch folder with several `.cpp`/`.h`; the
      Arduino build still takes one file's text) and a per-project build cache with the `.hex`
      output in an ignorable subfolder; a source file shared by two open schematics is
      read separately by each; the firmware picker lists only sources already open in the
      schematic (open a file from the Project panel to add it); no "reveal in Explorer"; no
-     project-wide search.
+     project-wide search; the installer's `.dbrproj` association is built but not installed or
+     tried.
 
 ## Gotchas
 
