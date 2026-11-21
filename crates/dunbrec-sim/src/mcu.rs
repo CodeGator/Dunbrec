@@ -308,9 +308,12 @@ pub fn load_firmware(
 ",
                 )
             }),
-        SourceLanguage::Cpp => Err(format!(
-            "'{name}' is a C++ sketch, and building sketches is not available yet"
-        )),
+        SourceLanguage::Cpp => dunbrec_mcu::arduino::cached_image(&file.text).ok_or_else(|| {
+            format!(
+                "'{name}' is a C++ sketch that has not been built since it last changed: \
+                 press Build in the Code panel first"
+            )
+        }),
     }
 }
 

@@ -132,6 +132,12 @@ jump to it), and reported by line when the circuit runs. The part's firmware rea
 `source:<name>`. Click a line number to set or clear a breakpoint on it (red dot; an arrow marks the current instruction while the circuit is paused), and the debugger listing shows the source line beside each instruction.
 Macros, `.include` and data or EEPROM segments are not supported yet.
 
+**Writing Arduino C++.** *New…* in the Code panel can also create an Arduino C++ sketch. Sketches
+are built by the Arduino command-line tool, which Dunbrec finds but does not include: install it
+(`winget install ArduinoSA.CLI` on Windows), then run `arduino-cli core install arduino:avr`.
+Press **Build**; compile errors are underlined on their lines and listed under the editor. The
+circuit runs the last build of exactly the text in the file, so build again after a change.
+
 **Parts library.** Besides generic parts, the palette has real ones: the 2N3904 and 2N3906
 transistors and the 1N4148 and 1N750 (4.7 V zener) diodes, using the published manufacturer
 SPICE models. They sit in the group for what they are (Transistors, Diodes), after the generic

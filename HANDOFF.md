@@ -125,12 +125,10 @@ Key mechanisms worth knowing before changing the engine:
    - Needs ngspice installed.
    - Plan: store reference results for fixture circuits and compare within tolerance: about
      0.1 % for DC, bounded RMS error for transients.
-2. **Real Arduino firmware tests.**
-   - No AVR toolchain is installed, so every MCU test program was assembled in-house
-     (`dunbrec_mcu::asm`).
-   - Install Arduino IDE or arduino-cli, build a few sketches (blink, `analogWrite`,
-     `analogRead`, `Serial.print`, `millis`) and add them as golden tests. This is the most
-     valuable remaining check of the emulator.
+2. **Real Arduino firmware tests.** Done for blink, `analogWrite`, `analogRead`, `Serial.print`
+   and `millis` (see `mcu_tests.rs`, "Real Arduino sketches"). They need `arduino-cli` with the
+   `arduino:avr` core and skip without it. Not covered: timer interrupts through `attachInterrupt`
+   and `Timer1`-style libraries, `tone()`, `pulseIn`, `shiftOut`.
 3. **UI verification of phase 11 in the running app.**
    - Covered so far by worker-thread tests and a screenshot of the schematic.
    - Pressing Run and watching the serial monitor in the window has not been done.
@@ -142,7 +140,7 @@ Key mechanisms worth knowing before changing the engine:
    - A CMOS 555 (TLC555) would need different output levels.
    - The ngspice cross-check (item 1) can now also cover the exported 741 subcircuit.
 6. **MCU firmware development** (debugger, assembly text, Arduino C++ builds): phases A and B
-   built; C (Arduino C++ via arduino-cli) and D (more chips) are not. See
+   and C (Arduino C++ via arduino-cli) built; D (more chips) is not. See
    [docs/mcu-firmware-development.md](docs/mcu-firmware-development.md). None of the new
    windows (debugger, code panel) has been looked at on screen yet.
 7. **Not yet supported:**

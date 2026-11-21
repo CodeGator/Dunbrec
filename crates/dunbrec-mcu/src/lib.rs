@@ -22,6 +22,7 @@
 //! demo programs ([`programs`]), which are written with the small
 //! assembler in [`asm`].
 
+pub mod arduino;
 pub mod asm;
 pub mod asm_text;
 mod avr;

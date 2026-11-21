@@ -18,6 +18,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use dunbrec_core::{SourceFile, SourceLanguage};
+use dunbrec_mcu::arduino::{self, BuildError, BuildOutput};
 use dunbrec_mcu::asm_text::{self, AsmError, Assembled, FLASH_WORDS};
 use egui::text::{CCursor, CCursorRange, LayoutJob, TextFormat};
 use egui::{Align, Color32, FontId, Id, RichText, Stroke, Ui};
@@ -44,6 +45,21 @@ delay:  subi    r20, 1
         rjmp    loop
 ";
 
+/// What a new C++ sketch contains.
+pub const STARTER_SKETCH: &str = "\
+// Blink the LED on D13.
+void setup() {
+  pinMode(LED_BUILTIN, OUTPUT);
+}
+
+void loop() {
+  digitalWrite(LED_BUILTIN, HIGH);
+  delay(500);
+  digitalWrite(LED_BUILTIN, LOW);
+  delay(500);
+}
+";
+
 /// A name for a new source file that no file of the schematic has.
 pub fn unused_name(sources: &BTreeMap<String, SourceFile>, base: &str) -> String {
     if !sources.contains_key(base) {
@@ -53,6 +69,14 @@ pub fn unused_name(sources: &BTreeMap<String, SourceFile>, base: &str) -> String
         .map(|n| format!("{base}{n}"))
         .find(|name| !sources.contains_key(name))
         .expect("some number is free")
+}
+
+/// A new Arduino C++ sketch.
+pub fn new_sketch() -> SourceFile {
+    SourceFile {
+        language: SourceLanguage::Cpp,
+        text: STARTER_SKETCH.to_string(),
+    }
 }
 
 /// A new assembly source file: the starter program for the first file of a
@@ -233,7 +257,13 @@ fn byte_of_column(line: &str, col: usize) -> usize {
 }
 
 /// The text as a coloured layout, with the places of `errors` underlined.
-fn highlight(text: &str, font: &FontId, palette: &Palette, errors: &[AsmError]) -> LayoutJob {
+fn highlight(
+    text: &str,
+    asm: bool,
+    font: &FontId,
+    palette: &Palette,
+    errors: &[AsmError],
+) -> LayoutJob {
     let mut job = LayoutJob::default();
     job.text.reserve(text.len());
     for (index, raw) in text.split_inclusive('\n').enumerate() {
@@ -256,7 +286,8 @@ fn highlight(text: &str, font: &FontId, palette: &Palette, errors: &[AsmError]) 
         // Tokens, with the gaps between them filled in and the line ending.
         let mut pieces: Vec<(Range<usize>, Kind)> = Vec::new();
         let mut pos = 0;
-        for (range, kind) in tokenize(line) {
+        let tokens = if asm { tokenize(line) } else { Vec::new() };
+        for (range, kind) in tokens {
             if range.start > pos {
                 pieces.push((pos..range.start, Kind::Plain));
             }
@@ -347,6 +378,22 @@ struct Built {
     result: Result<Assembled, Vec<AsmError>>,
 }
 
+/// A sketch build running on a worker thread.
+struct Building {
+    name: String,
+    text: String,
+    rx: std::sync::mpsc::Receiver<Result<BuildOutput, BuildError>>,
+}
+
+/// How the last build of a sketch ended.
+struct CppBuild {
+    name: String,
+    /// Hash of the text that was built.
+    hash: u64,
+    /// The size of the image, or why there is none.
+    result: Result<usize, BuildError>,
+}
+
 #[derive(Default)]
 pub struct CodeEditor {
     selected: Option<String>,
@@ -355,6 +402,12 @@ pub struct CodeEditor {
     /// A typing session has already recorded its undo step.
     typing: bool,
     built: Option<Built>,
+    /// New files are C++ sketches (the choice in the New… box).
+    new_cpp: bool,
+    /// A sketch being compiled on a worker thread.
+    building: Option<Building>,
+    /// The last finished sketch build.
+    cpp: Option<CppBuild>,
     /// A place (line, column) to move the cursor to on the next frame.
     jump: Option<(usize, usize)>,
 }
@@ -366,6 +419,55 @@ fn hash_of(text: &str) -> u64 {
 }
 
 impl CodeEditor {
+    /// Collect a finished sketch build.
+    fn poll_build(&mut self, ctx: &egui::Context) {
+        let Some(b) = &self.building else { return };
+        let finished = match b.rx.try_recv() {
+            Ok(result) => result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                return;
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err(BuildError::Other("the build stopped unexpectedly".into()))
+            }
+        };
+        let b = self.building.take().expect("checked above");
+        let result = finished.map(|out| {
+            let bytes = out.image.len();
+            arduino::remember(&b.text, out.image);
+            bytes
+        });
+        self.cpp = Some(CppBuild {
+            hash: hash_of(&b.text),
+            name: b.name,
+            result,
+        });
+    }
+
+    /// Compile sketch `name` on a worker thread.
+    fn start_build(&mut self, ctx: &egui::Context, name: &str, text: &str) {
+        let Some(cli) = arduino::find_cli(None) else {
+            self.cpp = Some(CppBuild {
+                name: name.to_string(),
+                hash: hash_of(text),
+                result: Err(BuildError::NoToolchain(arduino::SETUP_HELP.into())),
+            });
+            return;
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (sketch, source, ctx) = (name.to_string(), text.to_string(), ctx.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(arduino::build(&cli, &sketch, &source));
+            ctx.request_repaint();
+        });
+        self.building = Some(Building {
+            name: name.to_string(),
+            text: text.to_string(),
+            rx,
+        });
+    }
+
     /// Show `name` the next time the panel is drawn.
     pub fn select(&mut self, name: &str) {
         self.selected = Some(name.to_string());
@@ -395,6 +497,7 @@ impl CodeEditor {
         debugger: &mut Debugger,
         live: &mut Option<LiveSim>,
     ) {
+        self.poll_build(ui.ctx());
         let names: Vec<String> = doc.schematic().sources.keys().cloned().collect();
         if self.selected.as_ref().is_none_or(|n| !names.contains(n)) {
             self.selected = names.first().cloned();
@@ -431,7 +534,22 @@ impl CodeEditor {
                 .cloned()
                 .unwrap_or_default()
         } else {
-            Vec::new()
+            match &self.cpp {
+                Some(CppBuild {
+                    name: n,
+                    hash,
+                    result: Err(BuildError::Failed { diagnostics, .. }),
+                }) if *n == name && *hash == hash_of(&file.text) => diagnostics
+                    .iter()
+                    .filter(|d| d.error)
+                    .map(|d| AsmError {
+                        line: d.line,
+                        column: d.column.max(1),
+                        message: d.message.clone(),
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            }
         };
 
         if !errors.is_empty() {
@@ -460,14 +578,20 @@ impl CodeEditor {
                         });
                 });
         }
-        if !is_asm {
-            egui::TopBottomPanel::bottom("code_cpp_note").show_inside(ui, |ui| {
-                ui.label(
-                    RichText::new(
-                        "C++ sketches can be edited here, but building them is not available yet.",
-                    )
-                    .weak(),
-                );
+        // A build that could not run (no tool, no core...) is explained in
+        // full, not just flagged.
+        if !is_asm
+            && let Some(CppBuild {
+                name: n,
+                hash,
+                result: Err(e @ (BuildError::NoToolchain(_) | BuildError::Other(_))),
+            }) = &self.cpp
+            && *n == name
+            && *hash == hash_of(&file.text)
+        {
+            let message = e.to_string();
+            egui::TopBottomPanel::bottom("code_build_note").show_inside(ui, |ui| {
+                ui.label(RichText::new(message).color(ERROR_RED));
             });
         }
 
@@ -485,6 +609,16 @@ impl CodeEditor {
                         .desired_width(140.0)
                         .hint_text("main"),
                 );
+                egui::ComboBox::from_id_salt("new_language")
+                    .selected_text(if self.new_cpp {
+                        "Arduino C++"
+                    } else {
+                        "Assembly"
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.new_cpp, false, "Assembly");
+                        ui.selectable_value(&mut self.new_cpp, true, "Arduino C++");
+                    });
                 let name = typed.trim().to_string();
                 let taken = names.contains(&name);
                 let ok = !name.is_empty() && !taken;
@@ -496,7 +630,12 @@ impl CodeEditor {
                 }
                 if create {
                     self.new_name = None;
-                    self.create(doc, &name);
+                    let language = if self.new_cpp {
+                        SourceLanguage::Cpp
+                    } else {
+                        SourceLanguage::Asm
+                    };
+                    self.create_as(doc, &name, language);
                 } else if ui.button("Cancel").clicked() {
                     self.new_name = None;
                 }
@@ -531,6 +670,16 @@ impl CodeEditor {
                     self.selected = None;
                 }
                 ui.separator();
+                let sketch = doc
+                    .schematic()
+                    .sources
+                    .get(&name)
+                    .filter(|f| f.language == SourceLanguage::Cpp)
+                    .map(|f| f.text.clone());
+                if let Some(text) = sketch {
+                    self.build_controls(ui, &name, &text);
+                    return;
+                }
                 match self.built.as_ref().filter(|b| b.name == name) {
                     Some(Built { result: Ok(a), .. }) => {
                         ui.label(
@@ -559,8 +708,66 @@ impl CodeEditor {
         });
     }
 
+    /// The Build button and what it last did, for a C++ sketch.
+    fn build_controls(&mut self, ui: &mut Ui, name: &str, text: &str) {
+        let building = self.building.is_some();
+        if ui
+            .add_enabled(!building, egui::Button::new("Build"))
+            .on_hover_text(
+                "Compile this sketch with arduino-cli. The circuit runs the last build of \
+                 exactly this text, so build again after changing it.",
+            )
+            .clicked()
+        {
+            let ctx = ui.ctx().clone();
+            self.start_build(&ctx, name, text);
+        }
+        if building {
+            ui.spinner();
+            ui.label(RichText::new("Building…").weak());
+            return;
+        }
+        if let Some(image) = arduino::cached_image(text) {
+            ui.label(RichText::new(format!("Built: {} bytes", image.len())).weak());
+            return;
+        }
+        match self
+            .cpp
+            .as_ref()
+            .filter(|c| c.name == name && c.hash == hash_of(text))
+        {
+            Some(CppBuild {
+                result: Err(BuildError::Failed { diagnostics, .. }),
+                ..
+            }) => {
+                let n = diagnostics.iter().filter(|d| d.error).count();
+                ui.label(
+                    RichText::new(if n == 0 {
+                        "Build failed".to_string()
+                    } else {
+                        format!("{n} error{}", if n == 1 { "" } else { "s" })
+                    })
+                    .color(ERROR_RED),
+                );
+            }
+            Some(CppBuild { result: Err(_), .. }) => {
+                ui.label(RichText::new("Build could not run").color(ERROR_RED));
+            }
+            _ => {
+                ui.label(RichText::new("Not built since the last change").weak());
+            }
+        }
+    }
+
     fn create(&mut self, doc: &mut Document, name: &str) {
-        let file = new_file(&doc.schematic().sources, name);
+        self.create_as(doc, name, SourceLanguage::Asm);
+    }
+
+    fn create_as(&mut self, doc: &mut Document, name: &str, language: SourceLanguage) {
+        let file = match language {
+            SourceLanguage::Asm => new_file(&doc.schematic().sources, name),
+            SourceLanguage::Cpp => new_sketch(),
+        };
         doc.edit(|s| s.sources.insert(name.to_string(), file));
         self.selected = Some(name.to_string());
         self.typing = false;
@@ -658,16 +865,7 @@ impl CodeEditor {
                         click.on_hover_text("Click to set or clear a breakpoint on this line");
                     }
                     let mut layouter = |ui: &Ui, buffer: &dyn egui::TextBuffer, _wrap: f32| {
-                        let job = if is_asm {
-                            highlight(buffer.as_str(), &font, &palette, errors)
-                        } else {
-                            LayoutJob::simple(
-                                buffer.as_str().to_string(),
-                                font.clone(),
-                                palette.plain,
-                                f32::INFINITY,
-                            )
-                        };
+                        let job = highlight(buffer.as_str(), is_asm, &font, &palette, errors);
                         let galley: Arc<egui::Galley> = ui.fonts_mut(|f| f.layout_job(job));
                         galley
                     };
@@ -806,7 +1004,7 @@ mod tests {
                 column: 2,
                 message: String::new(),
             }];
-            let job = highlight(text, &font, &palette, &errors);
+            let job = highlight(text, true, &font, &palette, &errors);
             assert_eq!(job.text, text);
         }
     }
@@ -843,5 +1041,50 @@ mod tests {
         assert!(doc.undo());
         frame(&mut doc, &mut editor);
         assert_eq!(editor.selected.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn a_sketch_builds_from_the_panel_and_the_result_is_kept() {
+        let Some(_) = arduino::find_cli(None) else {
+            eprintln!("arduino-cli not installed: skipped");
+            return;
+        };
+        let ctx = egui::Context::default();
+        let mut editor = CodeEditor::default();
+        let mut doc = Document::default();
+        editor.create_as(&mut doc, "main", SourceLanguage::Cpp);
+        let text = doc.schematic().sources["main"].text.clone();
+        assert_eq!(text, STARTER_SKETCH);
+        editor.start_build(&ctx, "main", &text);
+        assert!(editor.building.is_some());
+        let started = std::time::Instant::now();
+        while editor.building.is_some() {
+            assert!(
+                started.elapsed().as_secs() < 120,
+                "the build never finished"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            editor.poll_build(&ctx);
+        }
+        let done = editor.cpp.as_ref().expect("a result");
+        assert!(done.result.is_ok(), "{:?}", done.result);
+        assert!(arduino::cached_image(&text).is_some());
+        // A sketch with a mistake keeps its diagnostics for the error list.
+        let bad = "void setup() {}
+void loop() { oops(); }
+";
+        editor.start_build(&ctx, "main", bad);
+        while editor.building.is_some() {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            editor.poll_build(&ctx);
+        }
+        let Some(CppBuild {
+            result: Err(BuildError::Failed { diagnostics, .. }),
+            ..
+        }) = &editor.cpp
+        else {
+            panic!("expected a failed build");
+        };
+        assert_eq!(diagnostics.iter().find(|d| d.error).unwrap().line, 2);
     }
 }
