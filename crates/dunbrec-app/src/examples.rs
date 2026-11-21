@@ -69,6 +69,10 @@ pub fn examples() -> &'static [Example] {
             name: "555 one-shot",
             build: timer555_one_shot,
         },
+        Example {
+            name: "CD4066 gated tone",
+            build: gated_tone,
+        },
     ]
 }
 
@@ -209,6 +213,81 @@ pub fn timer555_one_shot() -> Schematic {
     s.add_label("TRIG", Point::new(-6, 2));
     s.add_label("TRIG", Point::new(16, -2));
     s.add_label("TIMING", Point::new(-8, 0));
+    s
+}
+
+/// A CD4066 analog switch gating a tone: a 1 kHz sine (4.5 V ± 2 V, inside
+/// the 0–9 V supply) goes through switch A to a 10 kΩ load while a 100 Hz
+/// square wave on its control pin is high, so the output is bursts of five
+/// cycles with silence between. Scope TONE, GATE and OUT at 2 ms/div. The
+/// other three switches are idle, with their pins and controls grounded.
+pub fn gated_tone() -> Schematic {
+    let mut s = Schematic::new();
+    // Pins with the chip at the origin: A1 (-5,-6), A2 (-5,-4), B2 (-5,-2),
+    // B1 (-5,0), CB (-5,2), CC (-5,4), VSS (-5,6), C1 (5,6), C2 (5,4),
+    // D2 (5,2), D1 (5,0), CD (5,-2), CA (5,-4), VDD (5,-6).
+    place(&mut s, K::Cd4066 { r_on: 180.0 }, 0, 0, Rotation::R0);
+    // Left: the tone in and the load out; the idle pins to ground.
+    wire(&mut s, &[(-5, -6), (-8, -6)]);
+    wire(&mut s, &[(-5, -4), (-8, -4)]);
+    s.add_label("TONE", Point::new(-8, -6));
+    s.add_label("OUT", Point::new(-8, -4));
+    for y in [-2, 0, 2, 4, 6] {
+        wire(&mut s, &[(-5, y), (-7, y)]);
+    }
+    wire(&mut s, &[(-7, -2), (-7, 6), (-7, 7)]);
+    place(&mut s, K::Ground, -7, 7, Rotation::R0);
+    // Right: the supply and the gate; the idle pins to ground.
+    wire(&mut s, &[(5, -6), (8, -6)]);
+    wire(&mut s, &[(5, -4), (8, -4)]);
+    s.add_label("VDD", Point::new(8, -6));
+    s.add_label("GATE", Point::new(8, -4));
+    for y in [-2, 0, 2, 4, 6] {
+        wire(&mut s, &[(5, y), (7, y)]);
+    }
+    wire(&mut s, &[(7, -2), (7, 6), (7, 7)]);
+    place(&mut s, K::Ground, 7, 7, Rotation::R0);
+    // The 9 V supply.
+    supply(&mut s, 14, 9.0, false, "VDD");
+    // The 100 Hz gate signal.
+    let gate = K::VoltageSource {
+        waveform: Waveform::Pulse {
+            v1: 0.0,
+            v2: 9.0,
+            delay: 0.0,
+            rise: 1e-6,
+            fall: 1e-6,
+            width: 5e-3,
+            period: 10e-3,
+        },
+    };
+    place(&mut s, gate, 20, 0, Rotation::R0); // (20,-2) (20,2)
+    wire(&mut s, &[(20, -2), (20, -3)]);
+    s.add_label("GATE", Point::new(20, -3));
+    wire(&mut s, &[(20, 2), (20, 3)]);
+    place(&mut s, K::Ground, 20, 3, Rotation::R0);
+    // The 1 kHz tone.
+    let tone = K::VoltageSource {
+        waveform: Waveform::Sine {
+            offset: 4.5,
+            amplitude: 2.0,
+            frequency: 1e3,
+            delay: 0.0,
+            damping: 0.0,
+            phase: 0.0,
+        },
+    };
+    place(&mut s, tone, -16, -5, Rotation::R0); // (-16,-7) (-16,-3)
+    wire(&mut s, &[(-16, -7), (-16, -8)]);
+    s.add_label("TONE", Point::new(-16, -8));
+    wire(&mut s, &[(-16, -3), (-16, -2)]);
+    place(&mut s, K::Ground, -16, -2, Rotation::R0);
+    // The load.
+    place(&mut s, r(10e3), -12, 3, Rotation::R90); // (-12,1) (-12,5)
+    wire(&mut s, &[(-12, 1), (-12, 0)]);
+    s.add_label("OUT", Point::new(-12, 0));
+    wire(&mut s, &[(-12, 5), (-12, 6)]);
+    place(&mut s, K::Ground, -12, 6, Rotation::R0);
     s
 }
 
@@ -649,6 +728,11 @@ mod tests {
                     assert!(!high("OUT"), "waits for a trigger");
                     continue;
                 }
+                // Gate low at the operating point: nothing gets through.
+                "CD4066 gated tone" => {
+                    assert!(op.voltage_by_name("OUT").unwrap().abs() < 0.05);
+                    continue;
+                }
                 "Binary counter" => {
                     assert!(
                         ["Q0", "Q1", "Q2", "Q3"].iter().all(|q| !high(q)),
@@ -713,6 +797,40 @@ mod tests {
                 assert!((vout[i] + 10.0 * vin[i]).abs() < 0.1, "t = {t}");
             }
         }
+    }
+
+    #[test]
+    fn gated_tone_passes_the_tone_only_while_the_gate_is_high() {
+        use dunbrec_sim::{TransientOptions, transient};
+        let s = gated_tone();
+        let netlist = build_netlist(&s);
+        let circuit = Circuit::from_netlist(&netlist, &s.models).unwrap();
+        let res = transient(circuit, TransientOptions::new(30e-3).with_max_step(20e-6)).unwrap();
+        let (out, gate) = (res.voltage("OUT").unwrap(), res.voltage("GATE").unwrap());
+        // Gate high 0–5 ms of every 10 ms (after the 1 µs edge): the output
+        // swings with the tone (about 4.5 ± 2 V, a little less across the
+        // 180 Ω); low 5–10 ms: it sits at 0 V.
+        for k in 0..3 {
+            let t0 = k as f64 * 10e-3;
+            let window = |from: f64, to: f64| {
+                let v: Vec<f64> = res
+                    .times
+                    .iter()
+                    .zip(out)
+                    .filter(|(t, _)| **t >= t0 + from && **t <= t0 + to)
+                    .map(|(_, v)| *v)
+                    .collect();
+                (
+                    v.iter().cloned().fold(f64::MAX, f64::min),
+                    v.iter().cloned().fold(f64::MIN, f64::max),
+                )
+            };
+            let (lo, hi) = window(1e-3, 4.9e-3);
+            assert!(hi > 6.0 && lo < 3.0, "burst {k}: {lo} .. {hi} V");
+            let (lo, hi) = window(5.5e-3, 9.9e-3);
+            assert!(lo > -0.05 && hi < 0.05, "silence {k}: {lo} .. {hi} V");
+        }
+        assert!(gate.iter().any(|&g| g > 8.9));
     }
 
     #[test]

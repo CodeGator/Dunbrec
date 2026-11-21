@@ -22,7 +22,7 @@ Files, adds a Start-menu shortcut and opens `.dbr` files with Dunbrec. Or run fr
 
 ```sh
 cargo run --release -p dunbrec-app                     # empty schematic
-cargo run --release -p dunbrec-app -- --example 2      # an example (1–14, see File → Open example)
+cargo run --release -p dunbrec-app -- --example 2      # an example (1–15, see File → Open example)
 cargo run --release -p dunbrec-app -- my.dbr           # open a file
 cargo run --release -p dunbrec-app -- amp.cir          # import a SPICE netlist
 cargo run --release -p dunbrec-app -- board.kicad_sch  # import a KiCad schematic
@@ -100,7 +100,7 @@ File → Open example → Logic gates or Binary counter (run with Speed at real 
   follow automatically, so set it to match your supply (default 180 Ω). Changing it while
   running restarts the simulation. Not exportable to SPICE. Tie unused controls to VSS.
 
-Try File → Open example → Op-amp inverting amplifier, 555 LED blinker or 555 one-shot (run the
+Try File → Open example → Op-amp inverting amplifier, 555 LED blinker, 555 one-shot or CD4066 gated tone (run the
 555 examples at real-time speed). Each chip is a *composite part*: one symbol that simulates as
 a small built-in circuit of ordinary devices, so more op-amps and similar chips can be added as
 data.

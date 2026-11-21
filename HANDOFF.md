@@ -32,7 +32,7 @@ clean. Toolchain: Rust 1.99 (edition 2024, MSRV 1.90), Windows 11.
 ## Building and checking
 
 ```sh
-cargo run --release -p dunbrec-app -- --example 12   # examples 1–14, see File → Open example
+cargo run --release -p dunbrec-app -- --example 12   # examples 1–15, see File → Open example
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
