@@ -11,6 +11,7 @@ mod about;
 mod analyses_ui;
 mod app;
 mod canvas;
+mod code_ui;
 mod debugger_ui;
 mod dock;
 mod document;

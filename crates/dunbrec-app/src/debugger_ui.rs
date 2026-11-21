@@ -9,8 +9,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use dunbrec_core::{ComponentKind, Netlist, units::format_value};
+use dunbrec_core::{ComponentKind, Netlist, SOURCE_PREFIX, SourceLanguage, units::format_value};
 use dunbrec_mcu::CpuSnapshot;
+use dunbrec_mcu::asm_text::{Assembled, assemble};
 use dunbrec_mcu::disasm::{Line, disassemble};
 use dunbrec_sim::{HaltReason, McuHalt, McuInfo};
 use egui::{Color32, RichText, ScrollArea, Sense, Ui, vec2};
@@ -26,12 +27,48 @@ pub enum Action {
     StartPaused,
 }
 
+/// The source text a program was built from, so the listing can show the
+/// line each instruction came from.
+struct SourceMap {
+    name: String,
+    /// The source, one entry per line.
+    text: Vec<String>,
+    /// Source line (from 1) of the statement at each word address.
+    built: Assembled,
+}
+
+impl SourceMap {
+    /// The source line of the instruction at word address `address`: its
+    /// number and its text.
+    fn at(&self, address: usize) -> Option<(usize, &str)> {
+        let line = self.built.line_for_address(address)?;
+        Some((line, self.text.get(line - 1)?.as_str()))
+    }
+}
+
+/// Build the source file a `source:<name>` firmware reference names, for
+/// the listing. None for any other firmware, or one that does not build.
+fn source_map(firmware: &str, netlist: &Netlist) -> Option<SourceMap> {
+    let name = firmware.trim().strip_prefix(SOURCE_PREFIX)?.trim();
+    let file = netlist.sources.get(name)?;
+    if file.language != SourceLanguage::Asm {
+        return None;
+    }
+    Some(SourceMap {
+        name: name.to_string(),
+        text: file.text.lines().map(str::to_string).collect(),
+        built: assemble(&file.text).ok()?,
+    })
+}
+
 /// A microcontroller of the circuit and its program.
 struct Mcu {
     designator: String,
     clock: f64,
     /// Disassembly of the firmware, by address.
     lines: Vec<Line>,
+    /// Where the instructions came from, for firmware built from source.
+    source: Option<SourceMap>,
     /// Why the firmware could not be loaded, if it could not.
     error: Option<String>,
 }
@@ -139,8 +176,9 @@ impl Debugger {
         self.mcus = parts
             .into_iter()
             .map(|(designator, firmware, clock)| {
-                match dunbrec_mcu::firmware::load(&firmware, firmware_dir) {
+                match dunbrec_sim::load_firmware(&firmware, firmware_dir, &netlist.sources) {
                     Ok(image) => Mcu {
+                        source: source_map(&firmware, netlist),
                         designator,
                         clock,
                         lines: program_lines(&words(&image)),
@@ -150,6 +188,7 @@ impl Debugger {
                         designator,
                         clock,
                         lines: Vec::new(),
+                        source: None,
                         error: Some(e),
                     },
                 }
@@ -532,13 +571,19 @@ impl Debugger {
                         toggled = Some(line.address);
                     }
                     let hex: Vec<String> = line.words.iter().map(|w| format!("{w:04X}")).collect();
-                    let text = format!(
+                    let mut text = format!(
                         "{} 0x{:04X}  {:<9} {}",
                         if here { "▶" } else { " " },
                         line.byte_address(),
                         hex.join(" "),
                         line.text()
                     );
+                    // Firmware built from source: say which line this is.
+                    if let Some(map) = &mcu.source
+                        && let Some((n, source)) = map.at(line.address)
+                    {
+                        text = format!("{text:<44} ; {}:{n}  {}", map.name, source.trim());
+                    }
                     let text = RichText::new(text).monospace();
                     ui.label(if here {
                         text.strong().background_color(CHANGED.gamma_multiply(0.45))
@@ -613,6 +658,36 @@ mod tests {
             );
         }
         b.build()
+    }
+
+    #[test]
+    fn firmware_built_from_source_shows_its_lines() {
+        let mut nl = netlist(&["source:main", "builtin:blink", "source:gone"]);
+        nl.sources.insert(
+            "main".into(),
+            dunbrec_core::SourceFile {
+                language: SourceLanguage::Asm,
+                text: "; start
+  sbi DDRB, 5
+loop: rjmp loop
+"
+                .into(),
+            },
+        );
+        let map = source_map("source:main", &nl).expect("builds");
+        assert_eq!(map.at(0), Some((2, "  sbi DDRB, 5")));
+        assert_eq!(map.at(1), Some((3, "loop: rjmp loop")));
+        assert_eq!(map.at(2), None);
+        assert!(source_map("builtin:blink", &nl).is_none());
+        assert!(source_map("source:gone", &nl).is_none());
+
+        // The debugger lists the program and remembers where it came from.
+        let mut dbg = Debugger::default();
+        dbg.load(&nl, None);
+        assert_eq!(dbg.mcus[0].lines.len(), 2);
+        assert!(dbg.mcus[0].source.is_some());
+        assert!(dbg.mcus[1].source.is_none());
+        assert!(dbg.mcus[2].error.as_deref().unwrap().contains("gone"));
     }
 
     #[test]

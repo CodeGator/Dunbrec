@@ -451,3 +451,70 @@ fn an_input_edge_during_a_step_does_not_make_it_run_two_instructions() {
         }
     }
 }
+
+/// A circuit whose MCU runs the schematic's own source file `main`.
+fn circuit_with_source(
+    source: &str,
+    language: dunbrec_core::SourceLanguage,
+) -> Result<Circuit, SimError> {
+    let b = NetlistBuilder::new().element("R1", r(1e3), &["D13", "0"]);
+    let mut netlist = with_mcu(b, "source:main").build();
+    netlist.sources.insert(
+        "main".into(),
+        dunbrec_core::SourceFile {
+            language,
+            text: source.into(),
+        },
+    );
+    Circuit::from_netlist(&netlist, &ModelLibrary::new())
+}
+
+#[test]
+fn firmware_can_be_assembly_text_stored_with_the_schematic() {
+    let circuit = circuit_with_source(
+        "
+        sbi DDRB, PB5     ; D13 is an output
+        sbi PORTB, PB5    ; and high
+loop:   rjmp loop
+",
+        dunbrec_core::SourceLanguage::Asm,
+    )
+    .unwrap();
+    let res = transient(circuit, TransientOptions::new(1e-3)).unwrap();
+    let v = res.at(res.voltage("D13").unwrap(), 0.5e-3);
+    assert!((v - 5.0 * 1e3 / (1e3 + MCU_R_OUT)).abs() < 1e-3, "{v}");
+}
+
+#[test]
+fn a_source_file_with_errors_reports_them_by_line() {
+    let circuit = circuit_with_source(
+        "nop\nldi r16, nothing\n\nbogus r1\n",
+        dunbrec_core::SourceLanguage::Asm,
+    )
+    .unwrap();
+    let err = transient(circuit, TransientOptions::new(1e-3)).unwrap_err();
+    let text = err.to_string();
+    assert!(text.contains("U1"), "{text}");
+    assert!(
+        text.contains("main:2:10: 'nothing' is not defined"),
+        "{text}"
+    );
+    assert!(text.contains("main:4:1:"), "{text}");
+}
+
+#[test]
+fn a_missing_source_file_or_a_cpp_sketch_is_explained() {
+    let b = NetlistBuilder::new().element("R1", r(1e3), &["D13", "0"]);
+    let netlist = with_mcu(b, "source:gone").build();
+    let circuit = Circuit::from_netlist(&netlist, &ModelLibrary::new()).unwrap();
+    let err = transient(circuit, TransientOptions::new(1e-3)).unwrap_err();
+    assert!(
+        err.to_string().contains("no source file called 'gone'"),
+        "{err}"
+    );
+
+    let circuit =
+        circuit_with_source("void setup() {}", dunbrec_core::SourceLanguage::Cpp).unwrap();
+    let err = transient(circuit, TransientOptions::new(1e-3)).unwrap_err();
+    assert!(err.to_string().contains("C++ sketch"), "{err}");
+}

@@ -142,12 +142,23 @@ fn application_tab(ui: &mut egui::Ui, st: &mut AboutState) {
 }
 
 fn license_tab(ui: &mut egui::Ui) {
-    egui::ScrollArea::vertical().id_salt("about-license").auto_shrink([false, false]).show(ui, |ui| {
-        egui::Frame::new().fill(ui.visuals().extreme_bg_color).corner_radius(4.0).inner_margin(egui::Margin::same(12)).show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.label(RichText::new(GPL).size(12.5).color(ui.visuals().text_color()));
+    egui::ScrollArea::vertical()
+        .id_salt("about-license")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            egui::Frame::new()
+                .fill(ui.visuals().extreme_bg_color)
+                .corner_radius(4.0)
+                .inner_margin(egui::Margin::same(12))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.label(
+                        RichText::new(GPL)
+                            .size(12.5)
+                            .color(ui.visuals().text_color()),
+                    );
+                });
         });
-    });
 }
 
 fn open_source_tab(ui: &mut egui::Ui, st: &mut AboutState) {

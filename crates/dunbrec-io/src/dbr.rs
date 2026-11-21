@@ -188,6 +188,38 @@ mod tests {
     }
 
     #[test]
+    fn source_files_round_trip_and_old_files_load_without_them() {
+        use dunbrec_core::{SourceFile, SourceLanguage};
+        let mut s = sample();
+        s.sources.insert(
+            "blink".into(),
+            SourceFile {
+                language: SourceLanguage::Asm,
+                text: "loop: rjmp loop ; \"quoted\"
+  nop
+"
+                .into(),
+            },
+        );
+        let text = to_string(&s).unwrap();
+        assert!(text.contains("blink"));
+        assert_eq!(from_str(&text).unwrap(), s);
+
+        // A file saved before sources existed has no `sources` entry.
+        let plain = to_string(&sample()).unwrap();
+        let old: String = plain
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("sources:"))
+            .collect::<Vec<_>>()
+            .join(
+                "
+",
+            );
+        assert!(!old.contains("sources"));
+        assert_eq!(from_str(&old).unwrap(), sample());
+    }
+
+    #[test]
     fn round_trip_file() {
         let dir = std::env::temp_dir().join(format!("dunbrec-test-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();

@@ -4,6 +4,7 @@
 //! directly; it works on the [`Netlist`](crate::netlist::Netlist) produced by
 //! [`build_netlist`](crate::netlist::build_netlist).
 
+use std::collections::BTreeMap;
 use std::ops::{Add, Sub};
 
 use serde::{Deserialize, Serialize};
@@ -722,6 +723,27 @@ pub struct NetLabel {
     pub position: Point,
 }
 
+/// The language of a [`SourceFile`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SourceLanguage {
+    /// AVR assembly, built by the assembler inside Dunbrec.
+    Asm,
+    /// An Arduino C++ sketch, built by an external toolchain.
+    Cpp,
+}
+
+/// Firmware source text saved with the schematic. A microcontroller refers
+/// to one by name with the firmware reference `source:<name>`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceFile {
+    pub language: SourceLanguage,
+    pub text: String,
+}
+
+/// Prefix of a firmware reference that names a [`SourceFile`] of the
+/// schematic.
+pub const SOURCE_PREFIX: &str = "source:";
+
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct Schematic {
     #[serde(default)]
@@ -732,6 +754,10 @@ pub struct Schematic {
     pub labels: Vec<NetLabel>,
     #[serde(default)]
     pub models: ModelLibrary,
+    /// Firmware source files by name. Files saved before this field existed
+    /// load with none.
+    #[serde(default)]
+    pub sources: BTreeMap<String, SourceFile>,
     /// Next id to hand out; shared by components, wires and labels.
     #[serde(default)]
     next_id: u32,

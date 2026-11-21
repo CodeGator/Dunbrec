@@ -8,6 +8,8 @@ use dunbrec_core::{
 };
 use egui::{Color32, RichText, Ui};
 
+use dunbrec_core::SOURCE_PREFIX;
+
 use crate::canvas::Item;
 use crate::document::Document;
 
@@ -21,6 +23,9 @@ pub struct Properties {
     /// Set while a slider is being dragged: changes apply live, and only
     /// the first frame of the drag records an undo step.
     continuous: bool,
+    /// A source file the user asked to edit; the app opens the Code panel
+    /// on it and clears this.
+    pub open_code: Option<String>,
 }
 
 /// A change the panel wants to make; applied with an undo checkpoint.
@@ -111,6 +116,9 @@ impl Properties {
                 }
 
                 let mut k = c.kind.clone();
+                // Set when "New assembly file…" is picked: the file to add
+                // along with the firmware change.
+                let mut new_source: Option<String> = None;
                 let changed = match &mut k {
                     ComponentKind::Ground => false,
                     ComponentKind::Resistor { resistance } => {
@@ -299,13 +307,50 @@ impl Properties {
                                 });
                         });
                         ui.end_row();
+                        ui.label("");
+                        ui.horizontal(|ui| {
+                            egui::ComboBox::from_id_salt(("source", id))
+                                .selected_text("Source file")
+                                .show_ui(ui, |ui| {
+                                    for name in schematic.sources.keys() {
+                                        let reference = format!("{SOURCE_PREFIX}{name}");
+                                        if ui
+                                            .selectable_label(*firmware == reference, name)
+                                            .clicked()
+                                        {
+                                            *firmware = reference;
+                                            changed = true;
+                                        }
+                                    }
+                                    if ui.selectable_label(false, "New assembly file…").clicked()
+                                    {
+                                        let name =
+                                            crate::code_ui::unused_name(&schematic.sources, "main");
+                                        *firmware = format!("{SOURCE_PREFIX}{name}");
+                                        self.open_code = Some(name.clone());
+                                        new_source = Some(name);
+                                        changed = true;
+                                    }
+                                });
+                            if let Some(name) = firmware.trim().strip_prefix(SOURCE_PREFIX)
+                                && ui
+                                    .button("Edit")
+                                    .on_hover_text("Open this source file in the Code panel")
+                                    .clicked()
+                            {
+                                self.open_code = Some(name.trim().to_string());
+                            }
+                        });
+                        ui.end_row();
                         let clock_changed = self.value(ui, id, "Clock", "Hz", clock);
                         ui.label("");
                         ui.label(
                             egui::RichText::new(
-                                "Arduino IDE: Sketch → Export Compiled Binary, then pick the \
-                                 .hex without \"with_bootloader\". The file is reloaded each \
-                                 time the simulation starts.",
+                                "A source file is assembly kept in this schematic and built \
+                                 each time the simulation starts. For a compiled program: \
+                                 Arduino IDE, Sketch → Export Compiled Binary, then pick the \
+                                 .hex without \"with_bootloader\"; it is reloaded each time \
+                                 too.",
                             )
                             .small()
                             .weak(),
@@ -315,7 +360,19 @@ impl Properties {
                     }
                 };
                 if changed {
-                    edit = set_kind(k);
+                    edit = match new_source {
+                        Some(name) => {
+                            let kind = k.clone();
+                            Some(Box::new(move |s: &mut Schematic| {
+                                let file = crate::code_ui::new_file(&s.sources, &name);
+                                s.sources.entry(name).or_insert(file);
+                                if let Some(c) = s.component_mut(id) {
+                                    c.kind = kind;
+                                }
+                            }))
+                        }
+                        None => set_kind(k),
+                    };
                 }
             });
 

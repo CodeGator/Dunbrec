@@ -247,6 +247,7 @@ impl Transient {
             Some(McuSystem::new(
                 &circuit.mcus,
                 circuit.firmware_dir.as_deref(),
+                &circuit.sources,
             )?)
         };
         if let Some(m) = &mut mcu {

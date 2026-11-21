@@ -14,6 +14,7 @@ use crate::canvas::{
     Annotation, Canvas, Item, Marker, NodeMap, PartDrag, TagPlace, Tool, delete_items,
     node_tag_positions, transform_components,
 };
+use crate::code_ui::CodeEditor;
 use crate::debugger_ui::{Action as DebugAction, Debugger};
 use crate::dock::{self, LAYOUT_KEY, Pane};
 use crate::document::Document;
@@ -84,6 +85,7 @@ pub struct DunbrecApp {
     doc: Document,
     canvas: Canvas,
     properties: Properties,
+    code: CodeEditor,
     netlist: (u64, Netlist),
     dc: Option<DcResults>,
     live_dc: bool,
@@ -207,6 +209,7 @@ impl DunbrecApp {
             doc,
             canvas: Canvas::default(),
             properties: Properties::default(),
+            code: CodeEditor::default(),
             dc: None,
             live_dc: true,
             show_voltages: true,
@@ -916,6 +919,7 @@ impl DunbrecApp {
             doc: &mut self.doc,
             canvas: &mut self.canvas,
             properties: &mut self.properties,
+            code: &mut self.code,
             palette_search: &mut self.palette_search,
             netlist: &self.netlist.1,
             dc: &self.dc,
@@ -928,6 +932,14 @@ impl DunbrecApp {
         DockArea::new(&mut self.dock)
             .style(egui_dock::Style::from_egui(ctx.style().as_ref()))
             .show(ctx, &mut viewer);
+        // "Edit" on a microcontroller's source file opens it in the editor.
+        if let Some(name) = self.properties.open_code.take() {
+            dock::open(&mut self.dock, Pane::Code);
+            if let Some(at) = self.dock.find_tab(&Pane::Code) {
+                self.dock.set_active_tab(at);
+            }
+            self.code.select(&name);
+        }
     }
 
     // ---------------------------------------------------------- UI ---
@@ -1488,6 +1500,7 @@ struct PaneViewer<'a> {
     doc: &'a mut Document,
     canvas: &'a mut Canvas,
     properties: &'a mut Properties,
+    code: &'a mut CodeEditor,
     palette_search: &'a mut String,
     netlist: &'a Netlist,
     dc: &'a Option<DcResults>,
@@ -1524,6 +1537,7 @@ impl TabViewer for PaneViewer<'_> {
             }
             Pane::Checks => checks_ui(ui, self.netlist, self.doc.schematic()),
             Pane::Values => values_ui(ui, self.netlist, self.running, self.latest, self.dc),
+            Pane::Code => self.code.show(ui, self.doc),
             Pane::Retired => {}
         }
     }

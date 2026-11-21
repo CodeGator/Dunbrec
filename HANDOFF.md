@@ -109,7 +109,11 @@ Key mechanisms worth knowing before changing the engine:
     project became GPL-3.0; the in-house emulator stays).
   - ATmega328P first.
   - Firmware is a `.hex` path stored in the schematic (relative to the `.dbr`), reloaded on
-    every Run, plus `builtin:<name>` demo programs.
+    every Run, plus `builtin:<name>` demo programs and `source:<name>` (assembly text kept in
+    the schematic, built on every Run).
+  - File format: `Schematic.sources` (a map of name to `{ language, text }`) was added with
+    `#[serde(default)]`, so older `.dbr` files load unchanged and the version number was not
+    bumped. An older Dunbrec opening a file that has sources ignores them.
 - The user wants technical options explained in plain terms, with a recommendation, and
   confirmed before they become plans.
 - Don't drive the user's mouse or keyboard for UI testing without asking. Window screenshots
@@ -137,9 +141,10 @@ Key mechanisms worth knowing before changing the engine:
      composite machinery.
    - A CMOS 555 (TLC555) would need different output levels.
    - The ngspice cross-check (item 1) can now also cover the exported 741 subcircuit.
-6. **MCU firmware development** (debugger, assembly text, Arduino C++ builds): designed, not
-   built. See [docs/mcu-firmware-development.md](docs/mcu-firmware-development.md); start with
-   phase A (the debugger).
+6. **MCU firmware development** (debugger, assembly text, Arduino C++ builds): phases A and B
+   built (B4 partly); C (Arduino C++ via arduino-cli) and D (more chips) are not. See
+   [docs/mcu-firmware-development.md](docs/mcu-firmware-development.md). None of the new
+   windows (debugger, code panel) has been looked at on screen yet.
 7. **Not yet supported:**
    - MCU: SPI, I²C, EEPROM, watchdog, serial receive and other chips.
    - Simulation: a fixed temperature of 27 °C, MOSFET level 1 only, and a single logic family.

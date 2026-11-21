@@ -23,6 +23,7 @@
 //! assembler in [`asm`].
 
 pub mod asm;
+pub mod asm_text;
 mod avr;
 pub mod disasm;
 pub mod firmware;

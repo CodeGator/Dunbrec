@@ -19,9 +19,10 @@
 //! could affect the circuit, because it had no event there.
 
 use std::cell::Cell;
+use std::collections::BTreeMap;
 use std::path::Path;
 
-use dunbrec_core::{ComponentKind, NodeId};
+use dunbrec_core::{ComponentKind, NodeId, SOURCE_PREFIX, SourceFile, SourceLanguage};
 use dunbrec_mcu::{Atmega328p, CpuSnapshot, PIN_COUNT, PinDrive, Stop};
 
 use crate::ac::{AcContext, AcStamper};
@@ -267,6 +268,52 @@ impl Part {
     }
 }
 
+/// The most build errors listed in one message.
+const MAX_BUILD_ERRORS: usize = 5;
+
+/// Load the flash image a firmware reference names: `builtin:<name>`, a
+/// `.hex` file, or `source:<name>`, a source file of the schematic built
+/// here. Build errors come back as one message, a line each, as
+/// `<name>:<line>:<column>: <problem>`.
+pub fn load_firmware(
+    reference: &str,
+    base_dir: Option<&Path>,
+    sources: &BTreeMap<String, SourceFile>,
+) -> Result<Vec<u8>, String> {
+    let Some(name) = reference.trim().strip_prefix(SOURCE_PREFIX) else {
+        return dunbrec_mcu::firmware::load(reference, base_dir);
+    };
+    let name = name.trim();
+    let file = sources.get(name).ok_or_else(|| {
+        if name.is_empty() {
+            "no source file selected for this microcontroller".to_string()
+        } else {
+            format!("this schematic has no source file called '{name}'")
+        }
+    })?;
+    match file.language {
+        SourceLanguage::Asm => dunbrec_mcu::asm_text::assemble(&file.text)
+            .map(|built| built.image)
+            .map_err(|errors| {
+                let mut lines: Vec<String> = errors
+                    .iter()
+                    .take(MAX_BUILD_ERRORS)
+                    .map(|e| format!("{name}:{}:{}: {}", e.line, e.column, e.message))
+                    .collect();
+                if errors.len() > MAX_BUILD_ERRORS {
+                    lines.push(format!("and {} more", errors.len() - MAX_BUILD_ERRORS));
+                }
+                lines.join(
+                    "
+",
+                )
+            }),
+        SourceLanguage::Cpp => Err(format!(
+            "'{name}' is a C++ sketch, and building sketches is not available yet"
+        )),
+    }
+}
+
 /// All microcontrollers of a circuit.
 #[derive(Debug, Clone)]
 pub struct McuSystem {
@@ -275,8 +322,13 @@ pub struct McuSystem {
 }
 
 impl McuSystem {
-    /// Load each part's firmware (relative paths against `base_dir`).
-    pub fn new(specs: &[McuSpec], base_dir: Option<&Path>) -> Result<Self, SimError> {
+    /// Load each part's firmware (relative paths against `base_dir`,
+    /// `source:` references from `sources`).
+    pub fn new(
+        specs: &[McuSpec],
+        base_dir: Option<&Path>,
+        sources: &BTreeMap<String, SourceFile>,
+    ) -> Result<Self, SimError> {
         let parts = specs
             .iter()
             .map(|spec| {
@@ -287,7 +339,7 @@ impl McuSystem {
                     designator: spec.designator.clone(),
                     message,
                 };
-                let image = dunbrec_mcu::firmware::load(firmware, base_dir).map_err(err)?;
+                let image = load_firmware(firmware, base_dir, sources).map_err(err)?;
                 let chip = Atmega328p::new(&image).map_err(err)?;
                 Ok(Part {
                     spec: spec.clone(),
