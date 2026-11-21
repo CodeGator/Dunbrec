@@ -93,7 +93,8 @@ pub struct DunbrecApp {
     label_name: String,
     message: Option<String>,
     title: String,
-    show_about: bool,
+    pub(crate) show_about: bool,
+    pub(crate) about: crate::about::AboutState,
     show_shortcuts: bool,
     settings: Settings,
 
@@ -215,6 +216,7 @@ impl DunbrecApp {
             message: None,
             title: String::new(),
             show_about: false,
+            about: Default::default(),
             show_shortcuts: false,
             settings,
         }
@@ -1201,23 +1203,7 @@ impl DunbrecApp {
             });
         }
 
-        if self.show_about {
-            egui::Modal::new(egui::Id::new("about")).show(ctx, |ui| {
-                ui.heading("Dunbrec");
-                ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
-                ui.label("Schematic capture and circuit simulation with virtual instruments.");
-                ui.add_space(4.0);
-                ui.label(
-                    RichText::new(
-                        "Analyses: DC operating point, DC sweep, AC small-signal, transient.",
-                    )
-                    .weak(),
-                );
-                if ui.button("Close").clicked() {
-                    self.show_about = false;
-                }
-            });
-        }
+        self.about_window(ctx);
 
         if self.show_shortcuts {
             let mut open = true;
