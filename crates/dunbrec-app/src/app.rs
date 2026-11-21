@@ -839,6 +839,8 @@ impl DunbrecApp {
                         egui::vec2(130.0, height),
                         egui::Layout::left_to_right(egui::Align::Center),
                         |ui| {
+                            // The slot shrinks to its contents unless told not to.
+                            ui.set_min_size(egui::vec2(130.0, height));
                             ui.label(
                                 RichText::new(format!("t = {}", format_value(self.live_time, "s")))
                                     .monospace(),
@@ -849,6 +851,7 @@ impl DunbrecApp {
                         egui::vec2(96.0, height),
                         egui::Layout::left_to_right(egui::Align::Center),
                         |ui| {
+                            ui.set_min_size(egui::vec2(96.0, height));
                             if self.live_keeping_up < 0.95 {
                                 ui.label(
                                     RichText::new(format!(
