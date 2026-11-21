@@ -2,8 +2,12 @@
 //! models placed alongside semiconductor parts.
 //!
 //! The generic models are deliberately *not* named after real part numbers.
-//! Real parts (2N3904, 1N4148, ...) belong in a model library checked against
-//! manufacturer data, which comes later.
+//! Real parts (2N3904, 1N4148, ...) come from a model library checked against
+//! manufacturer data.
+//!
+//! Palette groups say what a part *is* (Diodes, Transistors, ...), never where
+//! its model came from: a real part sits in its function's group, after the
+//! generic one, and is recognisable by its part number.
 
 use dunbrec_core::{
     ComponentKind, DEFAULT_LOGIC_DELAY, DeviceModel, GateOp, ModelKind, Polarity, Schematic,
@@ -113,21 +117,21 @@ pub fn palette() -> &'static [PaletteEntry] {
         },
         PaletteEntry {
             name: "Diode",
-            group: "Semiconductors",
+            group: "Diodes",
             make: || ComponentKind::Diode {
                 model: GENERIC_DIODE.into(),
             },
         },
         PaletteEntry {
             name: "Zener diode",
-            group: "Semiconductors",
+            group: "Diodes",
             make: || ComponentKind::Diode {
                 model: GENERIC_ZENER.into(),
             },
         },
         PaletteEntry {
             name: "NPN transistor",
-            group: "Semiconductors",
+            group: "Transistors",
             make: || ComponentKind::Bjt {
                 polarity: Polarity::N,
                 model: GENERIC_NPN.into(),
@@ -135,7 +139,7 @@ pub fn palette() -> &'static [PaletteEntry] {
         },
         PaletteEntry {
             name: "PNP transistor",
-            group: "Semiconductors",
+            group: "Transistors",
             make: || ComponentKind::Bjt {
                 polarity: Polarity::P,
                 model: GENERIC_PNP.into(),
@@ -143,7 +147,7 @@ pub fn palette() -> &'static [PaletteEntry] {
         },
         PaletteEntry {
             name: "N-MOSFET",
-            group: "Semiconductors",
+            group: "Transistors",
             make: || ComponentKind::Mosfet {
                 polarity: Polarity::N,
                 model: GENERIC_NMOS.into(),
@@ -151,7 +155,7 @@ pub fn palette() -> &'static [PaletteEntry] {
         },
         PaletteEntry {
             name: "P-MOSFET",
-            group: "Semiconductors",
+            group: "Transistors",
             make: || ComponentKind::Mosfet {
                 polarity: Polarity::P,
                 model: GENERIC_PMOS.into(),
@@ -159,7 +163,7 @@ pub fn palette() -> &'static [PaletteEntry] {
         },
         PaletteEntry {
             name: "2N3904 NPN",
-            group: "Real parts",
+            group: "Transistors",
             make: || ComponentKind::Bjt {
                 polarity: Polarity::N,
                 model: "2N3904".into(),
@@ -167,7 +171,7 @@ pub fn palette() -> &'static [PaletteEntry] {
         },
         PaletteEntry {
             name: "2N3906 PNP",
-            group: "Real parts",
+            group: "Transistors",
             make: || ComponentKind::Bjt {
                 polarity: Polarity::P,
                 model: "2N3906".into(),
@@ -175,14 +179,14 @@ pub fn palette() -> &'static [PaletteEntry] {
         },
         PaletteEntry {
             name: "1N4148 diode",
-            group: "Real parts",
+            group: "Diodes",
             make: || ComponentKind::Diode {
                 model: "1N4148".into(),
             },
         },
         PaletteEntry {
             name: "1N750 4.7 V zener",
-            group: "Real parts",
+            group: "Diodes",
             make: || ComponentKind::Diode {
                 model: "1N750".into(),
             },
@@ -322,6 +326,34 @@ pub fn palette() -> &'static [PaletteEntry] {
     P
 }
 
+/// Palette entries grouped for display: groups in order of first appearance,
+/// entries in list order within each. `query` (lower case; empty matches
+/// everything) keeps an entry if it occurs in the entry's name, its group's
+/// name or its part type ("transistor", "operational amplifier"), so typing
+/// "diode" lists every diode and "3904" finds one part. Groups with no
+/// matching entry are left out.
+pub fn palette_groups(query: &str) -> Vec<(&'static str, Vec<&'static PaletteEntry>)> {
+    let mut groups: Vec<(&'static str, Vec<&'static PaletteEntry>)> = Vec::new();
+    for entry in palette() {
+        let matches = query.is_empty()
+            || [
+                entry.name,
+                entry.group,
+                crate::properties::kind_name(&(entry.make)()),
+            ]
+            .iter()
+            .any(|text| text.to_lowercase().contains(query));
+        if !matches {
+            continue;
+        }
+        match groups.iter_mut().find(|(g, _)| *g == entry.group) {
+            Some((_, entries)) => entries.push(entry),
+            None => groups.push((entry.group, vec![entry])),
+        }
+    }
+    groups
+}
+
 /// The generic model a palette part refers to, if it is not yet in the
 /// schematic's library.
 fn generic_model(name: &str) -> Option<DeviceModel> {
@@ -388,6 +420,55 @@ pub fn ensure_model(schematic: &mut Schematic, kind: &ComponentKind) {
 mod tests {
     use super::*;
     use dunbrec_core::{Point, build_netlist};
+
+    fn names(groups: &[(&str, Vec<&PaletteEntry>)]) -> Vec<&'static str> {
+        groups
+            .iter()
+            .flat_map(|(_, entries)| entries.iter().map(|e| e.name))
+            .collect()
+    }
+
+    #[test]
+    fn groups_describe_what_a_part_is() {
+        let all = palette_groups("");
+        // Every entry appears exactly once, and none sits in a provenance group.
+        let listed = names(&all);
+        assert_eq!(listed.len(), palette().len());
+        assert!(all.iter().all(|(g, _)| *g != "Real parts"));
+        let group_of = |part: &str| {
+            all.iter()
+                .find(|(_, entries)| entries.iter().any(|e| e.name == part))
+                .map(|(g, _)| *g)
+        };
+        // A real part sits with its generic siblings, after them.
+        assert_eq!(group_of("2N3904 NPN"), Some("Transistors"));
+        assert_eq!(group_of("NPN transistor"), Some("Transistors"));
+        assert_eq!(group_of("1N4148 diode"), group_of("Diode"));
+        let transistors = &all.iter().find(|(g, _)| *g == "Transistors").unwrap().1;
+        let position = |n: &str| transistors.iter().position(|e| e.name == n).unwrap();
+        assert!(position("NPN transistor") < position("2N3904 NPN"));
+    }
+
+    #[test]
+    fn searching_matches_name_group_and_part_type() {
+        // By part number.
+        assert_eq!(names(&palette_groups("3904")), vec!["2N3904 NPN"]);
+        // By group: every diode, generic and real.
+        let diodes = names(&palette_groups("diode"));
+        for d in ["Diode", "Zener diode", "1N4148 diode"] {
+            assert!(diodes.contains(&d), "{diodes:?}");
+        }
+        // By part type, which the name does not contain.
+        assert!(names(&palette_groups("operational")).contains(&"741 op-amp"));
+        assert!(names(&palette_groups("transistor")).contains(&"2N3906 PNP"));
+        // Nothing matches nonsense; groups without matches are left out.
+        assert!(palette_groups("zzzz").is_empty());
+        assert!(
+            palette_groups("3904")
+                .iter()
+                .all(|(_, entries)| !entries.is_empty())
+        );
+    }
 
     #[test]
     fn every_palette_part_has_its_model() {

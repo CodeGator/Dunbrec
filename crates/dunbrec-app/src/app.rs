@@ -18,7 +18,7 @@ use crate::dock::{self, LAYOUT_KEY, Pane};
 use crate::document::Document;
 use crate::examples::examples;
 use crate::instruments_ui::{Bench, MeterSignal, Signals};
-use crate::library::palette;
+use crate::library::{PaletteEntry, palette_groups};
 use crate::live::{Command, Event, LiveSim};
 use crate::properties::Properties;
 use crate::serial_ui::SerialMonitor;
@@ -114,6 +114,8 @@ pub struct DunbrecApp {
     serial: SerialMonitor,
     /// Where each panel is: docked, tabbed or floating.
     dock: DockState<Pane>,
+    /// Text in the palette's search box.
+    palette_search: String,
 }
 
 /// True if two netlists have the same nodes and connections, so a running
@@ -176,6 +178,7 @@ impl DunbrecApp {
         let tags = node_tag_positions(doc.schematic(), &netlist);
         Self {
             dock,
+            palette_search: String::new(),
             node_map: (doc.generation(), node_map, tags),
             analyses: Analyses::default(),
             serial: SerialMonitor::default(),
@@ -859,6 +862,7 @@ impl DunbrecApp {
             bench: &mut self.bench,
             analyses: &mut self.analyses,
             serial: &mut self.serial,
+            palette_search: &mut self.palette_search,
             netlist: &self.netlist.1,
             node_map: &self.node_map.1,
             dc: &self.dc,
@@ -1257,8 +1261,19 @@ fn describe_diagnostic(schematic: &Schematic, d: &Diagnostic) -> String {
     }
 }
 
-/// The tools and the parts library.
-fn palette_ui(ui: &mut egui::Ui, canvas: &mut Canvas) {
+/// What placing `entry` looks like to the canvas.
+fn place_tool(entry: &PaletteEntry) -> Tool {
+    Tool::Place {
+        kind: (entry.make)(),
+        rotation: dunbrec_core::Rotation::R0,
+        mirrored: false,
+    }
+}
+
+/// The tools, a search box, and the parts library by group. With nothing
+/// typed, groups fold open and shut; with a search, matching parts are
+/// listed under their group and Enter picks the first.
+fn palette_ui(ui: &mut egui::Ui, canvas: &mut Canvas, search: &mut String) {
     egui::ScrollArea::vertical().show(ui, |ui| {
         ui.heading("Tools");
         let tool = canvas.tool.clone();
@@ -1287,21 +1302,55 @@ fn palette_ui(ui: &mut egui::Ui, canvas: &mut Canvas) {
             canvas.tool = Tool::Probe;
         }
         ui.add_space(8.0);
-        let mut group = "";
-        for entry in palette() {
-            if entry.group != group {
-                group = entry.group;
-                ui.add_space(6.0);
-                ui.label(RichText::new(group).strong());
+
+        let groups = palette_groups(&search.trim().to_lowercase());
+        let searching = !search.trim().is_empty();
+        ui.horizontal(|ui| {
+            let clear_room = 26.0;
+            let edit = ui.add(
+                egui::TextEdit::singleline(search)
+                    .hint_text("Search parts")
+                    .desired_width(ui.available_width() - clear_room),
+            );
+            if searching
+                && ui
+                    .small_button("✕")
+                    .on_hover_text("Clear the search")
+                    .clicked()
+            {
+                search.clear();
             }
-            let kind = (entry.make)();
-            let active = matches!(&tool, Tool::Place { kind: k, .. } if *k == kind);
-            if ui.selectable_label(active, entry.name).clicked() {
-                canvas.tool = Tool::Place {
-                    kind,
-                    rotation: dunbrec_core::Rotation::R0,
-                    mirrored: false,
-                };
+            if edit.lost_focus()
+                && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                && let Some((_, entries)) = groups.first()
+                && let Some(first) = entries.first()
+            {
+                canvas.tool = place_tool(first);
+            }
+        });
+        if searching && groups.is_empty() {
+            ui.label(RichText::new("No parts match").weak());
+        }
+
+        let part_list = |ui: &mut egui::Ui, canvas: &mut Canvas, entries: &[&PaletteEntry]| {
+            for entry in entries {
+                let kind = (entry.make)();
+                let active = matches!(&canvas.tool, Tool::Place { kind: k, .. } if *k == kind);
+                if ui.selectable_label(active, entry.name).clicked() {
+                    canvas.tool = place_tool(entry);
+                }
+            }
+        };
+        for (group, entries) in &groups {
+            if searching {
+                ui.add_space(6.0);
+                ui.label(RichText::new(*group).strong());
+                part_list(ui, canvas, entries);
+            } else {
+                egui::CollapsingHeader::new(RichText::new(*group).strong())
+                    .id_salt(("palette group", *group))
+                    .default_open(true)
+                    .show(ui, |ui| part_list(ui, canvas, entries));
             }
         }
     });
@@ -1412,6 +1461,7 @@ struct PaneViewer<'a> {
     bench: &'a mut Bench,
     analyses: &'a mut Analyses,
     serial: &'a mut SerialMonitor,
+    palette_search: &'a mut String,
     netlist: &'a Netlist,
     node_map: &'a NodeMap,
     dc: &'a Option<DcResults>,
@@ -1442,7 +1492,7 @@ impl TabViewer for PaneViewer<'_> {
                 self.markers,
                 self.lit,
             ),
-            Pane::Palette => palette_ui(ui, self.canvas),
+            Pane::Palette => palette_ui(ui, self.canvas, self.palette_search),
             Pane::Properties => {
                 let selection: Vec<Item> = self.canvas.selection.iter().copied().collect();
                 egui::ScrollArea::vertical().show(ui, |ui| {
