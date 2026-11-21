@@ -781,48 +781,51 @@ impl DunbrecApp {
         });
     }
 
-    /// The instruments' on/off switches, which the toolbar and menus own.
-    fn instrument_switches(&self) -> [(Pane, bool); 8] {
-        [
-            (Pane::Scope, self.bench.show_scope),
-            (Pane::Meter, self.bench.show_meter),
-            (Pane::Logic, self.bench.show_logic),
-            (Pane::Bode, self.analyses.show_bode),
-            (Pane::Transfer, self.analyses.show_transfer),
-            (Pane::Tracer, self.analyses.show_tracer),
-            (Pane::Fgen, self.analyses.show_fgen),
-            (Pane::Serial, self.serial.show),
-        ]
-    }
-
-    /// An instrument's tab was closed in the dock: switch it off.
-    fn instrument_closed(&mut self, pane: Pane) {
-        match pane {
-            Pane::Scope => self.bench.show_scope = false,
-            Pane::Meter => self.bench.show_meter = false,
-            Pane::Logic => self.bench.show_logic = false,
-            Pane::Bode => self.analyses.show_bode = false,
-            Pane::Transfer => self.analyses.show_transfer = false,
-            Pane::Tracer => self.analyses.show_tracer = false,
-            Pane::Fgen => self.analyses.show_fgen = false,
-            Pane::Serial => self.serial.close(),
-            _ => {}
+    /// The instruments: free-floating windows that never dock.
+    fn instrument_windows(&mut self, ctx: &egui::Context) {
+        let probing = self.canvas.tool == Tool::Probe;
+        let s = self.doc.schematic();
+        let netlist = &self.netlist.1;
+        let map = &self.node_map.1;
+        let mut probe_clicked = false;
+        if self.bench.show_scope {
+            let (timebase_changed, clicked) =
+                self.bench.scope_window(ctx, s, netlist, map, probing);
+            probe_clicked |= clicked;
+            if timebase_changed && let Some(live) = &mut self.live {
+                live.send(Command::SetMaxStep(self.bench.max_step()));
+                live.send(Command::SetSpeed(self.bench.speed.value(&self.bench.scope)));
+            }
+        }
+        if self.bench.show_meter {
+            let running = self.live.is_some();
+            probe_clicked |= self
+                .bench
+                .meter_window(ctx, s, netlist, map, probing, running);
+        }
+        let inputs = Inputs {
+            doc: &mut self.doc,
+            netlist: &self.netlist.1,
+            map: &self.node_map.1,
+            bench: &mut self.bench,
+            probing,
+        };
+        probe_clicked |= self.analyses.show(ctx, inputs);
+        if self.bench.show_logic {
+            let s = self.doc.schematic();
+            probe_clicked |=
+                self.bench
+                    .logic_window(ctx, s, &self.netlist.1, &self.node_map.1, probing);
+        }
+        self.serial.window(ctx);
+        if probe_clicked {
+            self.canvas.tool = Tool::Probe;
         }
     }
 
-    /// Draw every panel (schematic, palette, properties, checks, values and
-    /// the instruments) in the dock.
+    /// Draw the dockable panels: schematic, palette, properties, checks and
+    /// values.
     fn dock_area(&mut self, ctx: &egui::Context) {
-        // Tabs follow the instruments' switches. Note which tabs exist now,
-        // so one that is gone afterwards, however it was closed, switches
-        // its instrument off.
-        let switches = self.instrument_switches();
-        dock::reconcile(&mut self.dock, &switches);
-        let before: Vec<(Pane, bool)> = Pane::INSTRUMENTS
-            .iter()
-            .map(|&p| (p, dock::is_open(&self.dock, p)))
-            .collect();
-
         // Live values while simulating, otherwise the DC point.
         let live_tags: Vec<Annotation>;
         let annotations: &[Annotation] = match (&self.live, &self.latest, &self.dc) {
@@ -853,45 +856,23 @@ impl DunbrecApp {
         };
         let markers = self.bench.markers(self.doc.schematic());
         let lit = self.lit_leds();
-        let probing = self.canvas.tool == Tool::Probe;
 
         let mut viewer = PaneViewer {
             doc: &mut self.doc,
             canvas: &mut self.canvas,
             properties: &mut self.properties,
-            bench: &mut self.bench,
-            analyses: &mut self.analyses,
-            serial: &mut self.serial,
             palette_search: &mut self.palette_search,
             netlist: &self.netlist.1,
-            node_map: &self.node_map.1,
             dc: &self.dc,
             latest: &self.latest,
             running: self.live.is_some(),
-            probing,
             annotations,
             markers: &markers,
             lit: &lit,
-            probe_clicked: false,
-            timebase_changed: false,
         };
         DockArea::new(&mut self.dock)
             .style(egui_dock::Style::from_egui(ctx.style().as_ref()))
             .show(ctx, &mut viewer);
-        let (probe_clicked, timebase_changed) = (viewer.probe_clicked, viewer.timebase_changed);
-
-        if timebase_changed && let Some(live) = &mut self.live {
-            live.send(Command::SetMaxStep(self.bench.max_step()));
-            live.send(Command::SetSpeed(self.bench.speed.value(&self.bench.scope)));
-        }
-        if probe_clicked {
-            self.canvas.tool = Tool::Probe;
-        }
-        for (pane, was_open) in before {
-            if was_open && !dock::is_open(&self.dock, pane) {
-                self.instrument_closed(pane);
-            }
-        }
     }
 
     // ---------------------------------------------------------- UI ---
@@ -1452,27 +1433,19 @@ fn values_ui(
 }
 
 /// What the dock needs to draw each panel: the parts of the app they show
-/// or edit, borrowed for one frame. Panels report back through
-/// `probe_clicked` and `timebase_changed`.
+/// or edit, borrowed for one frame.
 struct PaneViewer<'a> {
     doc: &'a mut Document,
     canvas: &'a mut Canvas,
     properties: &'a mut Properties,
-    bench: &'a mut Bench,
-    analyses: &'a mut Analyses,
-    serial: &'a mut SerialMonitor,
     palette_search: &'a mut String,
     netlist: &'a Netlist,
-    node_map: &'a NodeMap,
     dc: &'a Option<DcResults>,
     latest: &'a Option<Sample>,
     running: bool,
-    probing: bool,
     annotations: &'a [Annotation],
     markers: &'a [Marker],
     lit: &'a std::collections::HashSet<dunbrec_core::ComponentId>,
-    probe_clicked: bool,
-    timebase_changed: bool,
 }
 
 impl TabViewer for PaneViewer<'_> {
@@ -1501,54 +1474,7 @@ impl TabViewer for PaneViewer<'_> {
             }
             Pane::Checks => checks_ui(ui, self.netlist, self.doc.schematic()),
             Pane::Values => values_ui(ui, self.netlist, self.running, self.latest, self.dc),
-            Pane::Scope => {
-                let (timebase, probe) = self.bench.scope_ui(
-                    ui,
-                    self.doc.schematic(),
-                    self.netlist,
-                    self.node_map,
-                    self.probing,
-                );
-                self.timebase_changed |= timebase;
-                self.probe_clicked |= probe;
-            }
-            Pane::Meter => {
-                self.probe_clicked |= self.bench.meter_ui(
-                    ui,
-                    self.doc.schematic(),
-                    self.netlist,
-                    self.node_map,
-                    self.probing,
-                    self.running,
-                );
-            }
-            Pane::Logic => {
-                self.probe_clicked |= self.bench.logic_ui(
-                    ui,
-                    self.doc.schematic(),
-                    self.netlist,
-                    self.node_map,
-                    self.probing,
-                );
-            }
-            Pane::Bode | Pane::Transfer | Pane::Tracer => {
-                let mut inputs = Inputs {
-                    doc: &mut *self.doc,
-                    netlist: self.netlist,
-                    map: self.node_map,
-                    bench: &mut *self.bench,
-                    probing: self.probing,
-                };
-                match *tab {
-                    Pane::Bode => self.probe_clicked |= self.analyses.bode_ui(ui, &mut inputs),
-                    Pane::Transfer => {
-                        self.probe_clicked |= self.analyses.transfer_ui(ui, &mut inputs)
-                    }
-                    _ => self.analyses.tracer_ui(ui, &mut inputs),
-                }
-            }
-            Pane::Fgen => self.analyses.fgen_ui(ui, self.doc),
-            Pane::Serial => self.serial.ui(ui),
+            Pane::Retired => {}
         }
     }
 
@@ -1560,15 +1486,9 @@ impl TabViewer for PaneViewer<'_> {
         tab.closeable()
     }
 
-    /// Panels that scroll themselves, or draw edge to edge, get no scroll
-    /// bars from the dock. Instruments scroll vertically only, so their
-    /// width stays the width of the tab.
-    fn scroll_bars(&self, tab: &Pane) -> [bool; 2] {
-        if tab.is_instrument() {
-            [false, true]
-        } else {
-            [false, false]
-        }
+    /// Every panel scrolls itself, or draws edge to edge.
+    fn scroll_bars(&self, _tab: &Pane) -> [bool; 2] {
+        [false, false]
     }
 
     /// The schematic fills its tab to the edge.
@@ -1629,9 +1549,8 @@ impl eframe::App for DunbrecApp {
             let s = self.doc.schematic();
             let on_net = self.node_map.1.node_at(s, &self.netlist.1, at).is_some();
             self.probe_hint = self.bench.connect(at, part, on_net).err();
-            // The instruments were drawn before this click was handled.
-            ctx.request_repaint();
         }
+        self.instrument_windows(ctx);
 
         // Drop selections of items that no longer exist (after undo etc.).
         let s = self.doc.schematic();

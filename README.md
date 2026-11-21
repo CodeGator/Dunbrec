@@ -37,13 +37,13 @@ drag empty space to box-select, Del deletes, Ctrl+C / X / V / D copy, cut, paste
 duplicate, Ctrl+Z / Y undo and redo. Wheel zooms, middle-drag pans. Values accept engineering
 notation (`4k7`, `10u`, `2.2M`). Help → Keyboard shortcuts lists everything.
 
-**Panels.** Every panel (the schematic, palette, properties, checks, live values and each
-instrument) is a tab you can drag. Drop it on the edge of another panel to split the window,
-on the middle of one to stack it as a tab, or outside the window area to float it. Drag the
-dividers to resize. Closing a panel's tab hides it: bring Palette, Properties, Checks or Values
-back from View → Panels, and reopen an instrument from the toolbar or Instruments menu (a newly
-opened instrument appears in a tab strip under the schematic). The arrangement is remembered
-between sessions; View → Reset layout puts everything back.
+**Panels.** The schematic, palette, properties, checks and live values are tabs you can drag.
+Drop one on the edge of another panel to split the window, on the middle of one to stack it as
+a tab, or outside the window area to float it. Drag the dividers to resize. Closing a tab hides
+it: bring Palette, Properties, Checks or Values back from View → Panels. The arrangement is
+remembered between sessions; View → Reset layout puts everything back. Instruments (the
+oscilloscope, multimeter and the rest) are separate floating windows that you can move and
+resize freely but that never dock; open them from the toolbar or the Instruments menu.
 
 **Checking.** The Checks panel lists wiring problems in plain English (missing ground,
 unconnected pins, missing models), and the DC operating point is recalculated after every edit

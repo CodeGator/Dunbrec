@@ -51,19 +51,20 @@ powershell -ExecutionPolicy Bypass -File tools\build-installer.ps1   # MSI; need
 
 UI layout (`dock.rs`, `PaneViewer` in `app.rs`):
 
-- Every panel is a `Pane` tab in an `egui_dock::DockState`. Only the menu bar, run toolbar and
-  status bar are fixed. `dock.rs` has the pane list, `default_layout`, `open` / `close`
-  placement, `reconcile` and `sanitize`; `PaneViewer` (in `app.rs`) draws each pane from
-  borrowed app state. Instrument bodies are plain `*_ui(ui, …)` functions on `Bench`,
-  `Analyses` and `SerialMonitor`.
-- Instrument visibility is still the `show_*` flags (toolbar, menus, serial auto-open).
-  `reconcile` adds or removes tabs to match each frame, and a tab that disappears from the dock
-  (closed any way) switches its instrument off (`DunbrecApp::dock_area`).
+- The schematic, palette, properties, checks and values are `Pane` tabs in an
+  `egui_dock::DockState`. The menu bar, run toolbar and status bar are fixed. `dock.rs` has the
+  pane list, `default_layout`, `open` / `close` placement and `sanitize`; `PaneViewer` (in
+  `app.rs`) draws each pane from borrowed app state.
+- **Instruments never dock** (the user's decision): each is a floating `egui::Window`
+  (`Bench::scope_window` / `meter_window` / `logic_window`, `Analyses::show`,
+  `SerialMonitor::window`), switched by the `show_*` flags. They briefly were dock tabs in the
+  first version of Phase 13. `Pane::Retired` (`#[serde(other)]`) lets layouts saved then still
+  load; those tabs are dropped on load.
 - In `egui_dock` splits, `fraction` is the share of the *first* child (left or top), which is
   the new panel for `split_left` despite the crate's wording. `dock.rs` has a test on the real
   proportions.
 - The layout is saved under `dunbrec.layout.v1` in eframe storage, separate from `Settings`,
-  and restored through `sanitize` (instruments dropped, duplicates removed, no schematic means
+  and restored through `sanitize` (retired tabs dropped, duplicates removed, no schematic means
   default). Bump the key suffix if panes change in a way old layouts cannot express.
 
 Key mechanisms worth knowing before changing the engine:

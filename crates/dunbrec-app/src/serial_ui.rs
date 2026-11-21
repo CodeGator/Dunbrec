@@ -59,13 +59,24 @@ impl SerialMonitor {
         self.logs.get(designator).map(|s| s.as_str())
     }
 
-    /// The user closed the monitor: stay closed until they open it again.
-    pub fn close(&mut self) {
-        self.show = false;
-        self.dismissed = true;
+    /// The monitor as a floating window; closing it keeps it closed until
+    /// the user opens it again.
+    pub fn window(&mut self, ctx: &egui::Context) {
+        if !self.show {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("Serial monitor")
+            .open(&mut open)
+            .default_size([460.0, 300.0])
+            .show(ctx, |ui| self.ui(ui));
+        if !open {
+            self.show = false;
+            self.dismissed = true;
+        }
     }
 
-    pub fn ui(&mut self, ui: &mut egui::Ui) {
+    fn ui(&mut self, ui: &mut egui::Ui) {
         {
             {
                 ui.horizontal(|ui| {

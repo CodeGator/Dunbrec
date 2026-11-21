@@ -346,6 +346,31 @@ impl Bench {
 
     // ------------------------------------------------- oscilloscope ---
 
+    /// The oscilloscope as a floating window. Returns (timebase changed, a
+    /// probe button was clicked).
+    pub fn scope_window(
+        &mut self,
+        ctx: &egui::Context,
+        s: &Schematic,
+        netlist: &Netlist,
+        map: &NodeMap,
+        probe_tool_active: bool,
+    ) -> (bool, bool) {
+        let mut result = (false, false);
+        let mut open = self.show_scope;
+        egui::Window::new("Oscilloscope")
+            .open(&mut open)
+            .default_size([520.0, 520.0])
+            // Top right, over the properties panel, leaving the schematic clear.
+            .default_pos(ctx.content_rect().right_top() + vec2(-540.0, 90.0))
+            .resizable(true)
+            .show(ctx, |ui| {
+                result = self.scope_ui(ui, s, netlist, map, probe_tool_active);
+            });
+        self.show_scope = open;
+        result
+    }
+
     /// Returns (timebase changed, a probe button was clicked).
     pub fn scope_ui(
         &mut self,
@@ -508,6 +533,31 @@ impl Bench {
 
     // ----------------------------------------------------- multimeter ---
 
+    /// The multimeter as a floating window. Returns true if a probe button
+    /// was clicked.
+    pub fn meter_window(
+        &mut self,
+        ctx: &egui::Context,
+        s: &Schematic,
+        netlist: &Netlist,
+        map: &NodeMap,
+        probe_tool_active: bool,
+        running: bool,
+    ) -> bool {
+        let mut probe_clicked = false;
+        let mut open = self.show_meter;
+        egui::Window::new("Multimeter")
+            .open(&mut open)
+            .default_size([300.0, 220.0])
+            .default_pos(ctx.content_rect().left_bottom() + vec2(150.0, -440.0))
+            .resizable(false)
+            .show(ctx, |ui| {
+                probe_clicked = self.meter_ui(ui, s, netlist, map, probe_tool_active, running);
+            });
+        self.show_meter = open;
+        probe_clicked
+    }
+
     /// Returns true if a probe button was clicked.
     pub fn meter_ui(
         &mut self,
@@ -665,6 +715,28 @@ impl Bench {
                 });
             }
         }
+        probe_clicked
+    }
+
+    /// The logic analyser as a floating window. Returns true if a probe
+    /// button was clicked.
+    pub fn logic_window(
+        &mut self,
+        ctx: &egui::Context,
+        s: &Schematic,
+        netlist: &Netlist,
+        map: &NodeMap,
+        probe_tool_active: bool,
+    ) -> bool {
+        let mut probe_clicked = false;
+        let mut open = self.show_logic;
+        egui::Window::new("Logic analyser")
+            .open(&mut open)
+            .default_size([560.0, 420.0])
+            .show(ctx, |ui| {
+                probe_clicked = self.logic_ui(ui, s, netlist, map, probe_tool_active);
+            });
+        self.show_logic = open;
         probe_clicked
     }
 

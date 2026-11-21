@@ -1,9 +1,11 @@
-//! The dockable panel layout: which panels exist, where they start, how the
-//! arrangement is saved and restored, and keeping instrument tabs in step
-//! with their on/off switches. What a panel shows lives with the code that
-//! owns its data (see the pane viewer in `app.rs`).
+//! The dockable panel layout: which panels exist, where they start, and how
+//! the arrangement is saved and restored. What a panel shows lives with the
+//! code that owns its data (see the pane viewer in `app.rs`).
+//!
+//! Instruments are deliberately not part of this: they are floating windows
+//! that never dock.
 
-use egui_dock::{DockState, Node, NodeIndex, Split};
+use egui_dock::{DockState, Node, NodeIndex, Split, SurfaceIndex};
 use serde::{Deserialize, Serialize};
 
 /// Storage key for the saved arrangement. Bump the suffix when panes change
@@ -18,32 +20,16 @@ pub enum Pane {
     Properties,
     Checks,
     Values,
-    Scope,
-    Meter,
-    Logic,
-    Bode,
-    Transfer,
-    Tracer,
-    Fgen,
-    Serial,
+    /// A panel an older build could dock (the instruments). Layouts saved by
+    /// those builds still load; these tabs are dropped on the way in.
+    #[serde(other)]
+    Retired,
 }
 
 impl Pane {
     /// The panels the user can bring back from View → Panels.
     pub const SIDE_PANELS: [Pane; 4] =
         [Pane::Palette, Pane::Properties, Pane::Checks, Pane::Values];
-
-    /// Instruments, whose visibility is a flag the toolbar and menus own.
-    pub const INSTRUMENTS: [Pane; 8] = [
-        Pane::Scope,
-        Pane::Meter,
-        Pane::Logic,
-        Pane::Bode,
-        Pane::Transfer,
-        Pane::Tracer,
-        Pane::Fgen,
-        Pane::Serial,
-    ];
 
     pub fn title(self) -> &'static str {
         match self {
@@ -52,19 +38,8 @@ impl Pane {
             Pane::Properties => "Properties",
             Pane::Checks => "Checks",
             Pane::Values => "Values",
-            Pane::Scope => "Oscilloscope",
-            Pane::Meter => "Multimeter",
-            Pane::Logic => "Logic analyser",
-            Pane::Bode => "Bode plotter",
-            Pane::Transfer => "DC transfer",
-            Pane::Tracer => "Curve tracer",
-            Pane::Fgen => "Function generator",
-            Pane::Serial => "Serial monitor",
+            Pane::Retired => "",
         }
-    }
-
-    pub fn is_instrument(self) -> bool {
-        Pane::INSTRUMENTS.contains(&self)
     }
 
     /// The schematic is the one panel that cannot be closed.
@@ -79,8 +54,6 @@ const PALETTE_SHARE: f32 = 0.15;
 const SCHEMATIC_SHARE: f32 = 0.78;
 /// Share of the height the panels above the checks and values keep.
 const UPPER_SHARE: f32 = 0.85;
-/// Share of its height the schematic keeps when an instrument opens below it.
-const SCHEMATIC_ABOVE_INSTRUMENTS: f32 = 0.6;
 
 /// The arrangement a new user starts with, and what View → Reset layout
 /// returns to: schematic in the middle, palette on the left, properties on
@@ -130,12 +103,7 @@ pub fn open(dock: &mut DockState<Pane>, pane: Pane) {
                     .split_below(NodeIndex::root(), UPPER_SHARE, vec![pane]);
             }
         }
-        _ => {
-            // Instruments share a tab strip under the schematic.
-            if !join(dock, &Pane::INSTRUMENTS, pane) {
-                split_schematic(dock, Split::Below, SCHEMATIC_ABOVE_INSTRUMENTS, pane);
-            }
-        }
+        Pane::Retired => {}
     }
 }
 
@@ -165,22 +133,12 @@ fn join(dock: &mut DockState<Pane>, group: &[Pane], pane: Pane) -> bool {
     true
 }
 
-/// Make the instrument tabs match which instruments are switched on.
-pub fn reconcile(dock: &mut DockState<Pane>, wanted: &[(Pane, bool)]) {
-    for &(pane, on) in wanted {
-        match (on, is_open(dock, pane)) {
-            (true, false) => open(dock, pane),
-            (false, true) => close(dock, pane),
-            _ => {}
-        }
-    }
-}
-
-/// Make a restored layout safe to use: instruments start switched off, so
-/// their tabs are dropped; a panel appearing twice keeps its first tab; and
-/// a layout with no schematic is replaced by the default.
+/// Make a restored layout safe to use: tabs from panels that no longer dock
+/// are dropped (along with any floating window they leave empty, which the
+/// dock cannot draw); a panel appearing twice keeps its first tab; and a
+/// layout with no schematic is replaced by the default.
 pub fn sanitize(mut state: DockState<Pane>) -> DockState<Pane> {
-    state.retain_tabs(|p| !p.is_instrument());
+    state.retain_tabs(|p| *p != Pane::Retired);
     let mut seen: Vec<Pane> = Vec::new();
     state.retain_tabs(|p| {
         if seen.contains(p) {
@@ -190,6 +148,18 @@ pub fn sanitize(mut state: DockState<Pane>) -> DockState<Pane> {
             true
         }
     });
+    let emptied: Vec<SurfaceIndex> = (1..state.surfaces_count())
+        .map(SurfaceIndex)
+        .filter(|&i| {
+            state
+                .get_surface(i)
+                .and_then(|surface| surface.node_tree())
+                .is_some_and(|tree| tree.num_tabs() == 0)
+        })
+        .collect();
+    for surface in emptied.into_iter().rev() {
+        state.remove_surface(surface);
+    }
     if seen.contains(&Pane::Schematic) {
         state
     } else {
@@ -240,11 +210,6 @@ mod tests {
         close(&mut dock, Pane::Palette);
         open(&mut dock, Pane::Palette);
         assert!(near(share_of(&dock, Pane::Palette), PALETTE_SHARE));
-        open(&mut dock, Pane::Scope);
-        assert!(near(
-            share_of(&dock, Pane::Scope),
-            1.0 - SCHEMATIC_ABOVE_INSTRUMENTS
-        ));
     }
 
     #[test]
@@ -274,23 +239,6 @@ mod tests {
     }
 
     #[test]
-    fn instruments_share_a_strip_under_the_schematic() {
-        let mut dock = default_layout();
-        open(&mut dock, Pane::Scope);
-        assert_ne!(leaf_of(&dock, Pane::Scope), leaf_of(&dock, Pane::Schematic));
-        open(&mut dock, Pane::Meter);
-        assert_eq!(leaf_of(&dock, Pane::Scope), leaf_of(&dock, Pane::Meter));
-        // Opening twice does not duplicate, and does not move it.
-        let before = leaf_of(&dock, Pane::Meter);
-        open(&mut dock, Pane::Meter);
-        assert_eq!(leaf_of(&dock, Pane::Meter), before);
-        assert_eq!(
-            panes(&dock).iter().filter(|p| **p == Pane::Meter).count(),
-            1
-        );
-    }
-
-    #[test]
     fn side_panels_come_back_where_they_belong() {
         let mut dock = default_layout();
         for p in Pane::SIDE_PANELS {
@@ -304,25 +252,10 @@ mod tests {
         }
         assert_eq!(leaf_of(&dock, Pane::Checks), leaf_of(&dock, Pane::Values));
         assert_eq!(panes(&dock).len(), 5);
-    }
-
-    #[test]
-    fn reconcile_follows_the_switches() {
-        let mut dock = default_layout();
-        reconcile(
-            &mut dock,
-            &[
-                (Pane::Scope, true),
-                (Pane::Logic, true),
-                (Pane::Meter, false),
-            ],
-        );
-        assert!(is_open(&dock, Pane::Scope) && is_open(&dock, Pane::Logic));
-        assert!(!is_open(&dock, Pane::Meter));
-        reconcile(&mut dock, &[(Pane::Scope, false), (Pane::Logic, true)]);
-        assert!(!is_open(&dock, Pane::Scope) && is_open(&dock, Pane::Logic));
-        // Closing the last instrument leaves the core panels intact.
-        reconcile(&mut dock, &[(Pane::Logic, false)]);
+        // Opening one that is already open leaves it alone.
+        let before = leaf_of(&dock, Pane::Palette);
+        open(&mut dock, Pane::Palette);
+        assert_eq!(leaf_of(&dock, Pane::Palette), before);
         assert_eq!(panes(&dock).len(), 5);
     }
 
@@ -330,14 +263,69 @@ mod tests {
     fn layout_survives_a_save_and_load() {
         let mut dock = default_layout();
         close(&mut dock, Pane::Palette);
-        open(&mut dock, Pane::Scope);
         let text = ron::to_string(&dock).unwrap();
         let back: DockState<Pane> = ron::from_str(&text).unwrap();
         assert_eq!(panes(&back), panes(&dock));
-        // On restore, instruments are dropped (their switches start off).
         let restored = sanitize(back);
-        assert!(!is_open(&restored, Pane::Scope));
         assert!(!is_open(&restored, Pane::Palette));
+        assert!(is_open(&restored, Pane::Schematic));
+    }
+
+    #[test]
+    fn layouts_saved_when_instruments_could_dock_still_load() {
+        // An older build wrote tabs named after the instruments. They load
+        // as retired panels and are dropped; everything else is kept.
+        let text = ron::to_string(&default_layout())
+            .unwrap()
+            .replacen("Values", "Scope", 1);
+        assert!(text.contains("Scope"));
+        let loaded: DockState<Pane> = ron::from_str(&text).unwrap();
+        assert!(panes(&loaded).contains(&Pane::Retired));
+        let restored = sanitize(loaded);
+        let mut found = panes(&restored);
+        found.sort_by_key(|p| p.title());
+        let mut expected = vec![
+            Pane::Schematic,
+            Pane::Palette,
+            Pane::Properties,
+            Pane::Checks,
+        ];
+        expected.sort_by_key(|p| p.title());
+        assert_eq!(found, expected);
+    }
+
+    /// A viewer that draws nothing, to run the dock headlessly.
+    struct Blank;
+
+    impl egui_dock::TabViewer for Blank {
+        type Tab = Pane;
+        fn title(&mut self, tab: &mut Pane) -> egui::WidgetText {
+            tab.title().into()
+        }
+        fn ui(&mut self, _ui: &mut egui::Ui, _tab: &mut Pane) {}
+    }
+
+    #[test]
+    fn a_floating_window_emptied_by_the_cleanup_is_removed_and_nothing_panics() {
+        // A layout saved when an instrument had floated out of the dock: a
+        // window surface holding only a retired tab.
+        let mut state = default_layout();
+        state.add_window(vec![Pane::Retired]);
+        let restored = sanitize(state);
+        assert!(
+            (1..restored.surfaces_count()).all(|i| !restored.is_surface_valid(SurfaceIndex(i))),
+            "an empty window was kept"
+        );
+
+        // The dock draws it without a problem (an emptied window used to
+        // panic inside egui_dock).
+        let mut restored = restored;
+        let ctx = egui::Context::default();
+        for _ in 0..2 {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui_dock::DockArea::new(&mut restored).show(ctx, &mut Blank);
+            });
+        }
         assert!(is_open(&restored, Pane::Schematic));
     }
 
