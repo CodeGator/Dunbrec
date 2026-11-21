@@ -1,3 +1,7 @@
 /target
 **/*.rs.bk
 .claude/settings.local.json
+
+# Test projects made with the app while developing
+/projects/
+/Projects/
