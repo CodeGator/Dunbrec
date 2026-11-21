@@ -14,7 +14,7 @@ use num_complex::Complex64;
 use crate::circuit::{Circuit, FLOATING_SHUNT};
 use crate::device::Tolerances;
 use crate::error::SimError;
-use crate::newton::{Workspace, dc_solve};
+use crate::newton::Workspace;
 use crate::stamp::{BranchId, SolutionView, node_rows};
 
 pub type C64 = Complex64;
@@ -258,9 +258,8 @@ pub fn ac_analysis(
     let circuit = Circuit::from_netlist(netlist, models)?;
     let size = circuit.unknown_count();
     let rows = node_rows(circuit.node_count());
-    let op = dc_solve(
+    let op = crate::digital::operating_solution(
         &circuit,
-        false,
         &mut Workspace::new(size),
         &Tolerances::default(),
     )?;

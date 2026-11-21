@@ -3,7 +3,7 @@
 //! Pin positions come from `dunbrec_core` (`ComponentKind::pins`); every
 //! symbol has a lead ending exactly on each pin.
 
-use dunbrec_core::{Component, ComponentKind, Polarity, Rotation, Waveform};
+use dunbrec_core::{Component, ComponentKind, GateOp, Polarity, Rotation, Waveform};
 use egui::{Pos2, Rect, pos2};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -103,6 +103,76 @@ pub fn symbol(kind: &ComponentKind) -> Symbol {
         _ => false,
     };
     symbol_styled(kind, zener)
+}
+
+/// Quadratic Bézier curve sampled as a polyline.
+fn bezier(p0: (f32, f32), c: (f32, f32), p1: (f32, f32)) -> Vec<Pos2> {
+    const STEPS: usize = 12;
+    (0..=STEPS)
+        .map(|i| {
+            let t = i as f32 / STEPS as f32;
+            let u = 1.0 - t;
+            pos2(
+                u * u * p0.0 + 2.0 * u * t * c.0 + t * t * p1.0,
+                u * u * p0.1 + 2.0 * u * t * c.1 + t * t * p1.1,
+            )
+        })
+        .collect()
+}
+
+/// Closed rectangle outline.
+fn rect(x0: f32, y0: f32, x1: f32, y1: f32) -> Prim {
+    line(&[(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)])
+}
+
+/// Inversion bubble whose right edge touches `x_tip`.
+fn bubble(x_tip: f32) -> Prim {
+    Prim::Circle {
+        center: pos2(x_tip - 0.25, 0.0),
+        radius: 0.25,
+    }
+}
+
+/// A 2-input gate in the distinctive-shape style.
+fn gate_symbol(p: &mut Vec<Prim>, op: GateOp) {
+    let inverted = matches!(op, GateOp::Nand | GateOp::Nor | GateOp::Xnor);
+    let tip = 1.5;
+    match op {
+        GateOp::And | GateOp::Nand => {
+            p.push(line(&[(0.0, -1.5), (-1.5, -1.5), (-1.5, 1.5), (0.0, 1.5)]));
+            p.push(Prim::Line(arc(
+                (0.0, 0.0),
+                1.5,
+                -std::f32::consts::FRAC_PI_2,
+                std::f32::consts::FRAC_PI_2,
+            )));
+            p.push(line(&[(-3.0, -1.0), (-1.5, -1.0)]));
+            p.push(line(&[(-3.0, 1.0), (-1.5, 1.0)]));
+        }
+        _ => {
+            // OR family: concave back, curved sides meeting at the tip.
+            p.push(Prim::Line(bezier((-1.5, -1.5), (-0.7, 0.0), (-1.5, 1.5))));
+            p.push(Prim::Line(bezier((-1.5, -1.5), (0.6, -1.5), (tip, 0.0))));
+            p.push(Prim::Line(bezier((-1.5, 1.5), (0.6, 1.5), (tip, 0.0))));
+            if matches!(op, GateOp::Xor | GateOp::Xnor) {
+                p.push(Prim::Line(bezier((-1.9, -1.5), (-1.1, 0.0), (-1.9, 1.5))));
+            }
+            // Inputs end on the back curve (x ≈ -1.1 at y = ±1).
+            p.push(line(&[(-3.0, -1.0), (-1.13, -1.0)]));
+            p.push(line(&[(-3.0, 1.0), (-1.13, 1.0)]));
+        }
+    }
+    if inverted {
+        p.push(bubble(tip + 0.5));
+        p.push(line(&[(tip + 0.5, 0.0), (3.0, 0.0)]));
+    } else {
+        p.push(line(&[(tip, 0.0), (3.0, 0.0)]));
+    }
+}
+
+/// Clock-input triangle on the left edge of a box at `x`, centred on `y`.
+fn clock_mark(x: f32, y: f32) -> Prim {
+    line(&[(x, y - 0.4), (x + 0.5, y), (x, y + 0.4)])
 }
 
 pub fn symbol_styled(kind: &ComponentKind, zener: bool) -> Symbol {
@@ -253,6 +323,72 @@ pub fn symbol_styled(kind: &ComponentKind, zener: bool) -> Symbol {
             } else {
                 p.push(line(&[(-1.0, 0.0), (0.85, -0.75)]));
             }
+        }
+        ComponentKind::Gate { op, .. } => {
+            gate_symbol(&mut p, *op);
+            label = pos2(0.0, -2.2);
+        }
+        ComponentKind::Inverter { .. } => {
+            p.push(line(&[(-1.5, -1.2), (1.2, 0.0), (-1.5, 1.2), (-1.5, -1.2)]));
+            p.push(bubble(1.7));
+            p.push(line(&[(-3.0, 0.0), (-1.5, 0.0)]));
+            p.push(line(&[(1.7, 0.0), (3.0, 0.0)]));
+            label = pos2(0.0, -1.8);
+        }
+        ComponentKind::DFlipFlop { .. } => {
+            p.push(rect(-2.0, -2.5, 2.0, 2.5));
+            p.push(line(&[(-3.0, -1.0), (-2.0, -1.0)]));
+            p.push(line(&[(-3.0, 1.0), (-2.0, 1.0)]));
+            p.push(line(&[(2.0, -1.0), (3.0, -1.0)]));
+            p.push(line(&[(2.0, 1.0), (3.0, 1.0)]));
+            p.push(clock_mark(-2.0, 1.0));
+            p.push(text(-1.4, -1.0, "D", 0.7));
+            p.push(text(1.3, -1.0, "Q", 0.7));
+            p.push(text(1.3, 1.0, "Q̅", 0.7));
+            label = pos2(0.0, -3.1);
+        }
+        ComponentKind::Counter4 { .. } => {
+            p.push(rect(-2.0, -4.0, 2.0, 4.0));
+            p.push(line(&[(-3.0, 0.0), (-2.0, 0.0)]));
+            p.push(clock_mark(-2.0, 0.0));
+            for (y, name) in [(-3.0, "Q0"), (-1.0, "Q1"), (1.0, "Q2"), (3.0, "Q3")] {
+                p.push(line(&[(2.0, y), (3.0, y)]));
+                p.push(text(1.2, y, name, 0.6));
+            }
+            p.push(text(-0.6, -3.2, "CTR", 0.6));
+            label = pos2(0.0, -4.6);
+        }
+        ComponentKind::Clock { .. } => {
+            p.push(rect(-1.5, -1.0, 1.5, 1.0));
+            p.push(line(&[
+                (-1.1, 0.5),
+                (-0.55, 0.5),
+                (-0.55, -0.5),
+                (0.0, -0.5),
+                (0.0, 0.5),
+                (0.55, 0.5),
+                (0.55, -0.5),
+                (1.1, -0.5),
+            ]));
+            p.push(line(&[(1.5, 0.0), (3.0, 0.0)]));
+            label = pos2(0.0, -1.6);
+        }
+        ComponentKind::LogicSwitch { high } => {
+            p.push(rect(-1.5, -1.0, 1.5, 1.0));
+            p.push(text(0.0, 0.0, if *high { "1" } else { "0" }, 1.4));
+            p.push(line(&[(1.5, 0.0), (3.0, 0.0)]));
+            label = pos2(0.0, -1.6);
+        }
+        ComponentKind::LogicLed => {
+            p.push(line(&[(-3.0, 0.0), (-1.0, 0.0)]));
+            p.push(Prim::Circle {
+                center: pos2(0.0, 0.0),
+                radius: 1.0,
+            });
+            for (dx, dy) in [(0.9, -0.9), (1.3, -0.4)] {
+                p.push(line(&[(dx, dy - 0.3), (dx + 0.5, dy - 0.8)]));
+            }
+            label = pos2(0.0, 1.6);
         }
         ComponentKind::Vcvs { .. }
         | ComponentKind::Vccs { .. }

@@ -5,7 +5,10 @@
 //! Real parts (2N3904, 1N4148, ...) belong in a model library checked against
 //! manufacturer data, which comes later.
 
-use dunbrec_core::{ComponentKind, DeviceModel, ModelKind, Polarity, Schematic, Waveform};
+use dunbrec_core::{
+    ComponentKind, DEFAULT_LOGIC_DELAY, DeviceModel, GateOp, ModelKind, Polarity, Schematic,
+    Waveform,
+};
 
 pub struct PaletteEntry {
     pub name: &'static str,
@@ -183,6 +186,93 @@ pub fn palette() -> &'static [PaletteEntry] {
             make: || ComponentKind::Diode {
                 model: "1N750".into(),
             },
+        },
+        PaletteEntry {
+            name: "AND gate",
+            group: "Digital",
+            make: || ComponentKind::Gate {
+                op: GateOp::And,
+                delay: DEFAULT_LOGIC_DELAY,
+            },
+        },
+        PaletteEntry {
+            name: "OR gate",
+            group: "Digital",
+            make: || ComponentKind::Gate {
+                op: GateOp::Or,
+                delay: DEFAULT_LOGIC_DELAY,
+            },
+        },
+        PaletteEntry {
+            name: "NAND gate",
+            group: "Digital",
+            make: || ComponentKind::Gate {
+                op: GateOp::Nand,
+                delay: DEFAULT_LOGIC_DELAY,
+            },
+        },
+        PaletteEntry {
+            name: "NOR gate",
+            group: "Digital",
+            make: || ComponentKind::Gate {
+                op: GateOp::Nor,
+                delay: DEFAULT_LOGIC_DELAY,
+            },
+        },
+        PaletteEntry {
+            name: "XOR gate",
+            group: "Digital",
+            make: || ComponentKind::Gate {
+                op: GateOp::Xor,
+                delay: DEFAULT_LOGIC_DELAY,
+            },
+        },
+        PaletteEntry {
+            name: "XNOR gate",
+            group: "Digital",
+            make: || ComponentKind::Gate {
+                op: GateOp::Xnor,
+                delay: DEFAULT_LOGIC_DELAY,
+            },
+        },
+        PaletteEntry {
+            name: "Inverter (NOT)",
+            group: "Digital",
+            make: || ComponentKind::Inverter {
+                delay: DEFAULT_LOGIC_DELAY,
+            },
+        },
+        PaletteEntry {
+            name: "D flip-flop",
+            group: "Digital",
+            make: || ComponentKind::DFlipFlop {
+                delay: DEFAULT_LOGIC_DELAY,
+            },
+        },
+        PaletteEntry {
+            name: "4-bit counter",
+            group: "Digital",
+            make: || ComponentKind::Counter4 {
+                delay: DEFAULT_LOGIC_DELAY,
+            },
+        },
+        PaletteEntry {
+            name: "Clock",
+            group: "Digital",
+            make: || ComponentKind::Clock {
+                frequency: 1e3,
+                duty: 0.5,
+            },
+        },
+        PaletteEntry {
+            name: "Logic switch",
+            group: "Digital",
+            make: || ComponentKind::LogicSwitch { high: false },
+        },
+        PaletteEntry {
+            name: "Logic LED",
+            group: "Digital",
+            make: || ComponentKind::LogicLed,
         },
         PaletteEntry {
             name: "VCVS (E)",

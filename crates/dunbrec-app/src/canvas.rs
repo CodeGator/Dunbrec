@@ -556,12 +556,15 @@ pub fn paste(s: &mut Schematic, clip: &Clipboard, offset: Point) -> BTreeSet<Ite
     pasted
 }
 
-/// Flip a switch between open and closed.
+/// Flip a switch between open and closed, or a logic switch between low
+/// and high.
 pub fn toggle_switch(s: &mut Schematic, id: ComponentId) {
-    if let Some(c) = s.component_mut(id)
-        && let ComponentKind::Switch { closed, .. } = &mut c.kind
-    {
-        *closed = !*closed;
+    if let Some(c) = s.component_mut(id) {
+        match &mut c.kind {
+            ComponentKind::Switch { closed, .. } => *closed = !*closed,
+            ComponentKind::LogicSwitch { high } => *high = !*high,
+            _ => {}
+        }
     }
 }
 
@@ -623,6 +626,13 @@ pub fn value_text(kind: &ComponentKind) -> String {
         ComponentKind::Vcvs { gain } | ComponentKind::Cccs { gain } => format!("×{gain}"),
         ComponentKind::Vccs { transconductance } => format_value(*transconductance, "S"),
         ComponentKind::Ccvs { transresistance } => format_value(*transresistance, "Ω"),
+        ComponentKind::Gate { op, .. } => op.name().into(),
+        ComponentKind::Inverter { .. } => "NOT".into(),
+        ComponentKind::DFlipFlop { .. }
+        | ComponentKind::Counter4 { .. }
+        | ComponentKind::LogicLed => String::new(),
+        ComponentKind::Clock { frequency, .. } => format_value(*frequency, "Hz"),
+        ComponentKind::LogicSwitch { high } => (if *high { "high" } else { "low" }).into(),
     }
 }
 
@@ -753,6 +763,7 @@ impl Canvas {
         netlist: &Netlist,
         annotations: &[Annotation],
         markers: &[Marker],
+        lit: &std::collections::HashSet<ComponentId>,
     ) {
         let (response, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
         let rect = response.rect;
@@ -875,6 +886,19 @@ impl Canvas {
                     colors.text
                 }),
             );
+            if matches!(c.kind, ComponentKind::LogicLed) && lit.contains(&c.id) {
+                let centre = p.screen(symbols::to_schematic(c, pos2(0.0, 0.0)));
+                painter.circle_filled(
+                    centre,
+                    self.camera.scale * 1.6,
+                    Color32::from_rgba_unmultiplied(255, 60, 40, 60),
+                );
+                painter.circle_filled(
+                    centre,
+                    self.camera.scale * 0.85,
+                    Color32::from_rgb(255, 70, 50),
+                );
+            }
         }
         for l in &s.labels {
             let selected = self.selection.contains(&Item::Label(l.id));
@@ -1152,7 +1176,7 @@ impl Canvas {
                 grid_pointer.and_then(|p| hit_test(doc.schematic(), p))
             && matches!(
                 doc.schematic().component(id).map(|c| &c.kind),
-                Some(ComponentKind::Switch { .. })
+                Some(ComponentKind::Switch { .. } | ComponentKind::LogicSwitch { .. })
             )
         {
             doc.edit(|s| toggle_switch(s, id));

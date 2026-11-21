@@ -37,7 +37,88 @@ pub fn examples() -> &'static [Example] {
             name: "CMOS inverter",
             build: cmos_inverter,
         },
+        Example {
+            name: "Logic gates",
+            build: logic_gates,
+        },
+        Example {
+            name: "Binary counter",
+            build: binary_counter,
+        },
     ]
+}
+
+fn logic_gate(op: dunbrec_core::GateOp) -> K {
+    K::Gate {
+        op,
+        delay: dunbrec_core::DEFAULT_LOGIC_DELAY,
+    }
+}
+
+/// Two logic switches into AND, OR and XOR gates, each lighting an LED.
+/// Double-click a switch to flip it.
+pub fn logic_gates() -> Schematic {
+    use dunbrec_core::GateOp;
+    let mut s = Schematic::new();
+    place(&mut s, K::LogicSwitch { high: true }, -10, -4, Rotation::R0); // Y (-7,-4)
+    place(&mut s, K::LogicSwitch { high: false }, -10, 4, Rotation::R0); // Y (-7,4)
+    // Gates: A (-3, y-1), B (-3, y+1), Y (3, y) for y = -8, 0, 8.
+    for (op, y) in [(GateOp::And, -8), (GateOp::Or, 0), (GateOp::Xor, 8)] {
+        place(&mut s, logic_gate(op), 0, y, Rotation::R0);
+        place(&mut s, K::LogicLed, 8, y, Rotation::R0); // input (5, y)
+        wire(&mut s, &[(3, y), (5, y)]);
+    }
+    // Input A bus at x = -5, input B bus at x = -6.
+    wire(&mut s, &[(-7, -4), (-5, -4)]);
+    wire(&mut s, &[(-5, -9), (-5, 7)]);
+    for y in [-9, -1, 7] {
+        wire(&mut s, &[(-5, y), (-3, y)]);
+    }
+    wire(&mut s, &[(-7, 4), (-6, 4)]);
+    wire(&mut s, &[(-6, -7), (-6, 9)]);
+    for y in [-7, 1, 9] {
+        wire(&mut s, &[(-6, y), (-3, y)]);
+    }
+    s.add_label("A", Point::new(-5, -6));
+    s.add_label("B", Point::new(-6, 6));
+    s.add_label("AND", Point::new(4, -8));
+    s.add_label("OR", Point::new(4, 0));
+    s.add_label("XOR", Point::new(4, 8));
+    s
+}
+
+/// A 2 Hz clock driving a 4-bit counter with an LED on each output. Run it
+/// with Speed set to real time to watch it count.
+pub fn binary_counter() -> Schematic {
+    let mut s = Schematic::new();
+    place(
+        &mut s,
+        K::Clock {
+            frequency: 2.0,
+            duty: 0.5,
+        },
+        -8,
+        0,
+        Rotation::R0,
+    ); // Y (-5,0)
+    place(
+        &mut s,
+        K::Counter4 {
+            delay: dunbrec_core::DEFAULT_LOGIC_DELAY,
+        },
+        0,
+        0,
+        Rotation::R0,
+    ); // CLK (-3,0)
+    wire(&mut s, &[(-5, 0), (-3, 0)]);
+    // Fan the outputs out to LEDs spaced well apart.
+    for (i, (y, led_y)) in [(-3, -6), (-1, -2), (1, 2), (3, 6)].into_iter().enumerate() {
+        place(&mut s, K::LogicLed, 12, led_y, Rotation::R0); // input (9, led_y)
+        wire(&mut s, &[(3, y), (6, y), (6, led_y), (9, led_y)]);
+        s.add_label(format!("Q{i}"), Point::new(8, led_y));
+    }
+    s.add_label("CLK", Point::new(-4, 0));
+    s
 }
 
 fn sine(amplitude: f64, frequency: f64) -> K {
@@ -312,6 +393,22 @@ mod tests {
             );
             let circuit = Circuit::from_netlist(&netlist, &s.models).unwrap();
             let op = operating_point(&circuit).unwrap();
+            let high = |n: &str| op.voltage_by_name(n).unwrap() > 2.5;
+            match ex.name {
+                // A = 1, B = 0.
+                "Logic gates" => {
+                    assert!(!high("AND") && high("OR") && high("XOR"));
+                    continue;
+                }
+                "Binary counter" => {
+                    assert!(
+                        ["Q0", "Q1", "Q2", "Q3"].iter().all(|q| !high(q)),
+                        "starts at 0"
+                    );
+                    continue;
+                }
+                _ => {}
+            }
             let vout = op.voltage_by_name("VOUT").unwrap();
             match ex.name {
                 "Voltage divider" => assert!((vout - 5.0).abs() < 1e-9),

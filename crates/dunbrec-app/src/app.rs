@@ -61,6 +61,8 @@ struct DcResults {
 
 struct DcTable {
     annotations: Vec<Annotation>,
+    /// Voltage of every node, indexed by node number.
+    node_voltages: Vec<f64>,
     voltages: Vec<(String, f64)>,
     currents: Vec<(String, f64)>,
     warnings: Vec<String>,
@@ -128,6 +130,10 @@ fn feed(bench: &mut Bench, signals: &Signals, s: &Sample) {
         MeterSignal::Current(i) => s.currents.get(i).copied().unwrap_or(f64::NAN),
     };
     bench.meter.push(s.time, meter);
+    bench.logic.push(
+        s.time,
+        [0, 1, 2, 3, 4, 5, 6, 7].map(|ch| v(signals.logic[ch])),
+    );
 }
 
 impl DunbrecApp {
@@ -408,6 +414,9 @@ impl DunbrecApp {
                         })
                         .collect();
                     DcTable {
+                        node_voltages: (0..circuit.node_count())
+                            .map(|n| op.voltage(NodeId(n)))
+                            .collect(),
                         annotations,
                         voltages,
                         currents,
@@ -528,6 +537,36 @@ impl DunbrecApp {
         if plain(Key::S) {
             self.canvas.cancel();
         }
+    }
+
+    /// Logic LEDs whose input is high: from the running simulation, or
+    /// from the DC operating point when stopped.
+    fn lit_leds(&self) -> std::collections::HashSet<dunbrec_core::ComponentId> {
+        let voltages: Option<&[f64]> = match (&self.live, &self.latest, &self.dc) {
+            (Some(_), Some(sample), _) if self.live_generation == self.doc.generation() => {
+                Some(&sample.voltages)
+            }
+            (
+                None,
+                _,
+                Some(DcResults {
+                    outcome: Ok(t),
+                    generation,
+                }),
+            ) if *generation == self.doc.generation() => Some(&t.node_voltages),
+            _ => None,
+        };
+        let Some(voltages) = voltages else {
+            return Default::default();
+        };
+        self.netlist
+            .1
+            .elements
+            .iter()
+            .filter(|e| matches!(e.kind, dunbrec_core::ComponentKind::LogicLed))
+            .filter(|e| voltages.get(e.nodes[0].0).is_some_and(|v| *v > 2.5))
+            .map(|e| e.component)
+            .collect()
     }
 
     // --------------------------------------------------- clipboard ---
@@ -732,7 +771,7 @@ impl DunbrecApp {
                 }
                 ui.toggle_value(&mut self.bench.show_scope, "📈 Oscilloscope");
                 ui.toggle_value(&mut self.bench.show_meter, "🔢 Multimeter");
-                ui.toggle_value(&mut self.analyses.show_fgen, "∿ Function gen");
+                ui.toggle_value(&mut self.analyses.show_fgen, "〰 Function gen");
                 if let Some(e) = &self.live_error {
                     ui.separator();
                     ui.label(RichText::new(e).color(Color32::from_rgb(225, 70, 70)));
@@ -773,6 +812,12 @@ impl DunbrecApp {
             probing,
         };
         probe_clicked |= self.analyses.show(ctx, inputs);
+        if self.bench.show_logic {
+            let s = self.doc.schematic();
+            probe_clicked |=
+                self.bench
+                    .logic_window(ctx, s, &self.netlist.1, &self.node_map.1, probing);
+        }
         if probe_clicked {
             self.canvas.tool = Tool::Probe;
         }
@@ -927,7 +972,8 @@ impl DunbrecApp {
                 ui.menu_button("Instruments", |ui| {
                     ui.checkbox(&mut self.bench.show_scope, "📈 Oscilloscope");
                     ui.checkbox(&mut self.bench.show_meter, "🔢 Multimeter");
-                    ui.checkbox(&mut self.analyses.show_fgen, "∿ Function generator");
+                    ui.checkbox(&mut self.bench.show_logic, "📊 Logic analyser");
+                    ui.checkbox(&mut self.analyses.show_fgen, "〰 Function generator");
                     ui.separator();
                     ui.checkbox(
                         &mut self.analyses.show_bode,
@@ -1310,8 +1356,15 @@ impl eframe::App for DunbrecApp {
                     _ => &[],
                 };
                 let markers = self.bench.markers(self.doc.schematic());
-                self.canvas
-                    .show(ui, &mut self.doc, &self.netlist.1, annotations, &markers);
+                let lit = self.lit_leds();
+                self.canvas.show(
+                    ui,
+                    &mut self.doc,
+                    &self.netlist.1,
+                    annotations,
+                    &markers,
+                    &lit,
+                );
             });
 
         if let Some((at, part)) = self.canvas.take_probe_request() {

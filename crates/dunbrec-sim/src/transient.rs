@@ -25,6 +25,7 @@ use dunbrec_core::NodeId;
 use crate::circuit::Circuit;
 use crate::dc::OperatingPoint;
 use crate::device::{Integration, StampContext, Tolerances};
+use crate::digital::{CMOS_5V, DigitalSystem, Logic, settle_dc};
 use crate::error::SimError;
 use crate::newton::{TRANSIENT_MAX_ITERATIONS, Workspace, dc_solve, newton};
 use crate::stamp::{SolutionView, node_rows};
@@ -142,6 +143,11 @@ pub struct Transient {
     /// Time scale of the run, used for absolute time tolerances: the stop
     /// time, or for a free-running simulation a multiple of the max step.
     span: f64,
+    /// The circuit's logic, if it has any.
+    digital: Option<DigitalSystem>,
+    /// For each watch: the digital input it feeds (part, input, level it
+    /// signals), or `None` for a watch added by the caller.
+    watch_targets: Vec<Option<(usize, usize, Logic)>>,
 }
 
 impl Transient {
@@ -168,7 +174,12 @@ impl Transient {
 
         let size = circuit.unknown_count();
         let mut workspace = Workspace::new(size);
-        let x = dc_solve(&circuit, true, &mut workspace, &options.tolerances)?;
+        let mut digital =
+            (!circuit.digital.is_empty()).then(|| DigitalSystem::new(&circuit.digital, CMOS_5V));
+        let x = match &mut digital {
+            Some(sys) => settle_dc(&circuit, sys, &mut workspace, &options.tolerances, true)?,
+            None => dc_solve(&circuit, true, &mut workspace, &options.tolerances)?,
+        };
         let initial = OperatingPoint::from_solution(&circuit, &x);
 
         let rows = node_rows(circuit.node_count());
@@ -189,6 +200,29 @@ impl Transient {
         };
         let h_min = span * 1e-14;
 
+        // Digital inputs watch their nets: up through VIH, down through VIL.
+        let mut watches = Vec::new();
+        let mut watch_targets = Vec::new();
+        if let Some(sys) = &mut digital {
+            sys.sync_inputs(|n| sol.voltage(n));
+            let f = sys.family;
+            for (part, input, node) in sys.inputs() {
+                for (level, edge, value) in [
+                    (f.vih, Edge::Rising, Logic::High),
+                    (f.vil, Edge::Falling, Logic::Low),
+                ] {
+                    watches.push(Watch {
+                        p: node,
+                        n: NodeId::GROUND,
+                        level,
+                        edge,
+                    });
+                    watch_targets.push(Some((part, input, value)));
+                }
+            }
+            sys.start(0.0);
+        }
+
         Ok(Self {
             circuit,
             initial,
@@ -201,9 +235,11 @@ impl Transient {
             h_min,
             restart: true,
             damp: false,
-            watches: Vec::new(),
+            watches,
             finished: false,
             span,
+            digital,
+            watch_targets,
             options,
         })
     }
@@ -257,6 +293,12 @@ impl Transient {
         self.h_max = Self::max_step_for(&self.circuit, &self.options);
         self.h_next = self.h_next.min(self.h_max);
         self.restart = true;
+        if let Some(sys) = &mut self.digital
+            && let Some(part) = sys.part_of_element(index)
+        {
+            sys.update_part(part, &element.kind, self.time);
+            self.run_digital();
+        }
         Ok(true)
     }
 
@@ -279,7 +321,22 @@ impl Transient {
 
     pub fn add_watch(&mut self, watch: Watch) -> WatchId {
         self.watches.push(watch);
+        self.watch_targets.push(None);
         WatchId(self.watches.len() - 1)
+    }
+
+    /// Fire due digital events and update the output drivers.
+    fn run_digital(&mut self) {
+        let Some(sys) = &mut self.digital else { return };
+        let changes = sys.advance(self.time);
+        let family = sys.family;
+        for (driver, level) in &changes {
+            self.circuit.devices[*driver].drive(self.time, level.voltage(&family));
+        }
+        if !changes.is_empty() {
+            // An output starts to ramp: a kink, like a breakpoint.
+            self.restart = true;
+        }
     }
 
     /// The latest accepted time point.
@@ -307,10 +364,16 @@ impl Transient {
     }
 
     fn next_breakpoint(&self) -> f64 {
+        let digital = self
+            .digital
+            .as_ref()
+            .and_then(|s| s.next_event_time())
+            .filter(|&t| t > self.time);
         self.circuit
             .devices
             .iter()
             .filter_map(|d| d.next_breakpoint(self.time))
+            .chain(digital)
             .fold(self.options.stop_time, f64::min)
     }
 
@@ -321,6 +384,18 @@ impl Transient {
             return Ok(None);
         }
         let target = self.next_breakpoint();
+        if target - self.time <= self.h_min * 10.0 {
+            // The target is within rounding of now (e.g. a clock edge that
+            // accumulated rounding over many periods): treat it as reached.
+            self.time = target;
+            self.restart = true;
+            self.finished = target >= self.options.stop_time;
+            self.run_digital();
+            return Ok(Some(StepResult {
+                sample: self.sample(),
+                crossings: Vec::new(),
+            }));
+        }
         let mut h = self.h_next.min(self.h_max);
         // Land exactly on the target; stretch slightly rather than leave a
         // sliver of a step before it.
@@ -435,14 +510,23 @@ impl Transient {
             }
         }
         std::mem::swap(&mut self.x, &mut self.trial);
-        let crossings = crossings
-            .into_iter()
-            .map(|(i, frac, edge)| Crossing {
-                watch: WatchId(i),
-                time: start + frac * h,
-                edge,
-            })
-            .collect();
+        // Crossings of digital input thresholds become input events; the
+        // rest are reported to the caller.
+        let mut reported = Vec::new();
+        for (i, frac, edge) in crossings {
+            let time = start + frac * h;
+            match (self.watch_targets[i], &mut self.digital) {
+                (Some((part, input, value)), Some(sys)) => {
+                    sys.input_event(time, part, input, value)
+                }
+                _ => reported.push(Crossing {
+                    watch: WatchId(i),
+                    time,
+                    edge,
+                }),
+            }
+        }
+        let crossings = reported;
 
         // An infinite target (free-running, no breakpoint ahead) is never hit.
         let hit_target = target.is_finite()
@@ -459,6 +543,7 @@ impl Transient {
                 self.h_next = (h * BREAKPOINT_SHRINK).max(self.h_min * 10.0);
             }
         }
+        self.run_digital();
         StepResult {
             sample: self.sample(),
             crossings,

@@ -15,6 +15,7 @@ mod examples;
 mod instruments_ui;
 mod library;
 mod live;
+mod logic_ui;
 mod plot;
 mod properties;
 mod settings;

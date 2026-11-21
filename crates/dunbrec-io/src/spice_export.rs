@@ -23,6 +23,8 @@ const POT_MIN_SEGMENT: f64 = 1e-3;
 pub enum ExportError {
     #[error("the schematic has problems that must be fixed before exporting: {0:?}")]
     Netlist(Vec<String>),
+    #[error("logic parts cannot be written as a plain SPICE netlist: {}", .0.join(", "))]
+    Digital(Vec<String>),
 }
 
 /// A SPICE-safe identifier.
@@ -117,6 +119,15 @@ pub fn export(
     if !errors.is_empty() {
         return Err(ExportError::Netlist(errors));
     }
+    let digital: Vec<String> = netlist
+        .elements
+        .iter()
+        .filter(|e| e.kind.is_digital())
+        .map(|e| e.designator.clone())
+        .collect();
+    if !digital.is_empty() {
+        return Err(ExportError::Digital(digital));
+    }
     Ok(write_netlist(&netlist, schematic, title, directives))
 }
 
@@ -150,6 +161,14 @@ fn write_netlist(
         let d = &e.designator;
         let line = match &e.kind {
             K::Ground => continue,
+            // Rejected by `export` before writing.
+            K::Gate { .. }
+            | K::Inverter { .. }
+            | K::DFlipFlop { .. }
+            | K::Counter4 { .. }
+            | K::Clock { .. }
+            | K::LogicSwitch { .. }
+            | K::LogicLed => continue,
             K::Resistor { resistance } => {
                 format!(
                     "{} {} {} {}",

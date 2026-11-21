@@ -9,6 +9,7 @@ use crate::device::{
     Capacitor, Cccs, Ccvs, ControlledPins, CurrentSource, Device, Inductor, Potentiometer,
     Resistor, Vccs, Vcvs, VoltageSource,
 };
+use crate::digital::{CMOS_5V, DigitalDriver, NullDevice, PartSpec};
 use crate::error::{SimError, SimWarning};
 use crate::linalg::{DenseMatrix, LinearSolver};
 use crate::semiconductor::{Bjt, BjtParams, Diode, DiodeParams, Mosfet, MosfetParams};
@@ -28,6 +29,9 @@ pub struct Circuit {
     /// Per device: first branch and first internal node it was given, so
     /// a replacement device can take over the same unknowns.
     slots: Vec<(Option<BranchId>, Option<NodeId>)>,
+    /// Digital parts and how they are wired (their drivers follow the
+    /// netlist elements in `devices`).
+    pub(crate) digital: Vec<PartSpec>,
     pub(crate) warnings: Vec<SimWarning>,
 }
 
@@ -74,6 +78,41 @@ impl Circuit {
             slots.push(slot);
         }
 
+        // Digital parts: one analog driver per output, after the elements
+        // so device indices still match netlist element indices.
+        let mut digital = Vec::new();
+        for (index, element) in netlist.elements.iter().enumerate() {
+            if !element.kind.is_digital() {
+                continue;
+            }
+            let mut input_nodes = Vec::new();
+            let mut drivers = Vec::new();
+            let mut output_nodes = Vec::new();
+            for (pin, &node) in element.kind.pins().iter().zip(&element.nodes) {
+                match pin.domain {
+                    dunbrec_core::PinDomain::DigitalIn => input_nodes.push(node),
+                    dunbrec_core::PinDomain::DigitalOut => {
+                        drivers.push(devices.len());
+                        output_nodes.push(node);
+                        devices.push(Box::new(DigitalDriver::new(
+                            format!("{}:{}", element.designator, pin.name),
+                            node,
+                            CMOS_5V,
+                        )));
+                        slots.push((None, None));
+                    }
+                    dunbrec_core::PinDomain::Analog => {}
+                }
+            }
+            digital.push(PartSpec {
+                element: index,
+                kind: element.kind.clone(),
+                input_nodes,
+                drivers,
+                output_nodes,
+            });
+        }
+
         let mut circuit = Circuit {
             devices,
             node_names,
@@ -81,6 +120,7 @@ impl Circuit {
             shunted: Vec::new(),
             warnings: Vec::new(),
             slots,
+            digital,
         };
         circuit.check_topology()?;
         Ok(circuit)
@@ -273,6 +313,21 @@ fn make_device(e: &Element, models: &ModelLibrary) -> Result<Box<dyn Device>, Si
     let node = |i: usize| e.nodes[i];
     Ok(match &e.kind {
         ComponentKind::Ground => unreachable!("ground symbols do not produce netlist elements"),
+        kind @ (ComponentKind::Gate { .. }
+        | ComponentKind::Inverter { .. }
+        | ComponentKind::DFlipFlop { .. }
+        | ComponentKind::Counter4 { .. }
+        | ComponentKind::Clock { .. }
+        | ComponentKind::LogicSwitch { .. }
+        | ComponentKind::LogicLed) => {
+            if let ComponentKind::Clock { frequency, duty } = kind {
+                check_positive(e, "frequency", *frequency)?;
+                if !(0.0 < *duty && *duty < 1.0) {
+                    return Err(invalid(e, "duty cycle must be between 0 and 1"));
+                }
+            }
+            Box::new(NullDevice { name })
+        }
         ComponentKind::Resistor { resistance } => {
             let r = check_finite(e, "resistance", *resistance)?;
             if r == 0.0 {

@@ -27,6 +27,7 @@ pub mod ac;
 pub mod circuit;
 pub mod dc;
 pub mod device;
+pub mod digital;
 pub mod error;
 pub mod linalg;
 mod newton;
@@ -48,6 +49,8 @@ pub use transient::{
 
 #[cfg(test)]
 mod ac_tests;
+#[cfg(test)]
+mod digital_tests;
 #[cfg(test)]
 mod nonlinear_tests;
 #[cfg(test)]

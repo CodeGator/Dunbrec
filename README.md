@@ -4,9 +4,8 @@ A desktop electronics workbench written in Rust: draw or import a schematic, sim
 watch any node live with virtual instruments — oscilloscope, multimeter, function generator,
 Bode plotter and curve tracer.
 
-v1 covers analog circuits: discrete components, sources, diodes and transistors. The simulation
-core is designed for later mixed-signal work: digital logic and microcontrollers in the same
-circuit.
+Circuits can mix analog parts (discrete components, sources, diodes, transistors) with digital
+logic (gates, flip-flops, counters, clocks) in one simulation; microcontrollers come next.
 
 ## Installing
 
@@ -55,6 +54,15 @@ wiring restarts the run.
 | Bode plotter | AC small-signal gain and phase from a source to a node; peak and −3 dB points |
 | DC transfer | Sweeps a source and plots a node's voltage |
 | Curve tracer | Characteristic curves of a diode, BJT or MOSFET in the schematic |
+| Logic analyser | 8 channels of logic levels over time, with frequency read-outs |
+
+**Digital logic.** The palette's *Digital* group has AND, OR, NAND, NOR, XOR and XNOR gates,
+an inverter, a D flip-flop, a 4-bit counter, a clock, a logic switch (double-click to flip) and
+a logic LED that lights on the schematic. Logic is event-driven with a propagation delay per
+part, and meets the analog circuit at its pins like real 5 V CMOS: outputs drive their net
+through 50 Ω with a 5 ns edge, inputs switch at 3.5 V rising and 1.5 V falling. So a gate can
+drive a capacitor, an analog signal can clock a counter, and the scope works on any net. Try
+File → Open example → Logic gates or Binary counter (run with Speed at real time).
 
 **Parts library.** Besides generic parts, the palette's *Real parts* group has the 2N3904 and
 2N3906 transistors and the 1N4148 and 1N750 (4.7 V zener) diodes, using the published
@@ -89,11 +97,12 @@ imported is listed. File → Export SPICE netlist writes a netlist ngspice can r
 7. SPICE / KiCad import, SPICE export ✅
 8. DC sweep, AC analysis, Bode plotter, curve tracer, function generator ✅
 9. Polish: parts library, examples, copy/paste, settings, icon, installer ✅
-10. Digital logic (post-v1)
+10. Digital logic: gates, flip-flops, counters, clocks, logic analyser ✅
 11. Microcontrollers (post-v1)
 
-Known limits: fixed temperature (27 °C); MOSFETs are level 1 only; KiCad hierarchical sheets,
-SPICE `.param` expressions and EXP/SFFM sources are not supported yet.
+Known limits: fixed temperature (27 °C); MOSFETs are level 1 only; one logic family (5 V
+CMOS-style); logic parts are not exported to SPICE; KiCad hierarchical sheets, SPICE `.param`
+expressions and EXP/SFFM sources are not supported yet.
 
 ## Development
 

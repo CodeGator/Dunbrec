@@ -894,7 +894,7 @@ impl FunctionGen {
                 ui.label("Waveform");
                 ui.horizontal(|ui| {
                     for (shape, label) in [
-                        (Shape::Sine, "∿ Sine"),
+                        (Shape::Sine, "〰 Sine"),
                         (Shape::Square, "⊓ Square"),
                         (Shape::Triangle, "△ Triangle"),
                         (Shape::Dc, "— DC"),

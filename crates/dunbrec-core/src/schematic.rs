@@ -88,11 +88,14 @@ pub struct WireId(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct LabelId(pub u32);
 
-/// Which simulation domain a pin belongs to. Only analog exists today; digital
-/// pins arrive with the mixed-signal phase.
+/// Which simulation domain a pin belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PinDomain {
     Analog,
+    /// A logic input: reads its net's voltage against the input thresholds.
+    DigitalIn,
+    /// A logic output: drives its net to the logic level.
+    DigitalOut,
 }
 
 /// Static description of one pin of a component kind.
@@ -122,12 +125,86 @@ const BJT: &[PinDef] = &[pin("C", 2, -2), pin("B", -2, 0), pin("E", 2, 2)];
 const MOSFET: &[PinDef] = &[pin("D", 2, -2), pin("G", -2, 0), pin("S", 2, 2)];
 const GROUND: &[PinDef] = &[pin("gnd", 0, 0)];
 const POT: &[PinDef] = &[pin("A", -2, 0), pin("B", 2, 0), pin("W", 0, -2)];
+const fn din(name: &'static str, x: i32, y: i32) -> PinDef {
+    PinDef {
+        name,
+        offset: Point::new(x, y),
+        domain: PinDomain::DigitalIn,
+    }
+}
+
+const fn dout(name: &'static str, x: i32, y: i32) -> PinDef {
+    PinDef {
+        name,
+        offset: Point::new(x, y),
+        domain: PinDomain::DigitalOut,
+    }
+}
+
+const GATE2: &[PinDef] = &[din("A", -3, -1), din("B", -3, 1), dout("Y", 3, 0)];
+const INVERTER: &[PinDef] = &[din("A", -3, 0), dout("Y", 3, 0)];
+const DFF: &[PinDef] = &[
+    din("D", -3, -1),
+    din("CLK", -3, 1),
+    dout("Q", 3, -1),
+    dout("QN", 3, 1),
+];
+const COUNTER4: &[PinDef] = &[
+    din("CLK", -3, 0),
+    dout("Q0", 3, -3),
+    dout("Q1", 3, -1),
+    dout("Q2", 3, 1),
+    dout("Q3", 3, 3),
+];
+const LOGIC_SOURCE: &[PinDef] = &[dout("Y", 3, 0)];
+const LOGIC_LED: &[PinDef] = &[din("A", -3, 0)];
+
 const CONTROLLED: &[PinDef] = &[
     pin("out+", 2, -2),
     pin("out-", 2, 2),
     pin("ctrl+", -2, -2),
     pin("ctrl-", -2, 2),
 ];
+
+/// The function of a two-input logic gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum GateOp {
+    And,
+    Or,
+    Nand,
+    Nor,
+    Xor,
+    Xnor,
+}
+
+impl GateOp {
+    pub const ALL: [GateOp; 6] = [
+        GateOp::And,
+        GateOp::Or,
+        GateOp::Nand,
+        GateOp::Nor,
+        GateOp::Xor,
+        GateOp::Xnor,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            GateOp::And => "AND",
+            GateOp::Or => "OR",
+            GateOp::Nand => "NAND",
+            GateOp::Nor => "NOR",
+            GateOp::Xor => "XOR",
+            GateOp::Xnor => "XNOR",
+        }
+    }
+}
+
+/// Default propagation delay of logic parts (s).
+pub const DEFAULT_LOGIC_DELAY: f64 = 10e-9;
+
+fn default_logic_delay() -> f64 {
+    DEFAULT_LOGIC_DELAY
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Polarity {
@@ -313,6 +390,40 @@ pub enum ComponentKind {
     Cccs {
         gain: f64,
     },
+
+    // ---- Digital parts (5 V CMOS-style logic) ----
+    /// Two-input gate; output Y changes `delay` seconds after an input.
+    Gate {
+        op: GateOp,
+        #[serde(default = "default_logic_delay")]
+        delay: f64,
+    },
+    Inverter {
+        #[serde(default = "default_logic_delay")]
+        delay: f64,
+    },
+    /// Rising-edge D flip-flop with complementary outputs; starts with Q = 0.
+    DFlipFlop {
+        #[serde(default = "default_logic_delay")]
+        delay: f64,
+    },
+    /// 4-bit binary counter advancing on each rising clock edge.
+    Counter4 {
+        #[serde(default = "default_logic_delay")]
+        delay: f64,
+    },
+    /// Square-wave logic source: low, then high for the `duty` fraction at
+    /// the end of each period (first rising edge at (1 − duty)/f).
+    Clock {
+        frequency: f64,
+        duty: f64,
+    },
+    /// A constant logic level; double-click to flip.
+    LogicSwitch {
+        high: bool,
+    },
+    /// Lights up when its input is high.
+    LogicLed,
 }
 
 impl ComponentKind {
@@ -333,6 +444,12 @@ impl ComponentKind {
             | ComponentKind::Vccs { .. }
             | ComponentKind::Ccvs { .. }
             | ComponentKind::Cccs { .. } => CONTROLLED,
+            ComponentKind::Gate { .. } => GATE2,
+            ComponentKind::Inverter { .. } => INVERTER,
+            ComponentKind::DFlipFlop { .. } => DFF,
+            ComponentKind::Counter4 { .. } => COUNTER4,
+            ComponentKind::Clock { .. } | ComponentKind::LogicSwitch { .. } => LOGIC_SOURCE,
+            ComponentKind::LogicLed => LOGIC_LED,
         }
     }
 
@@ -354,7 +471,29 @@ impl ComponentKind {
             ComponentKind::Vccs { .. } => "G",
             ComponentKind::Ccvs { .. } => "H",
             ComponentKind::Cccs { .. } => "F",
+            ComponentKind::Gate { .. }
+            | ComponentKind::Inverter { .. }
+            | ComponentKind::DFlipFlop { .. }
+            | ComponentKind::Counter4 { .. } => "U",
+            ComponentKind::Clock { .. } => "CLK",
+            ComponentKind::LogicSwitch { .. } => "SW",
+            ComponentKind::LogicLed => "LED",
         }
+    }
+
+    /// True for logic parts, which are simulated by the event-driven
+    /// digital engine and meet the analog circuit at their pins.
+    pub fn is_digital(&self) -> bool {
+        matches!(
+            self,
+            ComponentKind::Gate { .. }
+                | ComponentKind::Inverter { .. }
+                | ComponentKind::DFlipFlop { .. }
+                | ComponentKind::Counter4 { .. }
+                | ComponentKind::Clock { .. }
+                | ComponentKind::LogicSwitch { .. }
+                | ComponentKind::LogicLed
+        )
     }
 
     /// Name of the device model this component refers to, if any.

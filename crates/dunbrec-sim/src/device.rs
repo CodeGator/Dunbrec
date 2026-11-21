@@ -132,6 +132,11 @@ pub trait Device: Send + std::fmt::Debug {
     /// scratch).
     fn reset_iteration(&self) {}
 
+    /// Set the level a digital output drives, ramping from `time`
+    /// (`f64::INFINITY` means at once, for the operating point). Only
+    /// digital output drivers respond.
+    fn drive(&self, _time: f64, _level: f64) {}
+
     /// Write this device's equations for the given analysis.
     fn stamp(&self, s: &mut Stamper, ctx: &StampContext);
 

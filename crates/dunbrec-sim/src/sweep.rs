@@ -65,6 +65,11 @@ impl DcSweeper {
     /// Solve the operating point for the present source values.
     pub fn solve(&mut self) -> Result<OperatingPoint, SimError> {
         let tol = Tolerances::default();
+        if !self.circuit.digital.is_empty() {
+            // Logic is re-settled at every point.
+            let x = crate::digital::operating_solution(&self.circuit, &mut self.workspace, &tol)?;
+            return Ok(OperatingPoint::from_solution(&self.circuit, &x));
+        }
         if let Some(x) = &mut self.x {
             let mut guess = x.clone();
             if newton(

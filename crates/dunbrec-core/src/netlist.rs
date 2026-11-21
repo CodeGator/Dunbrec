@@ -292,7 +292,13 @@ pub fn build_netlist(schematic: &Schematic) -> Netlist {
     };
 
     let mut diagnostics = Vec::new();
-    if ground_root.is_none() {
+    // Logic parts carry their own supply reference, so a purely digital
+    // circuit needs no ground symbol.
+    let has_analog = schematic
+        .components
+        .iter()
+        .any(|c| !matches!(c.kind, ComponentKind::Ground) && !c.kind.is_digital());
+    if ground_root.is_none() && has_analog {
         diagnostics.push(Diagnostic::NoGround);
     }
 

@@ -184,6 +184,39 @@ impl Properties {
                         self.value(ui, id, "Transresistance", "Ω", transresistance)
                     }
                     ComponentKind::Cccs { gain } => self.value(ui, id, "Gain", "A/A", gain),
+                    ComponentKind::Gate { op, delay } => {
+                        ui.label("Function");
+                        let before = *op;
+                        egui::ComboBox::from_id_salt(("gate", id))
+                            .selected_text(op.name())
+                            .show_ui(ui, |ui| {
+                                for o in dunbrec_core::GateOp::ALL {
+                                    ui.selectable_value(op, o, o.name());
+                                }
+                            });
+                        ui.end_row();
+                        (*op != before) | self.value(ui, id, "Delay", "s", delay)
+                    }
+                    ComponentKind::Inverter { delay }
+                    | ComponentKind::DFlipFlop { delay }
+                    | ComponentKind::Counter4 { delay } => self.value(ui, id, "Delay", "s", delay),
+                    ComponentKind::Clock { frequency, duty } => {
+                        let a = self.value(ui, id, "Frequency", "Hz", frequency);
+                        ui.label("Duty cycle");
+                        let slider = ui.add(egui::Slider::new(duty, 0.05..=0.95).fixed_decimals(2));
+                        ui.end_row();
+                        if slider.dragged() && !slider.drag_started() {
+                            self.continuous = true;
+                        }
+                        a | slider.changed()
+                    }
+                    ComponentKind::LogicSwitch { high } => {
+                        ui.label("Output");
+                        let r = ui.checkbox(high, "high").changed();
+                        ui.end_row();
+                        r
+                    }
+                    ComponentKind::LogicLed => false,
                 };
                 if changed {
                     edit = set_kind(k);
@@ -558,6 +591,13 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
         ComponentKind::Vccs { .. } => "Voltage-controlled current source",
         ComponentKind::Ccvs { .. } => "Current-controlled voltage source",
         ComponentKind::Cccs { .. } => "Current-controlled current source",
+        ComponentKind::Gate { .. } => "Logic gate",
+        ComponentKind::Inverter { .. } => "Inverter (NOT)",
+        ComponentKind::DFlipFlop { .. } => "D flip-flop",
+        ComponentKind::Counter4 { .. } => "4-bit counter",
+        ComponentKind::Clock { .. } => "Clock",
+        ComponentKind::LogicSwitch { .. } => "Logic switch",
+        ComponentKind::LogicLed => "Logic LED",
     }
 }
 

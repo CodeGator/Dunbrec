@@ -11,6 +11,7 @@ use dunbrec_instruments::{Meter, MeterMode, Scope, ScopeStatus, TriggerEdge, Tri
 use egui::{Align2, Color32, FontId, Rect, RichText, Sense, Shape, Stroke, Ui, pos2, vec2};
 
 use crate::canvas::{Marker, NodeMap};
+use crate::logic_ui::{LOGIC_CHANNELS, LOGIC_COLOR, LogicAnalyzer};
 
 /// Trace colours, as on a classic four-channel scope.
 pub const CHANNEL_COLORS: [Color32; CHANNELS] = [
@@ -48,6 +49,8 @@ pub enum ProbeSlot {
     BodeOut,
     /// Output node of the DC transfer plot.
     SweepOut,
+    /// A logic analyser channel.
+    Logic(usize),
 }
 
 /// What a probe is connected to.
@@ -89,6 +92,7 @@ impl Speed {
 pub struct Signals {
     pub scope: [Option<NodeId>; CHANNELS],
     pub meter: MeterSignal,
+    pub logic: [Option<NodeId>; LOGIC_CHANNELS],
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -109,6 +113,9 @@ pub struct Bench {
     pub meter_com: Option<Point>,
     pub bode_out: Option<Point>,
     pub sweep_out: Option<Point>,
+    pub logic_probes: [Option<Point>; LOGIC_CHANNELS],
+    pub logic: LogicAnalyzer,
+    pub show_logic: bool,
     pub active: ProbeSlot,
     pub show_scope: bool,
     pub show_meter: bool,
@@ -131,6 +138,9 @@ impl Default for Bench {
             meter_com: None,
             bode_out: None,
             sweep_out: None,
+            logic_probes: [None; LOGIC_CHANNELS],
+            logic: LogicAnalyzer::default(),
+            show_logic: false,
             active: ProbeSlot::Scope(0),
             show_scope: false,
             show_meter: false,
@@ -149,6 +159,7 @@ impl Bench {
     pub fn clear_readings(&mut self) {
         self.scope.clear();
         self.meter.clear();
+        self.logic.clear();
     }
 
     /// Connect the active probe to what was clicked. Returns a message if
@@ -188,6 +199,12 @@ impl Bench {
                 }
                 self.meter_com = Some(at);
             }
+            ProbeSlot::Logic(ch) => {
+                if !on_net {
+                    return Err("Click on a wire or pin for the logic analyser channel.".into());
+                }
+                self.logic_probes[ch] = Some(at);
+            }
             ProbeSlot::BodeOut | ProbeSlot::SweepOut => {
                 if !on_net {
                     return Err("Click on a wire or pin for the output to plot.".into());
@@ -225,7 +242,12 @@ impl Bench {
             },
             _ => MeterSignal::None,
         };
-        Signals { scope, meter }
+        let logic = std::array::from_fn(|ch| node(&self.logic_probes[ch]));
+        Signals {
+            scope,
+            meter,
+            logic,
+        }
     }
 
     /// Flags showing where the probes are, for the canvas.
@@ -263,6 +285,15 @@ impl Bench {
                 text: "COM".into(),
                 color: METER_COM,
             });
+        }
+        for (ch, p) in self.logic_probes.iter().enumerate() {
+            if let Some(at) = p {
+                out.push(Marker {
+                    at: *at,
+                    text: format!("D{ch}"),
+                    color: LOGIC_COLOR,
+                });
+            }
         }
         for (p, text) in [(self.bode_out, "BODE"), (self.sweep_out, "SWEEP")] {
             if let Some(at) = p {
@@ -600,6 +631,54 @@ impl Bench {
                 }
             });
         self.show_meter = open;
+        probe_clicked
+    }
+
+    /// Returns true if a probe button was clicked.
+    pub fn logic_window(
+        &mut self,
+        ctx: &egui::Context,
+        s: &Schematic,
+        netlist: &Netlist,
+        map: &NodeMap,
+        probe_tool_active: bool,
+    ) -> bool {
+        let mut probe_clicked = false;
+        let mut open = self.show_logic;
+        egui::Window::new("Logic analyser")
+            .open(&mut open)
+            .default_size([560.0, 420.0])
+            .show(ctx, |ui| {
+                let names: [String; LOGIC_CHANNELS] =
+                    std::array::from_fn(|ch| match self.logic_probes[ch] {
+                        Some(p) => self.describe(Some(ProbeTarget::Node(p)), s, netlist, map),
+                        None => String::new(),
+                    });
+                self.logic.draw(ui, &names);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Time/div");
+                    egui::ComboBox::from_id_salt("la_tdiv")
+                        .selected_text(format_value(self.logic.time_per_div, "s"))
+                        .show_ui(ui, |ui| {
+                            for v in one_two_five(1e-9, 1.0) {
+                                ui.selectable_value(
+                                    &mut self.logic.time_per_div,
+                                    v,
+                                    format_value(v, "s"),
+                                );
+                            }
+                        });
+                });
+                ui.horizontal_wrapped(|ui| {
+                    for ch in 0..LOGIC_CHANNELS {
+                        ui.label(format!("D{ch}"));
+                        if self.probe_button(ui, ProbeSlot::Logic(ch), probe_tool_active) {
+                            probe_clicked = true;
+                        }
+                    }
+                });
+            });
+        self.show_logic = open;
         probe_clicked
     }
 

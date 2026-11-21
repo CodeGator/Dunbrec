@@ -5,7 +5,7 @@ use dunbrec_core::NodeId;
 use crate::circuit::Circuit;
 use crate::device::Tolerances;
 use crate::error::{SimError, SimWarning};
-use crate::newton::{Workspace, dc_solve};
+use crate::newton::Workspace;
 use crate::stamp::{SolutionView, node_rows};
 
 /// Result of a DC operating point analysis.
@@ -56,7 +56,7 @@ impl OperatingPoint {
 /// Newton-Raphson iteration with gmin and source stepping as fallbacks.
 pub fn operating_point(circuit: &Circuit) -> Result<OperatingPoint, SimError> {
     let mut ws = Workspace::new(circuit.unknown_count());
-    let x = dc_solve(circuit, false, &mut ws, &Tolerances::default())?;
+    let x = crate::digital::operating_solution(circuit, &mut ws, &Tolerances::default())?;
     Ok(OperatingPoint::from_solution(circuit, &x))
 }
 
