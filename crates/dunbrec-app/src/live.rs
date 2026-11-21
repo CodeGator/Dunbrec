@@ -16,9 +16,6 @@ use dunbrec_core::{Element, ModelLibrary, Netlist};
 use dunbrec_mcu::CpuSnapshot;
 use dunbrec_sim::{Circuit, McuHalt, McuInfo, Sample, SerialByte, Transient, TransientOptions};
 
-// The debugger commands and events are consumed by the debugger window
-// (phase A4 of docs/mcu-firmware-development.md).
-#[allow(dead_code)]
 pub enum Command {
     Pause,
     Resume,
@@ -44,7 +41,6 @@ pub enum Command {
     },
 }
 
-#[allow(dead_code)]
 pub enum Event {
     Samples(Vec<Sample>),
     /// Bytes sent on microcontroller serial ports.
@@ -101,7 +97,6 @@ pub struct LiveSim {
     pub paused: bool,
     /// The circuit's microcontrollers, in the order the debugger commands
     /// index them.
-    #[allow(dead_code)]
     pub mcus: Vec<McuInfo>,
 }
 
@@ -109,6 +104,7 @@ impl LiveSim {
     /// Build the circuit and initial operating point here (so errors are
     /// reported at once), then start the worker. Relative microcontroller
     /// firmware paths are resolved against `firmware_dir`.
+    #[cfg(test)]
     pub fn start(
         netlist: Netlist,
         models: ModelLibrary,

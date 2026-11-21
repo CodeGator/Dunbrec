@@ -14,6 +14,7 @@ use crate::canvas::{
     Annotation, Canvas, Item, Marker, NodeMap, PartDrag, TagPlace, Tool, delete_items,
     node_tag_positions, transform_components,
 };
+use crate::debugger_ui::{Action as DebugAction, Debugger};
 use crate::dock::{self, LAYOUT_KEY, Pane};
 use crate::document::Document;
 use crate::examples::examples;
@@ -120,6 +121,10 @@ pub struct DunbrecApp {
     dock: DockState<Pane>,
     /// Text in the palette's search box.
     palette_search: String,
+    /// The microcontroller debugger, and the netlist generation whose
+    /// firmware it has loaded.
+    debugger: Debugger,
+    debug_loaded: Option<u64>,
 }
 
 /// True if two netlists have the same nodes and connections, so a running
@@ -183,6 +188,8 @@ impl DunbrecApp {
         Self {
             dock,
             palette_search: String::new(),
+            debugger: Debugger::default(),
+            debug_loaded: None,
             node_map: (doc.generation(), node_map, tags),
             analyses: Analyses::default(),
             serial: SerialMonitor::default(),
@@ -580,7 +587,21 @@ impl DunbrecApp {
 
     // ------------------------------------------------ live simulation ---
 
+    /// Relative firmware paths are relative to the schematic's folder.
+    fn firmware_dir(&self) -> Option<PathBuf> {
+        self.doc
+            .path()
+            .and_then(|p| p.parent())
+            .map(|d| d.to_path_buf())
+    }
+
     fn start_sim(&mut self) {
+        self.start_sim_with(false);
+    }
+
+    /// Start the live simulation, optionally paused at time zero (for the
+    /// debugger to step from the first instruction).
+    fn start_sim_with(&mut self, paused: bool) {
         self.stop_sim();
         let netlist = self.netlist.1.clone();
         if netlist.has_errors() {
@@ -590,15 +611,23 @@ impl DunbrecApp {
         self.bench.clear_readings();
         let speed = self.bench.speed.value(&self.bench.scope);
         let models = self.doc.schematic().models.clone();
-        // Relative firmware paths are relative to the schematic's folder.
-        let firmware_dir = self
-            .doc
-            .path()
-            .and_then(|p| p.parent())
-            .map(|d| d.to_path_buf());
+        let firmware_dir = self.firmware_dir();
         self.serial.clear();
-        match LiveSim::start(netlist, models, self.bench.max_step(), speed, firmware_dir) {
+        // The firmware file is read again for every run, so the debugger
+        // lists what this run will execute.
+        self.debugger.load(&netlist, firmware_dir.as_deref());
+        self.debug_loaded = Some(self.netlist.0);
+        let debug = self.debugger.setup(&netlist, paused);
+        match LiveSim::start_debug(
+            netlist,
+            models,
+            self.bench.max_step(),
+            speed,
+            firmware_dir,
+            debug,
+        ) {
             Ok(live) => {
+                self.debugger.sim_started();
                 self.live = Some(live);
                 self.live_generation = self.doc.generation();
                 self.live_error = None;
@@ -612,6 +641,7 @@ impl DunbrecApp {
     fn stop_sim(&mut self) {
         self.live = None;
         self.latest = None;
+        self.debugger.sim_stopped();
     }
 
     /// Run, or pause/resume a running simulation.
@@ -669,10 +699,15 @@ impl DunbrecApp {
                     }
                 }
                 Event::NeedsRestart => restart = true,
-                // A breakpoint or step paused the simulation. The debugger
-                // window (phase A4) will show the snapshot.
-                Event::Halted { .. } => live.paused = true,
-                Event::McuState { .. } => {}
+                // A breakpoint or step paused the simulation: the debugger
+                // window shows where.
+                Event::Halted { halt, snapshot } => {
+                    live.paused = true;
+                    self.debugger.on_halt(halt, snapshot, &live.mcus);
+                }
+                Event::McuState { part, snapshot } => {
+                    self.debugger.on_state(part, snapshot, &live.mcus);
+                }
                 Event::Error(e) => error = Some(e),
             }
         }
@@ -828,6 +863,16 @@ impl DunbrecApp {
         self.serial.window(ctx);
         if probe_clicked {
             self.canvas.tool = Tool::Probe;
+        }
+
+        // The debugger lists the firmware of the circuit as it is now.
+        if self.debugger.show && self.debug_loaded != Some(self.netlist.0) {
+            let dir = self.firmware_dir();
+            self.debugger.load(&self.netlist.1, dir.as_deref());
+            self.debug_loaded = Some(self.netlist.0);
+        }
+        if self.debugger.window(ctx, &mut self.live) == DebugAction::StartPaused {
+            self.start_sim_with(true);
         }
     }
 
@@ -1035,6 +1080,7 @@ impl DunbrecApp {
                     ui.checkbox(&mut self.bench.show_logic, "📊 Logic analyser");
                     ui.checkbox(&mut self.analyses.show_fgen, "〰 Function generator");
                     ui.checkbox(&mut self.serial.show, "⌨ Serial monitor");
+                    ui.checkbox(&mut self.debugger.show, "🐞 MCU debugger");
                     ui.separator();
                     ui.checkbox(
                         &mut self.analyses.show_bode,

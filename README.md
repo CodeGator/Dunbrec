@@ -110,6 +110,17 @@ inputs switch at 3.0 V rising and 1.5 V falling, and the ADC samples the net's v
 demo programs (`blink`, `fade`, `pot-pwm-serial`) need no toolchain; try File → Open example →
 Arduino blink, Arduino PWM fade, or Arduino pot, PWM and serial.
 
+**Debugging firmware.** Instruments → *MCU debugger* opens a floating window for the
+microcontrollers in the circuit. It lists the firmware as assembly (registers and I/O by name,
+jump targets as byte addresses); **click a line's gutter to set or clear a breakpoint**, even
+before the circuit runs. *Start paused at reset* runs the circuit paused at time zero, so you can
+**Step** one instruction at a time from the very first one; *Continue* runs to the next
+breakpoint, which pauses the whole circuit at that exact instant and opens the window. While
+stopped it shows the program counter, stack pointer, status flags, cycle count and simulated
+time, the 32 registers (changed ones highlighted), and a view of data memory. It shows the state
+the circuit has seen at the stop, not a live view of a running chip. Breakpoints are kept per
+part for the session; *Clear all breakpoints* removes them all.
+
 **Parts library.** Besides generic parts, the palette has real ones: the 2N3904 and 2N3906
 transistors and the 1N4148 and 1N750 (4.7 V zener) diodes, using the published manufacturer
 SPICE models. They sit in the group for what they are (Transistors, Diodes), after the generic
