@@ -13,6 +13,7 @@ mod app;
 mod canvas;
 mod code_ui;
 mod debugger_ui;
+mod dialog;
 mod dock;
 mod document;
 mod examples;
