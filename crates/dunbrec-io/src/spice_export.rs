@@ -264,10 +264,37 @@ fn write_netlist(
                     sanitize(model)
                 )
             }
+            K::MultiSwitch {
+                form,
+                thrown,
+                r_on,
+                r_off,
+            } => {
+                let name = element_name('R', d);
+                let mut text = format!(
+                    "* {} switch {d} ({})",
+                    form.name(),
+                    if *thrown { "thrown" } else { "rest" }
+                );
+                for (i, &(a, b, when)) in form.contacts().iter().enumerate() {
+                    let r = if *thrown == when { r_on } else { r_off };
+                    let _ = write!(
+                        text,
+                        "
+{name}_{} {} {} {}",
+                        i + 1,
+                        n[a],
+                        n[b],
+                        num(*r)
+                    );
+                }
+                text
+            }
             K::Switch {
                 closed,
                 r_on,
                 r_off,
+                ..
             } => {
                 let (r, state) = if *closed {
                     (r_on, "closed")
@@ -518,6 +545,7 @@ mod tests {
                         closed: true,
                         r_on: 0.01,
                         r_off: 1e9,
+                        momentary: false,
                     },
                     &["w", "out"],
                 ),

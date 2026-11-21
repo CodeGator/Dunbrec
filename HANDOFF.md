@@ -23,6 +23,7 @@ named after the application version and merged into `main`; this one is `0.2.0`.
 | 11 | ATmega328P emulation with `.hex` firmware; serial monitor; Arduino examples |
 | 12 | Composite parts; 741 op-amp (Boyle macromodel); 555 timer; examples 12–14 |
 | 13 | Dockable panels: every panel is an `egui_dock` tab; layout saved between sessions |
+| 0.2.0 | Switches group: SPST, SPDT, DPST, DPDT (`ComponentKind::MultiSwitch`, `SwitchContacts` device) and hold-to-press push buttons (`Switch { momentary }`, `Canvas::push_buttons`) |
 
 Health at handoff: `cargo test --workspace` 237 passed, 0 failed (1 ignored: an emulator speed
 benchmark); `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --check`

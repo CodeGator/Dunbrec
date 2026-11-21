@@ -252,6 +252,9 @@ pub struct Canvas {
     pub paste_count: i32,
     /// Probe tool click: the grid point and the part under it, if any.
     probe_request: Option<(Point, Option<ComponentId>)>,
+    /// The push button being held down. Pressing flips it from its resting
+    /// state and releasing flips it back, without an undo step.
+    held_button: Option<ComponentId>,
 }
 
 impl Default for Canvas {
@@ -264,6 +267,7 @@ impl Default for Canvas {
             drag: None,
             label_request: None,
             probe_request: None,
+            held_button: None,
             clipboard: None,
             paste_count: 0,
         }
@@ -601,6 +605,7 @@ pub fn toggle_switch(s: &mut Schematic, id: ComponentId) {
     if let Some(c) = s.component_mut(id) {
         match &mut c.kind {
             ComponentKind::Switch { closed, .. } => *closed = !*closed,
+            ComponentKind::MultiSwitch { thrown, .. } => *thrown = !*thrown,
             ComponentKind::LogicSwitch { high } => *high = !*high,
             _ => {}
         }
@@ -787,6 +792,13 @@ pub fn value_text(kind: &ComponentKind) -> String {
         | ComponentKind::Bjt { model, .. }
         | ComponentKind::Mosfet { model, .. } => model.clone(),
         ComponentKind::Switch { closed, .. } => (if *closed { "closed" } else { "open" }).into(),
+        ComponentKind::MultiSwitch { form, thrown, .. } => {
+            format!(
+                "{} {}",
+                form.name(),
+                if *thrown { "thrown" } else { "rest" }
+            )
+        }
         ComponentKind::Potentiometer { resistance, wiper } => {
             format!("{} @{:.0}%", format_value(*resistance, "Ω"), wiper * 100.0)
         }
@@ -980,6 +992,8 @@ impl Canvas {
         if !ui.ctx().wants_keyboard_input() {
             self.keyboard(ui, doc);
         }
+
+        self.push_buttons(&response, doc, grid_pointer);
 
         // ---- tools ----
         match self.tool.clone() {
@@ -1353,6 +1367,44 @@ impl Canvas {
         }
     }
 
+    /// Push buttons act while the mouse button is held on them (Select tool
+    /// only). Starting to drag the part, or letting go anywhere, lets the
+    /// button spring back.
+    fn push_buttons(
+        &mut self,
+        response: &egui::Response,
+        doc: &mut Document,
+        grid_pointer: Option<Pos2>,
+    ) {
+        if let Some(id) = self.held_button {
+            let down = response.ctx.input(|i| i.pointer.primary_down());
+            let dragging = response.drag_started_by(PointerButton::Primary);
+            if !down || dragging || self.tool != Tool::Select {
+                self.held_button = None;
+                if doc.schematic().component(id).is_some() {
+                    toggle_switch(doc.schematic_mut(), id);
+                }
+            }
+        }
+        if self.tool == Tool::Select
+            && self.held_button.is_none()
+            && response.hovered()
+            && response.ctx.input(|i| i.pointer.primary_pressed())
+            && let Some(Item::Component(id)) =
+                grid_pointer.and_then(|p| hit_test(doc.schematic(), p))
+            && matches!(
+                doc.schematic().component(id).map(|c| &c.kind),
+                Some(ComponentKind::Switch {
+                    momentary: true,
+                    ..
+                })
+            )
+        {
+            toggle_switch(doc.schematic_mut(), id);
+            self.held_button = Some(id);
+        }
+    }
+
     fn select_tool(
         &mut self,
         response: &egui::Response,
@@ -1479,7 +1531,13 @@ impl Canvas {
                 grid_pointer.and_then(|p| hit_test(doc.schematic(), p))
             && matches!(
                 doc.schematic().component(id).map(|c| &c.kind),
-                Some(ComponentKind::Switch { .. } | ComponentKind::LogicSwitch { .. })
+                Some(
+                    ComponentKind::Switch {
+                        momentary: false,
+                        ..
+                    } | ComponentKind::MultiSwitch { .. }
+                        | ComponentKind::LogicSwitch { .. }
+                )
             )
         {
             doc.edit(|s| toggle_switch(s, id));
@@ -1618,6 +1676,34 @@ impl Canvas {
 mod tests {
     use super::*;
     use crate::examples::voltage_divider;
+
+    #[test]
+    fn toggling_flips_every_kind_of_switch() {
+        use crate::library::palette;
+        let mut s = Schematic::new();
+        let ids: Vec<_> = palette()
+            .iter()
+            .filter(|e| e.group == "Switches")
+            .map(|e| s.add_component((e.make)(), Point::new(0, 0)))
+            .collect();
+        assert_eq!(ids.len(), 6);
+        let labels = |s: &Schematic| -> Vec<String> {
+            s.components.iter().map(|c| value_text(&c.kind)).collect()
+        };
+        let before = labels(&s);
+        for &id in &ids {
+            toggle_switch(&mut s, id);
+        }
+        let after = labels(&s);
+        assert!(
+            before.iter().zip(&after).all(|(a, b)| a != b),
+            "{before:?} {after:?}"
+        );
+        for &id in &ids {
+            toggle_switch(&mut s, id);
+        }
+        assert_eq!(labels(&s), before);
+    }
 
     #[test]
     fn corners_are_found_and_moved_with_what_is_attached() {

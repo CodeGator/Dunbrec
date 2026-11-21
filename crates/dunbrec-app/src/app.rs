@@ -52,6 +52,10 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("Esc", "Stop the current tool / clear the selection"),
     ("Space", "Run, pause or resume the simulation"),
     ("Double-click a switch", "Flip it (also while simulating)"),
+    (
+        "Hold a push button",
+        "Press it for as long as the mouse is down",
+    ),
     ("Mouse wheel / middle drag", "Zoom / pan"),
 ];
 

@@ -7,7 +7,7 @@ use dunbrec_core::{ComponentKind, Element, ModelLibrary, Netlist, NodeId, Polari
 use crate::device::StampContext;
 use crate::device::{
     Capacitor, Cccs, Ccvs, ControlledPins, CurrentSource, Device, Inductor, Potentiometer,
-    Resistor, Vccs, Vcvs, VoltageSource,
+    Resistor, SwitchContacts, Vccs, Vcvs, VoltageSource,
 };
 use crate::digital::{CMOS_5V, DigitalDriver, InputSense, NullDevice, PartSpec, SwitchDriver};
 use crate::error::{SimError, SimWarning};
@@ -494,10 +494,30 @@ pub(crate) fn make_device(e: &Element, models: &ModelLibrary) -> Result<Box<dyn 
                 resistance: r,
             })
         }
+        ComponentKind::MultiSwitch {
+            form,
+            thrown,
+            r_on,
+            r_off,
+        } => {
+            let r_on = check_positive(e, "on resistance", *r_on)?;
+            let r_off = check_positive(e, "off resistance", *r_off)?;
+            Box::new(SwitchContacts {
+                name,
+                contacts: form
+                    .contacts()
+                    .iter()
+                    .map(|&(a, b, when)| {
+                        (node(a), node(b), if *thrown == when { r_on } else { r_off })
+                    })
+                    .collect(),
+            })
+        }
         ComponentKind::Switch {
             closed,
             r_on,
             r_off,
+            ..
         } => {
             let r_on = check_positive(e, "on resistance", *r_on)?;
             let r_off = check_positive(e, "off resistance", *r_off)?;

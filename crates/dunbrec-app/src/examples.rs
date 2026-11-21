@@ -179,10 +179,10 @@ pub fn timer555_blinker() -> Schematic {
     s
 }
 
-/// A 555 monostable: closing the switch pulls TRIG low and the output goes
-/// high for 1.1 RC = 1.1 s (100 kΩ, 10 µF), then low again. Double-click
-/// the switch to close it and again to open it — a quick press and
-/// release. Held closed, the output stays high until it is released.
+/// A 555 monostable: pressing the push button pulls TRIG low and the output
+/// goes high for 1.1 RC = 1.1 s (100 kΩ, 10 µF), then low again. Click the
+/// button, or hold it: held down, the output stays high until it is
+/// released.
 pub fn timer555_one_shot() -> Schematic {
     let mut s = Schematic::new();
     timer555_frame(&mut s, 16);
@@ -200,6 +200,7 @@ pub fn timer555_one_shot() -> Schematic {
         closed: false,
         r_on: 0.1,
         r_off: 1e9,
+        momentary: true,
     };
     place(&mut s, button, 16, 1, Rotation::R90); // (16,-1) (16,3)
     wire(&mut s, &[(16, -8), (16, -7)]);

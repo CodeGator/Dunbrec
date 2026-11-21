@@ -423,6 +423,7 @@ fn closing_a_switch_mid_run() {
         closed,
         r_on: 1e-3,
         r_off: 1e12,
+        momentary: false,
     };
     let netlist = NetlistBuilder::new()
         .element(

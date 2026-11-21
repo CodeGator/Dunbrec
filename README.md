@@ -59,7 +59,7 @@ with each node's voltage shown on the schematic.
 the Speed box sets how much simulated time passes per second. Open instruments from the
 toolbar or the Instruments menu, click an input's 🔌 Probe button, then click a wire or pin
 (or a part, for current). Edits while running take effect at once: double-click a switch to
-flip it, drag a potentiometer's wiper, use the function generator, change a value. Changing the
+flip it (hold a push button to press it), drag a potentiometer's wiper, use the function generator, change a value. Changing the
 wiring restarts the run.
 
 | Instrument | What it does |

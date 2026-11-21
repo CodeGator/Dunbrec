@@ -128,6 +128,21 @@ const DIODE: &[PinDef] = &[pin("A", -2, 0), pin("K", 2, 0)];
 const BJT: &[PinDef] = &[pin("C", 2, -2), pin("B", -2, 0), pin("E", 2, 2)];
 const MOSFET: &[PinDef] = &[pin("D", 2, -2), pin("G", -2, 0), pin("S", 2, 2)];
 const GROUND: &[PinDef] = &[pin("gnd", 0, 0)];
+const SPDT: &[PinDef] = &[pin("C", -2, 0), pin("1", 2, -1), pin("2", 2, 1)];
+const DPST: &[PinDef] = &[
+    pin("1a", -2, -1),
+    pin("1b", 2, -1),
+    pin("2a", -2, 1),
+    pin("2b", 2, 1),
+];
+const DPDT: &[PinDef] = &[
+    pin("C1", -2, -2),
+    pin("1A", 2, -3),
+    pin("1B", 2, -1),
+    pin("C2", -2, 2),
+    pin("2A", 2, 1),
+    pin("2B", 2, 3),
+];
 const POT: &[PinDef] = &[pin("A", -2, 0), pin("B", 2, 0), pin("W", 0, -2)];
 const fn din(name: &'static str, x: i32, y: i32) -> PinDef {
     PinDef {
@@ -419,8 +434,20 @@ pub enum ComponentKind {
         polarity: Polarity,
         model: String,
     },
+    /// Two-terminal switch. A `momentary` one is a push button: it only
+    /// leaves its resting state (`closed`) while held down.
     Switch {
         closed: bool,
+        r_on: f64,
+        r_off: f64,
+        #[serde(default)]
+        momentary: bool,
+    },
+    /// Multi-contact switch (see [`SwitchForm`]); `thrown` is the actuated
+    /// position.
+    MultiSwitch {
+        form: SwitchForm,
+        thrown: bool,
         r_on: f64,
         r_off: f64,
     },
@@ -566,6 +593,40 @@ fn default_mcu_clock() -> f64 {
     DEFAULT_MCU_CLOCK
 }
 
+/// The contact arrangement of a [`ComponentKind::MultiSwitch`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SwitchForm {
+    /// Single pole, double throw: the common pin goes to throw 1, or to
+    /// throw 2 when thrown.
+    Spdt,
+    /// Double pole, single throw: two contacts that close together.
+    Dpst,
+    /// Double pole, double throw: two changeover contacts that move together.
+    Dpdt,
+}
+
+impl SwitchForm {
+    pub const ALL: [SwitchForm; 3] = [SwitchForm::Spdt, SwitchForm::Dpst, SwitchForm::Dpdt];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            SwitchForm::Spdt => "SPDT",
+            SwitchForm::Dpst => "DPST",
+            SwitchForm::Dpdt => "DPDT",
+        }
+    }
+
+    /// The contacts as `(pin, pin, closed_when_thrown)`: the contact joins
+    /// the two pins when `thrown` equals the third element.
+    pub fn contacts(self) -> &'static [(usize, usize, bool)] {
+        match self {
+            SwitchForm::Spdt => &[(0, 1, false), (0, 2, true)],
+            SwitchForm::Dpst => &[(0, 1, true), (2, 3, true)],
+            SwitchForm::Dpdt => &[(0, 1, false), (0, 2, true), (3, 4, false), (3, 5, true)],
+        }
+    }
+}
+
 impl ComponentKind {
     pub fn pins(&self) -> &'static [PinDef] {
         match self {
@@ -579,6 +640,11 @@ impl ComponentKind {
             ComponentKind::Diode { .. } => DIODE,
             ComponentKind::Bjt { .. } => BJT,
             ComponentKind::Mosfet { .. } => MOSFET,
+            ComponentKind::MultiSwitch { form, .. } => match form {
+                SwitchForm::Spdt => SPDT,
+                SwitchForm::Dpst => DPST,
+                SwitchForm::Dpdt => DPDT,
+            },
             ComponentKind::Potentiometer { .. } => POT,
             ComponentKind::Vcvs { .. }
             | ComponentKind::Vccs { .. }
@@ -608,7 +674,7 @@ impl ComponentKind {
             ComponentKind::Diode { .. } => "D",
             ComponentKind::Bjt { .. } => "Q",
             ComponentKind::Mosfet { .. } => "M",
-            ComponentKind::Switch { .. } => "S",
+            ComponentKind::Switch { .. } | ComponentKind::MultiSwitch { .. } => "S",
             ComponentKind::Potentiometer { .. } => "RV",
             ComponentKind::Vcvs { .. } => "E",
             ComponentKind::Vccs { .. } => "G",

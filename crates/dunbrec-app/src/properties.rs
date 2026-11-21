@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use dunbrec_core::{
-    ComponentId, ComponentKind, ModelKind, Polarity, Schematic, Waveform,
+    ComponentId, ComponentKind, ModelKind, Polarity, Schematic, SwitchForm, Waveform,
     units::{format_value, parse_eng, parse_spice},
 };
 use egui::{Color32, RichText, Ui};
@@ -167,9 +167,26 @@ impl Properties {
                         closed,
                         r_on,
                         r_off,
+                        momentary,
                     } => {
                         ui.label("Closed");
                         let a = ui.checkbox(closed, "").changed();
+                        ui.end_row();
+                        ui.label("Push button");
+                        let b = ui.checkbox(momentary, "").changed();
+                        ui.end_row();
+                        a | b
+                            | self.value(ui, id, "On resistance", "Ω", r_on)
+                            | self.value(ui, id, "Off resistance", "Ω", r_off)
+                    }
+                    ComponentKind::MultiSwitch {
+                        thrown,
+                        r_on,
+                        r_off,
+                        ..
+                    } => {
+                        ui.label("Thrown");
+                        let a = ui.checkbox(thrown, "").changed();
                         ui.end_row();
                         a | self.value(ui, id, "On resistance", "Ω", r_on)
                             | self.value(ui, id, "Off resistance", "Ω", r_off)
@@ -738,7 +755,19 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
             ..
         } => "N-channel MOSFET",
         ComponentKind::Mosfet { .. } => "P-channel MOSFET",
+        ComponentKind::Switch {
+            momentary: true, ..
+        } => "Push button",
         ComponentKind::Switch { .. } => "Switch",
+        ComponentKind::MultiSwitch {
+            form: SwitchForm::Spdt,
+            ..
+        } => "SPDT switch",
+        ComponentKind::MultiSwitch {
+            form: SwitchForm::Dpst,
+            ..
+        } => "DPST switch",
+        ComponentKind::MultiSwitch { .. } => "DPDT switch",
         ComponentKind::Potentiometer { .. } => "Potentiometer",
         ComponentKind::Vcvs { .. } => "Voltage-controlled voltage source",
         ComponentKind::Vccs { .. } => "Voltage-controlled current source",

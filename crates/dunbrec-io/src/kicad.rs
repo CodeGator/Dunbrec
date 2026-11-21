@@ -380,6 +380,7 @@ fn classify(inst: &Instance) -> Option<(K, &'static [&'static str])> {
                 closed: false,
                 r_on: 0.01,
                 r_off: 1e9,
+                momentary: starts("SW_PUSH"),
             },
             TWO,
         ));

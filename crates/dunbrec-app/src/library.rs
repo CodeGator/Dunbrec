@@ -11,7 +11,7 @@
 
 use dunbrec_core::{
     ComponentKind, DEFAULT_LOGIC_DELAY, DeviceModel, GateOp, ModelKind, Polarity, Schematic,
-    Waveform,
+    SwitchForm, Waveform,
 };
 
 pub struct PaletteEntry {
@@ -19,6 +19,10 @@ pub struct PaletteEntry {
     pub group: &'static str,
     pub make: fn() -> ComponentKind,
 }
+
+/// Contact resistance of a closed and of an open switch (Ω).
+pub const SWITCH_R_ON: f64 = 0.01;
+pub const SWITCH_R_OFF: f64 = 1e9;
 
 pub const GENERIC_DIODE: &str = "DGEN";
 pub const GENERIC_ZENER: &str = "ZGEN5V1";
@@ -60,11 +64,62 @@ pub fn palette() -> &'static [PaletteEntry] {
         },
         PaletteEntry {
             name: "Switch",
-            group: "Passive",
+            group: "Switches",
             make: || ComponentKind::Switch {
                 closed: false,
-                r_on: 0.01,
-                r_off: 1e9,
+                r_on: SWITCH_R_ON,
+                r_off: SWITCH_R_OFF,
+                momentary: false,
+            },
+        },
+        PaletteEntry {
+            name: "SPDT switch",
+            group: "Switches",
+            make: || ComponentKind::MultiSwitch {
+                form: SwitchForm::Spdt,
+                thrown: false,
+                r_on: SWITCH_R_ON,
+                r_off: SWITCH_R_OFF,
+            },
+        },
+        PaletteEntry {
+            name: "DPST switch",
+            group: "Switches",
+            make: || ComponentKind::MultiSwitch {
+                form: SwitchForm::Dpst,
+                thrown: false,
+                r_on: SWITCH_R_ON,
+                r_off: SWITCH_R_OFF,
+            },
+        },
+        PaletteEntry {
+            name: "DPDT switch",
+            group: "Switches",
+            make: || ComponentKind::MultiSwitch {
+                form: SwitchForm::Dpdt,
+                thrown: false,
+                r_on: SWITCH_R_ON,
+                r_off: SWITCH_R_OFF,
+            },
+        },
+        PaletteEntry {
+            name: "Push button (normally open)",
+            group: "Switches",
+            make: || ComponentKind::Switch {
+                closed: false,
+                r_on: SWITCH_R_ON,
+                r_off: SWITCH_R_OFF,
+                momentary: true,
+            },
+        },
+        PaletteEntry {
+            name: "Push button (normally closed)",
+            group: "Switches",
+            make: || ComponentKind::Switch {
+                closed: true,
+                r_on: SWITCH_R_ON,
+                r_off: SWITCH_R_OFF,
+                momentary: true,
             },
         },
         PaletteEntry {
@@ -447,6 +502,33 @@ mod tests {
         let transistors = &all.iter().find(|(g, _)| *g == "Transistors").unwrap().1;
         let position = |n: &str| transistors.iter().position(|e| e.name == n).unwrap();
         assert!(position("NPN transistor") < position("2N3904 NPN"));
+    }
+
+    #[test]
+    fn switches_have_their_own_group() {
+        let all = palette_groups("");
+        let switches = &all.iter().find(|(g, _)| *g == "Switches").unwrap().1;
+        let names: Vec<_> = switches.iter().map(|e| e.name).collect();
+        assert_eq!(
+            names,
+            [
+                "Switch",
+                "SPDT switch",
+                "DPST switch",
+                "DPDT switch",
+                "Push button (normally open)",
+                "Push button (normally closed)"
+            ]
+        );
+        // Searching by part type finds them.
+        assert!(
+            super::palette_groups("push")
+                .iter()
+                .any(|(g, _)| *g == "Switches")
+        );
+        // The plain switch is no longer a passive part.
+        let passive = &all.iter().find(|(g, _)| *g == "Passive").unwrap().1;
+        assert!(passive.iter().all(|e| e.name != "Switch"));
     }
 
     #[test]
