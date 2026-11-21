@@ -1,6 +1,6 @@
 //! The schematic canvas: drawing, hit testing, and the editing tools.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use dunbrec_core::{
     ComponentId, ComponentKind, Diagnostic, LabelId, Netlist, NodeId, Point, Rotation, Schematic,
@@ -338,6 +338,42 @@ fn label_rect(position: Point, name: &str) -> Rect {
         pos2(p.x, p.y - 1.1),
         pos2(p.x + 0.5 + 0.55 * name.chars().count() as f32, p.y + 0.1),
     )
+}
+
+/// Net-label names whose connections should be shown: the label under the
+/// pointer (`hovered`) and any selected labels.
+fn focused_label_names<'a>(
+    s: &'a Schematic,
+    hovered: Option<Item>,
+    selection: &BTreeSet<Item>,
+) -> HashSet<&'a str> {
+    s.labels
+        .iter()
+        .filter(|l| hovered == Some(Item::Label(l.id)) || selection.contains(&Item::Label(l.id)))
+        .map(|l| l.name.as_str())
+        .collect()
+}
+
+/// Indices of the wires on the nets those labels name.
+fn wires_of_labelled_nets(
+    s: &Schematic,
+    netlist: &Netlist,
+    names: &HashSet<&str>,
+) -> HashSet<usize> {
+    if names.is_empty() {
+        return HashSet::new();
+    }
+    let nodes: HashSet<NodeId> = names
+        .iter()
+        .filter_map(|n| netlist.node_by_name(n))
+        .collect();
+    let (_, wire_node) = spread_nodes(s, netlist);
+    wire_node
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| n.is_some_and(|n| nodes.contains(&n)))
+        .map(|(i, _)| i)
+        .collect()
 }
 
 /// Topmost item at grid position `p`.
@@ -867,6 +903,23 @@ impl Canvas {
         let s = doc.schematic();
         let width = p.stroke_width();
 
+        // Hovering over or selecting a net label lights up every label of
+        // that name and the wires of its net: same-named labels are joined
+        // even though no wire is drawn between them.
+        let hovered = grid_pointer
+            .filter(|_| response.hovered())
+            .and_then(|g| hit_test(s, g))
+            .filter(|item| matches!(item, Item::Label(_)));
+        let focus = focused_label_names(s, hovered, &self.selection);
+        let glow = colors.label.gamma_multiply(0.25);
+        for i in wires_of_labelled_nets(s, netlist, &focus) {
+            let w = &s.wires[i];
+            painter.line_segment(
+                [p.screen(to_pos(w.a)), p.screen(to_pos(w.b))],
+                Stroke::new(width * 5.0, glow),
+            );
+        }
+
         for w in &s.wires {
             let color = if self.selection.contains(&Item::Wire(w.id)) {
                 colors.selected
@@ -924,6 +977,17 @@ impl Canvas {
                 colors.label
             };
             let at = p.screen(to_pos(l.position));
+            if focus.contains(l.name.as_str()) {
+                let r = label_rect(l.position, &l.name);
+                let r = Rect::from_min_max(p.screen(r.min), p.screen(r.max));
+                painter.rect_filled(r, 3.0, glow);
+                painter.rect_stroke(
+                    r,
+                    3.0,
+                    Stroke::new(1.0_f32, colors.label),
+                    egui::StrokeKind::Outside,
+                );
+            }
             painter.circle_filled(at, (self.camera.scale * 0.15).max(2.0), color);
             painter.text(
                 at + vec2(self.camera.scale * 0.3, -self.camera.scale * 0.2),
@@ -1239,6 +1303,32 @@ impl Canvas {
 mod tests {
     use super::*;
     use crate::examples::voltage_divider;
+
+    #[test]
+    fn focusing_a_label_finds_its_whole_net() {
+        // In the op-amp example "+15V" names a stub on the op-amp's V+ pin
+        // and a separate stub on the supply: both light up, nothing else.
+        let s = crate::examples::opamp_inverting();
+        let netlist = dunbrec_core::build_netlist(&s);
+        let label = s.labels.iter().find(|l| l.name == "+15V").unwrap();
+        let focus = focused_label_names(&s, Some(Item::Label(label.id)), &BTreeSet::new());
+        assert_eq!(focus, HashSet::from(["+15V"]));
+        let wires = wires_of_labelled_nets(&s, &netlist, &focus);
+        let ends: HashSet<(Point, Point)> = wires
+            .iter()
+            .map(|&i| (s.wires[i].a, s.wires[i].b))
+            .collect();
+        assert_eq!(
+            ends,
+            HashSet::from([
+                (Point::new(0, -3), Point::new(0, -4)),
+                (Point::new(12, -8), Point::new(12, -10)),
+            ])
+        );
+        // Nothing focused, nothing lit.
+        let none = focused_label_names(&s, None, &BTreeSet::new());
+        assert!(wires_of_labelled_nets(&s, &netlist, &none).is_empty());
+    }
 
     #[test]
     fn camera_round_trip_and_zoom_anchor() {
