@@ -3,7 +3,7 @@
 State of the project for whoever picks it up next. User-facing documentation is in
 [README.md](README.md); this file covers status, decisions and open work.
 
-*Last updated: 2026-11-22, version 0.4.0 released (assistant, settings, message boxes, project behaviour).*
+*Last updated: 2026-11-22, version 0.5.0 started (0.4.0 released: assistant, settings, message boxes, project behaviour).*
 
 ## Status
 
@@ -12,7 +12,7 @@ plus Phase 12 (integrated circuits) and a fix for probes failing after opening a
 Version 0.3.0 was released on 2026-11-21 (tag `v0.3.0`, merged to `main`; 0.1.0 and 0.2.0 were
 released the same day). Version 0.4.0 was merged to `main` and pushed to `release` on 2026-11-22;
 the workflow drafts the GitHub release `v0.4.0`, which is published by hand. Work branches are
-named after the application version and merged into `main`; the next one (0.5.0) is not started. A release is cut by merging the branch into `main` and pushing `main:release`, which
+named after the application version and merged into `main`; this one is `0.5.0`. A release is cut by merging the branch into `main` and pushing `main:release`, which
 drafts the GitHub release (see `.github/workflows/release.yml`).
 
 | Phase | Content |
