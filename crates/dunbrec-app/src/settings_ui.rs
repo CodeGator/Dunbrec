@@ -10,7 +10,7 @@ use std::sync::mpsc::{Receiver, channel};
 use egui::{Color32, ComboBox, Context, RichText, TextEdit, Ui};
 
 use crate::ai::{self, AiSettings, Provider};
-use crate::settings::{Settings, Theme};
+use crate::settings::{Settings, TextSize, Theme};
 
 type ModelList = Result<Vec<String>, String>;
 
@@ -116,6 +116,22 @@ impl SettingsDialog {
                 }
             }
         });
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.label("Text size");
+            for size in TextSize::ALL {
+                if ui
+                    .radio_value(&mut settings.text_size, size, size.name())
+                    .clicked()
+                {
+                    ctx.set_zoom_factor(size.factor());
+                }
+            }
+        });
+        ui.label(
+            RichText::new("Makes everything larger: menus, panels, dialogs and the schematic.")
+                .weak(),
+        );
     }
 
     fn assistant(&mut self, ui: &mut Ui, ctx: &Context, ai: &mut AiSettings) {

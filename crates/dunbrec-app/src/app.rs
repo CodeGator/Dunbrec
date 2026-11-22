@@ -111,6 +111,8 @@ pub struct DunbrecApp {
     show_shortcuts: bool,
     settings: Settings,
     settings_dialog: crate::settings_ui::SettingsDialog,
+    /// A project file or folder waiting for the user to confirm deleting it.
+    confirm_delete: Option<PathBuf>,
     assistant: crate::assistant::Assistant,
 
     // ---- live simulation and instruments ----
@@ -193,6 +195,7 @@ impl DunbrecApp {
             .and_then(|s| eframe::get_value(s, STORAGE_KEY))
             .unwrap_or_default();
         cc.egui_ctx.set_theme(settings.theme.preference());
+        cc.egui_ctx.set_zoom_factor(settings.text_size.factor());
         let mut startup_problems = Vec::new();
         let doc = match initial {
             Some((mut s, path)) => {
@@ -262,6 +265,7 @@ impl DunbrecApp {
             show_shortcuts: false,
             settings,
             settings_dialog: Default::default(),
+            confirm_delete: None,
             assistant: Default::default(),
         };
         if app.project.is_some() {
@@ -608,7 +612,7 @@ impl DunbrecApp {
                 }
             }
             C::Rename { from, to } => self.rename_in_project(&from, &to),
-            C::Delete(path) => self.delete_in_project(&path),
+            C::AskDelete(path) => self.confirm_delete = Some(path),
             C::Refresh => self.refresh_project(),
             C::MoveSourcesToFiles => self.move_sources_to_files(),
             C::ForgetProject(path) => self.settings.forget_project(&path),
@@ -1757,6 +1761,40 @@ impl DunbrecApp {
                 if let (0, Some(at), false) = (choice, at, name.is_empty()) {
                     self.doc.edit(|s| s.add_label(name, at));
                 }
+            }
+        }
+
+        if let Some(path) = self.confirm_delete.clone() {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let what = if path.is_dir() {
+                format!("Delete the folder “{name}” and everything in it?")
+            } else {
+                format!("Delete “{name}”?")
+            };
+            // Cancel is the highlighted button: Enter must not delete a file.
+            let answer = Dialog {
+                id: "confirm_delete",
+                kind: dialog::Kind::Warning,
+                title: "Delete from disk",
+                buttons: &["Delete", "Cancel"],
+                default: 1,
+                cancel: Some(1),
+            }
+            .show(ctx, |ui| {
+                dialog::paragraph(ui, &what);
+                ui.add_space(4.0);
+                dialog::paragraph(ui, "This removes it from the disk and cannot be undone.");
+            });
+            match answer {
+                Some(0) => {
+                    self.confirm_delete = None;
+                    self.delete_in_project(&path);
+                }
+                Some(_) => self.confirm_delete = None,
+                None => {}
             }
         }
 

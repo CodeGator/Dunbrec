@@ -107,8 +107,9 @@ pub enum Command {
     },
     /// Take a file or folder out of the project, leaving it on the disk.
     RemoveFromProject(PathBuf),
-    /// Delete a file or folder from the disk (and so from the project).
-    Delete(PathBuf),
+    /// The user asked to delete a file or folder from the disk; the app
+    /// confirms in a message box before doing it.
+    AskDelete(PathBuf),
     /// Pick existing files to add to the project.
     AddExisting,
     Refresh,
@@ -129,9 +130,6 @@ enum Form {
         path: PathBuf,
         name: String,
         fresh: bool,
-    },
-    Delete {
-        path: PathBuf,
     },
 }
 
@@ -407,15 +405,13 @@ impl ProjectPanel {
             ui.close();
         }
         if ui.button("Delete from disk…").clicked() {
-            self.form = Some(Form::Delete {
-                path: e.path.clone(),
-            });
+            out = Some(Command::AskDelete(e.path.clone()));
             ui.close();
         }
         out
     }
 
-    /// The small form for a name or a confirmation, above the tree.
+    /// The small form for a name, above the tree.
     fn form_ui(&mut self, ui: &mut Ui, project: &Project) -> Option<Command> {
         let mut form = self.form.take()?;
         let mut out = None;
@@ -488,35 +484,6 @@ impl ProjectPanel {
                             from: path.clone(),
                             to: path.with_file_name(name.trim()),
                         });
-                        keep = false;
-                    }
-                    if ui.button("Cancel").clicked() {
-                        keep = false;
-                    }
-                });
-            }
-            Form::Delete { path } => {
-                let name = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                let what = if path.is_dir() {
-                    format!("Delete the folder “{name}” and everything in it?")
-                } else {
-                    format!("Delete “{name}”?")
-                };
-                ui.label(RichText::new(what).strong());
-                ui.label(
-                    RichText::new("This removes it from the disk and cannot be undone.")
-                        .small()
-                        .color(Color32::from_rgb(220, 150, 30)),
-                );
-                ui.horizontal(|ui| {
-                    if ui
-                        .button(RichText::new("Delete").color(Color32::from_rgb(225, 70, 70)))
-                        .clicked()
-                    {
-                        out = Some(Command::Delete(path.clone()));
                         keep = false;
                     }
                     if ui.button("Cancel").clicked() {
@@ -680,9 +647,6 @@ mod tests {
                 path: dir.join("a.dbr"),
                 name: "a.dbr".into(),
                 fresh: true,
-            },
-            Form::Delete {
-                path: dir.join("fw"),
             },
         ] {
             panel.form = Some(form);
