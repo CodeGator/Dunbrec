@@ -25,6 +25,7 @@ mod instruments_ui;
 mod library;
 mod live;
 mod logic_ui;
+mod part_edits;
 mod plot;
 mod project;
 mod project_ui;

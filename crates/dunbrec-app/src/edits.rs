@@ -14,6 +14,8 @@
 //! ```
 //! ````
 //!
+//! Blocks that add and remove parts are in [`crate::part_edits`].
+//!
 //! Nothing here touches the document until [`apply`] is called, which the
 //! user triggers with an Apply button. Applying is one undo step.
 
@@ -21,6 +23,7 @@ use dunbrec_core::units::{format_value, parse_eng};
 use dunbrec_core::{ComponentId, ComponentKind as K, Schematic, Waveform};
 
 use crate::document::Document;
+use crate::part_edits::{self, NewPart};
 
 /// Fence tag of a block that changes part values.
 pub const SET_TAG: &str = "dunbrec-set";
@@ -31,7 +34,14 @@ pub const FILE_TAG: &str = "dunbrec-file";
 #[derive(Debug, Clone, PartialEq)]
 pub enum Edit {
     Set(Vec<SetLine>),
-    File { name: String, text: String },
+    File {
+        name: String,
+        text: String,
+    },
+    /// New parts, below the drawing.
+    Add(Vec<NewPart>),
+    /// Parts to take out, by designator.
+    Remove(Vec<String>),
 }
 
 /// `R2 = 1k`, or `RV1.wiper = 0.5`.
@@ -306,6 +316,22 @@ pub fn apply(doc: &mut Document, edit: &Edit) -> Result<String, String> {
             let summaries: Vec<&str> = plans.iter().map(|p| p.summary.as_str()).collect();
             Ok(summaries.join("; "))
         }
+        Edit::Add(parts) => {
+            let notes = part_edits::check_add(doc.schematic(), parts)?;
+            doc.edit(|s| {
+                let _ = part_edits::add_parts(s, parts);
+            });
+            Ok(notes.join(" "))
+        }
+        Edit::Remove(names) => {
+            part_edits::check_remove(doc.schematic(), names)?;
+            doc.edit(|s| {
+                for n in names {
+                    let _ = part_edits::remove_part(s, n);
+                }
+            });
+            Ok(format!("Removed {}.", names.join(", ")))
+        }
         Edit::File { name, text } => {
             check_file(doc.schematic(), name)?;
             doc.edit(|s| {
@@ -471,6 +497,28 @@ mod tests {
         };
         let e = apply(&mut d, &missing).unwrap_err();
         assert!(e.contains("main.ino"), "{e}");
+    }
+
+    #[test]
+    fn adding_and_removing_parts_are_one_undo_step_each() {
+        let mut d = Document::new(crate::examples::voltage_divider(), None);
+        let count = |d: &Document| d.schematic().components.len();
+        let start = count(&d);
+        let parts = part_edits::parse_add("R9 resistor 4k7 VOUT 0").unwrap();
+        let msg = apply(&mut d, &Edit::Add(parts)).unwrap();
+        assert!(msg.contains("R9"), "{msg}");
+        assert!(count(&d) > start);
+        assert!(d.undo());
+        assert_eq!(count(&d), start);
+        assert!(d.redo());
+        let msg = apply(&mut d, &Edit::Remove(vec!["R9".into()])).unwrap();
+        assert!(msg.contains("R9"), "{msg}");
+        assert_eq!(count(&d), start);
+        // An impossible edit changes nothing and leaves no undo step.
+        let steps = d.can_undo();
+        let bad = Edit::Remove(vec!["R99".into()]);
+        assert!(apply(&mut d, &bad).is_err());
+        assert_eq!(d.can_undo(), steps);
     }
 
     #[test]

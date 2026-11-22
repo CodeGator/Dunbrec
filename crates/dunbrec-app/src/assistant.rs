@@ -16,6 +16,7 @@ use egui::{Align, Color32, FontId, Layout, RichText, ScrollArea, TextEdit, Ui};
 
 use crate::ai::{self, AiSettings, Chat, ChatMessage, Event, Request, Role};
 use crate::edits::{self, DiffKind, Edit};
+use crate::part_edits;
 
 /// Lines of text the question box shows before it scrolls.
 const INPUT_ROWS: usize = 6;
@@ -53,6 +54,27 @@ file name, containing the complete new text of that file (never a fragment):
 ...whole file...
 ```
 The file must already exist in the document (see the Firmware sections below).
+
+3. To add parts, write a fenced block tagged dunbrec-add with one part per line: \
+DESIGNATOR kind value, then the net of each pin in pin order. Net 0 is ground. To join \
+an existing net, use its name from the circuit above (a label such as VOUT, or an \
+automatic name such as N001); any other name is a new net that only the new parts share.
+```dunbrec-add
+R5 resistor 10k VOUT 0
+C3 capacitor 100n VOUT 0
+Q2 npn 2N3904 NODEC NODEB 0
+```
+Kinds, values and pin order: resistor, capacitor, inductor (value in engineering units; \
+pins p n); potentiometer (total resistance; pins A B W); switch (open or closed; pins p n); \
+vsource and isource (DC value; pins + - and in out); diode (generic or a model such as \
+1N4148; pins A K); npn and pnp (generic or 2N3904 / 2N3906; pins C B E); nmos and pmos \
+(generic; pins D G S). Choose designators that are not already in use. Nothing else can \
+be added this way (no LEDs, logic, op-amps or microcontrollers), so describe those in \
+words. A two-pin part between nets that already exist is drawn beside them with real \
+wires; any other part goes below the drawing, joined by net labels.
+
+4. To remove parts, write a fenced block tagged dunbrec-remove with one designator per \
+line. Wires the user drew to a part stay where they are.
 
 Use ordinary code fences, with no dunbrec tag, for examples that are not meant to be \
 applied. The current document follows.";
@@ -444,6 +466,12 @@ fn proposal(lang: &str, text: &str) -> Option<Result<Edit, String>> {
     if lang == edits::SET_TAG {
         return Some(edits::parse_set(text).map(Edit::Set));
     }
+    if lang == part_edits::ADD_TAG {
+        return Some(part_edits::parse_add(text).map(Edit::Add));
+    }
+    if lang == part_edits::REMOVE_TAG {
+        return Some(part_edits::parse_remove(text).map(Edit::Remove));
+    }
     let name = lang.strip_prefix(edits::FILE_TAG)?;
     // "dunbrec-filefoo" is not ours; the tag is followed by a space.
     if !name.is_empty() && !name.starts_with(char::is_whitespace) {
@@ -480,6 +508,8 @@ fn card(
             ui.set_width(ui.available_width());
             let title = match &proposal {
                 Ok(Edit::Set(_)) => "Suggested change: values".to_string(),
+                Ok(Edit::Add(_)) => "Suggested change: add parts".to_string(),
+                Ok(Edit::Remove(_)) => "Suggested change: remove parts".to_string(),
                 Ok(Edit::File { name, .. }) => format!("Suggested change: {name}"),
                 Err(_) => "Suggested change".to_string(),
             };
@@ -551,6 +581,43 @@ fn preview(ui: &mut Ui, edit: &Edit, schematic: &Schematic) -> bool {
                 }
             }
             all_fine
+        }
+        Edit::Add(parts) => {
+            for p in parts {
+                ui.colored_label(
+                    GOOD,
+                    format!("+ {}: {}  ({})", p.designator, p.summary, p.nets.join(", ")),
+                );
+            }
+            match part_edits::check_add(schematic, parts) {
+                Ok(notes) => {
+                    for n in &notes {
+                        ui.label(RichText::new(n).weak());
+                    }
+                    true
+                }
+                Err(e) => {
+                    ui.colored_label(BAD, format!("✗ {e}"));
+                    false
+                }
+            }
+        }
+        Edit::Remove(names) => {
+            for n in names {
+                match part_edits::describe(schematic, n) {
+                    Some(d) => {
+                        ui.colored_label(BAD, format!("− {d}"));
+                    }
+                    None => {
+                        ui.colored_label(BAD, format!("✗ There is no part called {n}."));
+                    }
+                }
+            }
+            let ok = part_edits::check_remove(schematic, names).is_ok();
+            if ok {
+                ui.label(RichText::new("Wires you drew to these parts are left in place.").weak());
+            }
+            ok
         }
         Edit::File { name, text } => {
             if let Err(e) = edits::check_file(schematic, name) {
