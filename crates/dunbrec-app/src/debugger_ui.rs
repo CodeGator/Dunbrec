@@ -6,6 +6,7 @@
 //! Breakpoints belong to the debugger, keyed by the part's designator, so
 //! they survive restarts and can be set before a simulation starts.
 
+use crate::float::{self, Spec};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
@@ -407,10 +408,15 @@ impl Debugger {
         }
         let mut action = Action::None;
         let mut open = true;
-        egui::Window::new("MCU debugger")
-            .open(&mut open)
-            .default_size([640.0, 620.0])
-            .show(ctx, |ui| action = self.contents(ui, live));
+        let spec = Spec {
+            title: "MCU debugger",
+            size: [640.0, 620.0],
+            resizable: true,
+            pos: None,
+        };
+        float::window(ctx, spec, &mut open, |ui| {
+            action = self.contents(ui, live);
+        });
         self.show = open;
         action
     }

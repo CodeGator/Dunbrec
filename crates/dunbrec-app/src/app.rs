@@ -27,7 +27,7 @@ use crate::project::{self, Project};
 use crate::project_ui::{self, ProjectPanel};
 use crate::properties::Properties;
 use crate::serial_ui::SerialMonitor;
-use crate::settings::{STORAGE_KEY, Settings, Theme};
+use crate::settings::{STORAGE_KEY, Settings};
 
 /// Keyboard shortcuts shown under Help.
 const SHORTCUTS: &[(&str, &str)] = &[
@@ -110,6 +110,8 @@ pub struct DunbrecApp {
     pub(crate) about: crate::about::AboutState,
     show_shortcuts: bool,
     settings: Settings,
+    settings_dialog: crate::settings_ui::SettingsDialog,
+    assistant: crate::assistant::Assistant,
 
     // ---- live simulation and instruments ----
     bench: Bench,
@@ -259,6 +261,8 @@ impl DunbrecApp {
             about: Default::default(),
             show_shortcuts: false,
             settings,
+            settings_dialog: Default::default(),
+            assistant: Default::default(),
         };
         if app.project.is_some() {
             dock::open(&mut app.dock, Pane::Project);
@@ -1382,6 +1386,8 @@ impl DunbrecApp {
 
         let running = self.live.is_some();
         let mut project_command = None;
+        let mut open_settings = false;
+        let title = self.doc.display_name();
         let mut viewer = PaneViewer {
             doc: &mut self.doc,
             canvas: &mut self.canvas,
@@ -1401,12 +1407,19 @@ impl DunbrecApp {
             recent_projects: &self.settings.recent_projects,
             project_panel: &mut self.project_panel,
             project_command: &mut project_command,
+            assistant: &mut self.assistant,
+            ai: &self.settings.ai,
+            title: &title,
+            open_settings: &mut open_settings,
         };
         DockArea::new(&mut self.dock)
             .style(egui_dock::Style::from_egui(ctx.style().as_ref()))
             .show(ctx, &mut viewer);
         if let Some(command) = project_command {
             self.run_project_command(command);
+        }
+        if open_settings {
+            self.settings_dialog.open();
         }
         // "Edit" on a microcontroller's source file opens it in the editor.
         if let Some(name) = self.properties.open_code.take() {
@@ -1533,6 +1546,11 @@ impl DunbrecApp {
                         ui.close();
                     }
                     ui.separator();
+                    if ui.button("Settings…").clicked() {
+                        self.settings_dialog.open();
+                        ui.close();
+                    }
+                    ui.separator();
                     if ui.button("Quit").clicked() {
                         ctx.send_viewport_cmd(ViewportCommand::Close);
                         ui.close();
@@ -1632,20 +1650,6 @@ impl DunbrecApp {
                     ui.checkbox(&mut self.analyses.show_tracer, "〽 Curve tracer");
                 });
                 ui.menu_button("View", |ui| {
-                    ui.label(RichText::new("Theme").weak());
-                    for (theme, name) in [
-                        (Theme::System, "Follow Windows"),
-                        (Theme::Light, "Light"),
-                        (Theme::Dark, "Dark"),
-                    ] {
-                        if ui
-                            .radio_value(&mut self.settings.theme, theme, name)
-                            .clicked()
-                        {
-                            ctx.set_theme(theme.preference());
-                        }
-                    }
-                    ui.separator();
                     ui.checkbox(&mut self.show_voltages, "Node voltages on the schematic");
                     ui.separator();
                     ui.menu_button("Panels", |ui| {
@@ -1792,7 +1796,7 @@ impl DunbrecApp {
 }
 
 /// Explain a netlist problem in a sentence.
-fn describe_diagnostic(schematic: &Schematic, d: &Diagnostic) -> String {
+pub(crate) fn describe_diagnostic(schematic: &Schematic, d: &Diagnostic) -> String {
     let name = |id| {
         schematic
             .component(id)
@@ -2072,6 +2076,10 @@ struct PaneViewer<'a> {
     project_panel: &'a mut ProjectPanel,
     /// What the Project panel asked for this frame.
     project_command: &'a mut Option<project_ui::Command>,
+    assistant: &'a mut crate::assistant::Assistant,
+    ai: &'a crate::ai::AiSettings,
+    title: &'a str,
+    open_settings: &'a mut bool,
 }
 
 impl TabViewer for PaneViewer<'_> {
@@ -2115,6 +2123,17 @@ impl TabViewer for PaneViewer<'_> {
                 };
                 if let Some(command) = self.project_panel.show(ui, &view) {
                     *self.project_command = Some(command);
+                }
+            }
+            Pane::Assistant => {
+                let view = crate::assistant::View {
+                    settings: self.ai,
+                    title: self.title,
+                    schematic: self.doc.schematic(),
+                    netlist: self.netlist,
+                };
+                if self.assistant.show(ui, &view).is_some() {
+                    *self.open_settings = true;
                 }
             }
             Pane::Retired => {}
@@ -2212,6 +2231,7 @@ impl eframe::App for DunbrecApp {
         });
 
         self.dialogs(ctx);
+        self.settings_dialog.show(ctx, &mut self.settings);
     }
 }
 

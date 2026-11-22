@@ -1,6 +1,7 @@
 //! Serial monitor: text a microcontroller sends on its serial port
 //! (`Serial.print`), one log per microcontroller.
 
+use crate::float::{self, Spec};
 use std::collections::BTreeMap;
 
 use egui::{Color32, FontId, RichText};
@@ -66,10 +67,13 @@ impl SerialMonitor {
             return;
         }
         let mut open = true;
-        egui::Window::new("Serial monitor")
-            .open(&mut open)
-            .default_size([460.0, 300.0])
-            .show(ctx, |ui| self.ui(ui));
+        let spec = Spec {
+            title: "Serial monitor",
+            size: [460.0, 300.0],
+            resizable: true,
+            pos: None,
+        };
+        float::window(ctx, spec, &mut open, |ui| self.ui(ui));
         if !open {
             self.show = false;
             self.dismissed = true;

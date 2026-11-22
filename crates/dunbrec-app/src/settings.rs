@@ -36,6 +36,8 @@ pub struct Settings {
     pub recent_projects: Vec<PathBuf>,
     /// The project that was open when the app last closed.
     pub project: Option<PathBuf>,
+    /// The language model behind the Assistant panel.
+    pub ai: crate::ai::AiSettings,
 }
 
 impl Settings {
