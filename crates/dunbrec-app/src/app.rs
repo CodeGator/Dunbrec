@@ -77,6 +77,15 @@ enum Pending {
     Quit,
 }
 
+/// A file or folder the user asked to delete, waiting for their answer.
+#[derive(Debug, Clone)]
+struct DeleteAsk {
+    path: PathBuf,
+    /// The open circuit is inside it and has unsaved changes: the user is
+    /// asked about losing those first.
+    discard_first: bool,
+}
+
 /// DC operating point shown on the canvas and in the results panel.
 struct DcResults {
     generation: u64,
@@ -112,7 +121,7 @@ pub struct DunbrecApp {
     settings: Settings,
     settings_dialog: crate::settings_ui::SettingsDialog,
     /// A project file or folder waiting for the user to confirm deleting it.
-    confirm_delete: Option<PathBuf>,
+    confirm_delete: Option<DeleteAsk>,
     /// Asking for the name of a new project file or the new name of one.
     name_prompt: Option<project_ui::NamePrompt>,
     assistant: crate::assistant::Assistant,
@@ -619,7 +628,13 @@ impl DunbrecApp {
                 self.name_prompt = Some(project_ui::NamePrompt::create(&dir, what));
             }
             C::AskRename(path) => self.name_prompt = Some(project_ui::NamePrompt::rename(&path)),
-            C::AskDelete(path) => self.confirm_delete = Some(path),
+            C::AskDelete(path) => {
+                let discard_first = self.doc.is_dirty() && self.open_circuit_is_in(&path);
+                self.confirm_delete = Some(DeleteAsk {
+                    path,
+                    discard_first,
+                });
+            }
             C::Refresh => self.refresh_project(),
             C::MoveSourcesToFiles => self.move_sources_to_files(),
             C::ForgetProject(path) => self.settings.forget_project(&path),
@@ -703,6 +718,84 @@ impl DunbrecApp {
         self.refresh_project();
     }
 
+    /// Whether the open circuit's file is `path` or inside the folder `path`.
+    fn open_circuit_is_in(&self, path: &std::path::Path) -> bool {
+        let gone = project::normalize(path);
+        self.doc
+            .path()
+            .is_some_and(|p| project::starts_with_ci(p, &gone))
+    }
+
+    /// The questions before a file or folder is deleted from the disk: first,
+    /// if the open circuit is in it and has unsaved changes, whether to lose
+    /// those; then whether to delete.
+    fn confirm_delete_dialog(&mut self, ctx: &egui::Context, ask: DeleteAsk) {
+        let name = ask
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if ask.discard_first {
+            let open_name = self.doc.display_name();
+            // Cancel is the highlighted button, as for the question after.
+            let answer = Dialog {
+                id: "confirm_delete_unsaved",
+                kind: dialog::Kind::Warning,
+                title: "Unsaved changes",
+                buttons: &["Discard changes", "Cancel"],
+                default: 1,
+                cancel: Some(1),
+            }
+            .show(ctx, |ui| {
+                dialog::paragraph(
+                    ui,
+                    &format!(
+                        "“{open_name}” has changes you have not saved. If you delete it, \
+                         they are lost."
+                    ),
+                );
+            });
+            match answer {
+                Some(0) => {
+                    self.confirm_delete = Some(DeleteAsk {
+                        discard_first: false,
+                        ..ask
+                    });
+                }
+                Some(_) => self.confirm_delete = None,
+                None => {}
+            }
+            return;
+        }
+        let what = if ask.path.is_dir() {
+            format!("Delete the folder “{name}” and everything in it?")
+        } else {
+            format!("Delete “{name}”?")
+        };
+        // Cancel is the highlighted button: Enter must not delete a file.
+        let answer = Dialog {
+            id: "confirm_delete",
+            kind: dialog::Kind::Warning,
+            title: "Delete from disk",
+            buttons: &["Delete", "Cancel"],
+            default: 1,
+            cancel: Some(1),
+        }
+        .show(ctx, |ui| {
+            dialog::paragraph(ui, &what);
+            ui.add_space(4.0);
+            dialog::paragraph(ui, "This removes it from the disk and cannot be undone.");
+        });
+        match answer {
+            Some(0) => {
+                self.confirm_delete = None;
+                self.delete_in_project(&ask.path);
+            }
+            Some(_) => self.confirm_delete = None,
+            None => {}
+        }
+    }
+
     fn delete_in_project(&mut self, path: &std::path::Path) {
         let Some(project) = self.project.as_mut() else {
             return;
@@ -711,9 +804,13 @@ impl DunbrecApp {
             self.message = Some(Message::error("Could not delete it", e));
             return;
         }
-        let gone = project::normalize(path);
-        // Drop open source files that were deleted with it.
-        if let Some(dir) = self.firmware_dir() {
+        // A circuit that was deleted cannot be edited or simulated: it gives
+        // way to a new blank one, as File > New does.
+        if self.open_circuit_is_in(path) {
+            self.replace(Document::default());
+        } else if let Some(dir) = self.firmware_dir() {
+            // Drop open source files that were deleted with it.
+            let gone = project::normalize(path);
             let dead: Vec<String> = self
                 .doc
                 .schematic()
@@ -726,17 +823,6 @@ impl DunbrecApp {
             for name in dead {
                 self.doc.schematic_mut().sources.remove(&name);
             }
-        }
-        if self
-            .doc
-            .path()
-            .is_some_and(|p| project::starts_with_ci(p, &gone))
-        {
-            self.message = Some(Message::info(
-                "The open schematic's file is gone",
-                "The schematic you are working on was deleted from the disk. Save it (Ctrl+S) \
-                 to keep it.",
-            ));
         }
         self.refresh_project();
     }
@@ -1785,38 +1871,8 @@ impl DunbrecApp {
             self.name_prompt = None;
         }
 
-        if let Some(path) = self.confirm_delete.clone() {
-            let name = path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            let what = if path.is_dir() {
-                format!("Delete the folder “{name}” and everything in it?")
-            } else {
-                format!("Delete “{name}”?")
-            };
-            // Cancel is the highlighted button: Enter must not delete a file.
-            let answer = Dialog {
-                id: "confirm_delete",
-                kind: dialog::Kind::Warning,
-                title: "Delete from disk",
-                buttons: &["Delete", "Cancel"],
-                default: 1,
-                cancel: Some(1),
-            }
-            .show(ctx, |ui| {
-                dialog::paragraph(ui, &what);
-                ui.add_space(4.0);
-                dialog::paragraph(ui, "This removes it from the disk and cannot be undone.");
-            });
-            match answer {
-                Some(0) => {
-                    self.confirm_delete = None;
-                    self.delete_in_project(&path);
-                }
-                Some(_) => self.confirm_delete = None,
-                None => {}
-            }
+        if let Some(ask) = self.confirm_delete.clone() {
+            self.confirm_delete_dialog(ctx, ask);
         }
 
         if let Some(message) = &self.message
