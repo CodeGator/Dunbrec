@@ -5,6 +5,7 @@
 // and signals are parallel arrays), so index loops read most clearly.
 #![allow(clippy::needless_range_loop)]
 
+use crate::float::{self, Spec};
 use dunbrec_core::{ComponentId, Netlist, NodeId, Point, Schematic, units::format_value};
 use dunbrec_instruments::scope::{CHANNELS, DIVISIONS_X, DIVISIONS_Y, PRE_TRIGGER_DIVISIONS};
 use dunbrec_instruments::{Meter, MeterMode, Scope, ScopeStatus, TriggerEdge, TriggerMode};
@@ -358,15 +359,16 @@ impl Bench {
     ) -> (bool, bool) {
         let mut result = (false, false);
         let mut open = self.show_scope;
-        egui::Window::new("Oscilloscope")
-            .open(&mut open)
-            .default_size([520.0, 520.0])
+        let spec = Spec {
+            title: float::OSCILLOSCOPE,
+            size: [520.0, 520.0],
+            resizable: true,
             // Top right, over the properties panel, leaving the schematic clear.
-            .default_pos(ctx.content_rect().right_top() + vec2(-540.0, 90.0))
-            .resizable(true)
-            .show(ctx, |ui| {
-                result = self.scope_ui(ui, s, netlist, map, probe_tool_active);
-            });
+            pos: Some(ctx.content_rect().right_top() + vec2(-540.0, 90.0)),
+        };
+        float::window(ctx, spec, &mut open, |ui| {
+            result = self.scope_ui(ui, s, netlist, map, probe_tool_active);
+        });
         self.show_scope = open;
         result
     }
@@ -546,14 +548,15 @@ impl Bench {
     ) -> bool {
         let mut probe_clicked = false;
         let mut open = self.show_meter;
-        egui::Window::new("Multimeter")
-            .open(&mut open)
-            .default_size([300.0, 220.0])
-            .default_pos(ctx.content_rect().left_bottom() + vec2(150.0, -440.0))
-            .resizable(false)
-            .show(ctx, |ui| {
-                probe_clicked = self.meter_ui(ui, s, netlist, map, probe_tool_active, running);
-            });
+        let spec = Spec {
+            title: float::MULTIMETER,
+            size: [300.0, 220.0],
+            resizable: false,
+            pos: Some(ctx.content_rect().left_bottom() + vec2(150.0, -440.0)),
+        };
+        float::window(ctx, spec, &mut open, |ui| {
+            probe_clicked = self.meter_ui(ui, s, netlist, map, probe_tool_active, running);
+        });
         self.show_meter = open;
         probe_clicked
     }
@@ -730,12 +733,15 @@ impl Bench {
     ) -> bool {
         let mut probe_clicked = false;
         let mut open = self.show_logic;
-        egui::Window::new("Logic analyser")
-            .open(&mut open)
-            .default_size([560.0, 420.0])
-            .show(ctx, |ui| {
-                probe_clicked = self.logic_ui(ui, s, netlist, map, probe_tool_active);
-            });
+        let spec = Spec {
+            title: float::LOGIC_ANALYSER,
+            size: [560.0, 420.0],
+            resizable: true,
+            pos: None,
+        };
+        float::window(ctx, spec, &mut open, |ui| {
+            probe_clicked = self.logic_ui(ui, s, netlist, map, probe_tool_active);
+        });
         self.show_logic = open;
         probe_clicked
     }

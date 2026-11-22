@@ -2,6 +2,7 @@
 //! transfer plot (DC sweeps), and a function generator that drives a source
 //! in the schematic.
 
+use crate::float::{self, Spec};
 use dunbrec_core::{
     ComponentId, ComponentKind as K, ModelLibrary, Netlist, NetlistBuilder, Polarity, Schematic,
     Waveform, units::format_value,
@@ -41,35 +42,50 @@ impl Analyses {
         let mut probe_clicked = false;
         if self.show_bode {
             let mut open = true;
-            egui::Window::new("Bode plotter")
-                .open(&mut open)
-                .default_size([560.0, 520.0])
-                .show(ctx, |ui| probe_clicked |= self.bode.ui(ui, &mut inp));
+            let spec = Spec {
+                title: float::BODE_PLOTTER,
+                size: [560.0, 520.0],
+                resizable: true,
+                pos: None,
+            };
+            float::window(ctx, spec, &mut open, |ui| {
+                probe_clicked |= self.bode.ui(ui, &mut inp)
+            });
             self.show_bode = open;
         }
         if self.show_transfer {
             let mut open = true;
-            egui::Window::new("DC transfer")
-                .open(&mut open)
-                .default_size([520.0, 400.0])
-                .show(ctx, |ui| probe_clicked |= self.transfer.ui(ui, &mut inp));
+            let spec = Spec {
+                title: float::DC_TRANSFER,
+                size: [520.0, 400.0],
+                resizable: true,
+                pos: None,
+            };
+            float::window(ctx, spec, &mut open, |ui| {
+                probe_clicked |= self.transfer.ui(ui, &mut inp)
+            });
             self.show_transfer = open;
         }
         if self.show_tracer {
             let mut open = true;
-            egui::Window::new("Curve tracer")
-                .open(&mut open)
-                .default_size([520.0, 440.0])
-                .show(ctx, |ui| self.tracer.ui(ui, &mut inp));
+            let spec = Spec {
+                title: float::CURVE_TRACER,
+                size: [520.0, 440.0],
+                resizable: true,
+                pos: None,
+            };
+            float::window(ctx, spec, &mut open, |ui| self.tracer.ui(ui, &mut inp));
             self.show_tracer = open;
         }
         if self.show_fgen {
             let mut open = true;
-            egui::Window::new("Function generator")
-                .open(&mut open)
-                .default_size([320.0, 240.0])
-                .resizable(false)
-                .show(ctx, |ui| self.fgen.ui(ui, inp.doc));
+            let spec = Spec {
+                title: float::FUNCTION_GENERATOR,
+                size: [320.0, 240.0],
+                resizable: false,
+                pos: None,
+            };
+            float::window(ctx, spec, &mut open, |ui| self.fgen.ui(ui, inp.doc));
             self.show_fgen = open;
         }
         probe_clicked

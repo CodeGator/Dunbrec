@@ -1,6 +1,7 @@
 //! Serial monitor: text a microcontroller sends on its serial port
 //! (`Serial.print`), one log per microcontroller.
 
+use crate::float::{self, Spec};
 use std::collections::BTreeMap;
 
 use egui::{Color32, FontId, RichText};
@@ -54,6 +55,20 @@ impl SerialMonitor {
         }
     }
 
+    /// The last `max` characters of each microcontroller's output.
+    pub fn tails(&self, max: usize) -> Vec<(String, String)> {
+        self.logs
+            .iter()
+            .filter(|(_, log)| !log.is_empty())
+            .map(|(name, log)| {
+                let start = (log.len().saturating_sub(max)..=log.len())
+                    .find(|&i| log.is_char_boundary(i))
+                    .unwrap_or(log.len());
+                (name.clone(), log[start..].to_string())
+            })
+            .collect()
+    }
+
     #[cfg(test)]
     pub fn text(&self, designator: &str) -> Option<&str> {
         self.logs.get(designator).map(|s| s.as_str())
@@ -66,10 +81,13 @@ impl SerialMonitor {
             return;
         }
         let mut open = true;
-        egui::Window::new("Serial monitor")
-            .open(&mut open)
-            .default_size([460.0, 300.0])
-            .show(ctx, |ui| self.ui(ui));
+        let spec = Spec {
+            title: float::SERIAL_MONITOR,
+            size: [460.0, 300.0],
+            resizable: true,
+            pos: None,
+        };
+        float::window(ctx, spec, &mut open, |ui| self.ui(ui));
         if !open {
             self.show = false;
             self.dismissed = true;

@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use dunbrec_core::{SourceFile, SourceLanguage};
@@ -24,6 +25,7 @@ use egui::text::{CCursor, CCursorRange, LayoutJob, TextFormat};
 use egui::{Align, Color32, FontId, Id, RichText, Stroke, Ui};
 
 use crate::debugger_ui::Debugger;
+use crate::dialog::{self, Dialog};
 use crate::document::Document;
 use crate::live::LiveSim;
 
@@ -92,6 +94,16 @@ pub fn file_key(typed: &str, chosen: SourceLanguage) -> (String, SourceLanguage)
             (format!("{typed}.{ext}"), chosen)
         }
     }
+}
+
+/// The tab to show after `closed` is closed: the one after it, else the one
+/// before, else none.
+fn after_closing(names: &[String], closed: &str) -> Option<String> {
+    let at = names.iter().position(|n| n == closed)?;
+    names
+        .get(at + 1)
+        .or_else(|| at.checked_sub(1).and_then(|before| names.get(before)))
+        .cloned()
 }
 
 /// The name Arduino's tool should give the sketch built from the source
@@ -278,6 +290,7 @@ impl Palette {
     }
 }
 
+const WARNING_AMBER: Color32 = Color32::from_rgb(220, 150, 30);
 const ERROR_RED: Color32 = Color32::from_rgb(225, 70, 70);
 
 /// Byte offset in `line` of the 1-based character column `col`.
@@ -430,6 +443,12 @@ pub struct CodeEditor {
     selected: Option<String>,
     /// The name being typed for a new file, while the box is open.
     new_name: Option<String>,
+    /// The name box just opened: select the suggested name.
+    new_fresh: bool,
+    /// Files made on disk since the app last asked, to list in the project.
+    created: Vec<PathBuf>,
+    /// Why a file could not be made, until the app has shown it.
+    problem: Option<String>,
     /// A typing session has already recorded its undo step.
     typing: bool,
     built: Option<Built>,
@@ -534,9 +553,13 @@ impl CodeEditor {
             self.selected = names.first().cloned();
         }
 
+        self.new_file_dialog(ui.ctx(), doc, &names);
+
         egui::TopBottomPanel::top("code_header").show_inside(ui, |ui| {
             ui.add_space(2.0);
-            self.header(ui, doc, &names);
+            self.tabs(ui, doc, &names);
+            self.header(ui, doc);
+            self.location_note(ui, doc);
             ui.add_space(2.0);
         });
 
@@ -633,84 +656,199 @@ impl CodeEditor {
         });
     }
 
-    fn header(&mut self, ui: &mut Ui, doc: &mut Document, names: &[String]) {
-        ui.horizontal(|ui| {
-            if let Some(typed) = &mut self.new_name {
-                ui.label("Name:");
-                let response = ui.add(
-                    egui::TextEdit::singleline(typed)
-                        .desired_width(140.0)
-                        .hint_text("main"),
+    /// Files this panel has made on disk since the last call.
+    pub fn take_created(&mut self) -> Vec<PathBuf> {
+        std::mem::take(&mut self.created)
+    }
+
+    /// Why a file could not be made, once.
+    pub fn take_problem(&mut self) -> Option<String> {
+        self.problem.take()
+    }
+
+    /// Where the selected file lives, and whether it is on disk yet.
+    fn location_note(&self, ui: &mut Ui, doc: &Document) {
+        let Some(name) = &self.selected else { return };
+        if !crate::project::is_file_source(name) {
+            ui.label(
+                RichText::new(
+                    "Kept inside the circuit file (the older way). The Project panel's \
+                     “Move to files” makes it a file of its own.",
+                )
+                .weak(),
+            );
+            return;
+        }
+        let path = doc.path().and_then(|p| p.parent()).map(|d| d.join(name));
+        match path {
+            Some(path) if path.is_file() => {
+                ui.add(
+                    egui::Label::new(RichText::new(format!("📄 {}", path.display())).weak())
+                        .truncate(),
+                )
+                .on_hover_text(path.display().to_string());
+            }
+            Some(path) => {
+                ui.colored_label(
+                    WARNING_AMBER,
+                    format!(
+                        "Not on disk yet: it will be written to {} when you save the circuit.",
+                        path.display()
+                    ),
                 );
-                egui::ComboBox::from_id_salt("new_language")
-                    .selected_text(if self.new_cpp {
-                        "Arduino C++"
-                    } else {
-                        "Assembly"
-                    })
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.new_cpp, false, "Assembly");
-                        ui.selectable_value(&mut self.new_cpp, true, "Arduino C++");
-                    });
-                let name = typed.trim().to_string();
-                let chosen = if self.new_cpp {
-                    SourceLanguage::Cpp
-                } else {
-                    SourceLanguage::Asm
-                };
-                let (key, _) = file_key(&name, chosen);
-                let taken = names.contains(&key);
-                let ok = !name.is_empty() && crate::project::valid_name(&name) && !taken;
-                let enter = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                let create =
-                    ui.add_enabled(ok, egui::Button::new("Create")).clicked() || (enter && ok);
-                if taken {
-                    ui.label(RichText::new("already exists").color(ERROR_RED));
-                }
-                if create {
-                    self.new_name = None;
-                    self.create_as(doc, &name, chosen);
-                } else if ui.button("Cancel").clicked() {
-                    self.new_name = None;
-                }
-                return;
             }
-            let mut picked = self.selected.clone();
-            egui::ComboBox::from_id_salt("code_file")
-                .selected_text(picked.as_deref().unwrap_or("(no files)"))
-                .show_ui(ui, |ui| {
-                    for n in names {
-                        ui.selectable_value(&mut picked, Some(n.clone()), n);
-                    }
-                });
-            if picked != self.selected {
-                self.selected = picked;
-                self.typing = false;
+            None => {
+                ui.colored_label(
+                    WARNING_AMBER,
+                    "Not saved yet: this circuit has no file, so this one will be written next \
+                     to it when you first save the circuit (Ctrl+S).",
+                );
             }
+        }
+    }
+
+    /// The message box that asks for the name and kind of a new source file.
+    fn new_file_dialog(&mut self, ctx: &egui::Context, doc: &mut Document, names: &[String]) {
+        let Some(mut typed) = self.new_name.take() else {
+            return;
+        };
+        let mut cpp = self.new_cpp;
+        let mut fresh = std::mem::take(&mut self.new_fresh);
+        let (name, chosen) = (
+            typed.trim().to_string(),
+            if cpp {
+                SourceLanguage::Cpp
+            } else {
+                SourceLanguage::Asm
+            },
+        );
+        let (key, _) = file_key(&name, chosen);
+        let taken = names.contains(&key);
+        let ok = !name.is_empty() && crate::project::valid_name(&name) && !taken;
+        let folder = doc.path().and_then(|p| p.parent()).map(|d| d.to_path_buf());
+
+        let answer = Dialog {
+            id: "new_source",
+            kind: dialog::Kind::Question,
+            title: "New firmware file",
+            buttons: &["Create", "Cancel"],
+            default: 0,
+            cancel: Some(1),
+        }
+        .show(ctx, |ui| {
+            dialog::paragraph(ui, "Name of the new file:");
+            ui.add_space(6.0);
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut typed)
+                    .font(egui::TextStyle::Heading)
+                    .desired_width(f32::INFINITY),
+            );
+            if std::mem::take(&mut fresh) {
+                crate::project_ui::select_all(ui, &response, &typed);
+            }
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.radio_value(&mut cpp, false, "Assembly");
+                ui.radio_value(&mut cpp, true, "Arduino C++");
+            });
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(match folder.as_deref() {
+                    Some(dir) => format!("It is created now, in {}.", dir.display()),
+                    None => "This circuit has not been saved, so the file is written when you \
+                             first save it."
+                        .to_string(),
+                })
+                .weak(),
+            );
+            if taken {
+                ui.add_space(4.0);
+                ui.colored_label(ERROR_RED, "A file with that name already exists.");
+            } else if !name.is_empty() && !crate::project::valid_name(&name) {
+                ui.add_space(4.0);
+                ui.colored_label(ERROR_RED, "That is not a name a file can have.");
+            }
+        });
+        self.new_cpp = cpp;
+        match answer {
+            Some(0) if ok => self.create_as(doc, &name, chosen),
+            // Not a usable name yet: keep asking.
+            Some(0) => self.new_name = Some(typed),
+            Some(_) => {}
+            None => self.new_name = Some(typed),
+        }
+        self.new_fresh = fresh;
+    }
+
+    /// One tab per source file of the circuit, with a button to add another.
+    /// Closing a tab that is a file only stops showing it here (it stays on
+    /// disk); closing one kept inside the circuit removes it. Either way
+    /// Ctrl+Z brings it back.
+    fn tabs(&mut self, ui: &mut Ui, doc: &mut Document, names: &[String]) {
+        let mut close = None;
+        ui.horizontal(|ui| {
             if ui
-                .button("New…")
+                .button("＋ New…")
                 .on_hover_text("Add another source file to this schematic")
                 .clicked()
             {
                 let free = unused_file_name(&doc.schematic().sources, "main", "asm");
                 self.new_name = Some(free.trim_end_matches(".asm").to_string());
+                self.new_fresh = true;
             }
+            ui.separator();
+            egui::ScrollArea::horizontal()
+                .id_salt("code_tabs")
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        for name in names {
+                            let selected = self.selected.as_deref() == Some(name.as_str());
+                            let is_file = crate::project::is_file_source(name);
+                            let tab = ui.selectable_label(selected, name);
+                            if tab.clicked() && !selected {
+                                self.selected = Some(name.clone());
+                                self.typing = false;
+                            }
+                            if tab.middle_clicked() {
+                                close = Some(name.clone());
+                            }
+                            tab.on_hover_text(if is_file {
+                                "A file beside the circuit"
+                            } else {
+                                "Kept inside the circuit file"
+                            });
+                            if ui
+                                .small_button("✕")
+                                .on_hover_text(if is_file {
+                                    "Close this tab. The file stays on disk; delete it in the \
+                                     Project panel. (Ctrl+Z brings the tab back)"
+                                } else {
+                                    "Remove this file from the circuit (Ctrl+Z brings it back)"
+                                })
+                                .clicked()
+                            {
+                                close = Some(name.clone());
+                            }
+                            ui.add_space(6.0);
+                        }
+                    });
+                });
+        });
+        if let Some(name) = close {
+            let next = after_closing(names, &name);
+            doc.edit(|s| s.sources.remove(&name));
+            if self.selected.as_deref() == Some(name.as_str()) {
+                self.selected = next;
+                self.typing = false;
+            }
+        }
+    }
+
+    /// What the selected file builds to: its size, or how many errors.
+    fn header(&mut self, ui: &mut Ui, doc: &Document) {
+        ui.horizontal(|ui| {
             if let Some(name) = self.selected.clone() {
-                let is_file = crate::project::is_file_source(&name);
-                if ui
-                    .button(if is_file { "Close" } else { "Delete" })
-                    .on_hover_text(if is_file {
-                        "Stop showing this file here. It stays on disk; delete it in the \
-                         Project panel. (Ctrl+Z brings it back)"
-                    } else {
-                        "Remove this file (Ctrl+Z brings it back)"
-                    })
-                    .clicked()
-                {
-                    doc.edit(|s| s.sources.remove(&name));
-                    self.selected = None;
-                }
-                ui.separator();
                 let sketch = doc
                     .schematic()
                     .sources
@@ -818,6 +956,35 @@ impl CodeEditor {
             self.typing = false;
             return;
         }
+        // A circuit that has a file makes the new source file on disk now, as
+        // the Project panel does, rather than keeping it in memory until the
+        // next save.
+        if let Some(dir) = &dir {
+            let kind = match language {
+                SourceLanguage::Asm => crate::project::NewSource::Assembly,
+                SourceLanguage::Cpp => crate::project::NewSource::Sketch,
+            };
+            match crate::project::new_source(dir, &key, kind) {
+                Ok(path) => match crate::project::attach(doc.schematic_mut(), dir, &key) {
+                    Ok(()) => {
+                        self.created.push(path);
+                        self.selected = Some(key);
+                        self.typing = false;
+                        return;
+                    }
+                    Err(e) => {
+                        self.problem = Some(e);
+                        return;
+                    }
+                },
+                Err(e) => {
+                    self.problem = Some(e);
+                    return;
+                }
+            }
+        }
+        // An unsaved circuit has no folder yet: the file is written beside it
+        // when it is first saved.
         let file = match language {
             SourceLanguage::Asm => new_file(&doc.schematic().sources, &key),
             SourceLanguage::Cpp => new_sketch(),
@@ -841,7 +1008,9 @@ impl CodeEditor {
         let font = egui::TextStyle::Monospace.resolve(ui.style());
         let row_height = ui.fonts_mut(|f| f.row_height(&font));
         let rows = ((ui.available_height() / row_height).ceil() as usize).max(8);
-        let id = Id::new("code_text");
+        // Each file has its own text box and scroll position, so switching
+        // tabs keeps your place in every file.
+        let id = Id::new(("code_text", name));
         let plain = ui.visuals().text_color();
         let palette = Palette::new(ui.visuals().dark_mode, plain);
         let weak = ui.visuals().weak_text_color();
@@ -871,6 +1040,7 @@ impl CodeEditor {
         let mut changed = false;
         let mut has_focus = false;
         egui::ScrollArea::both()
+            .id_salt(("code_scroll", name))
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.horizontal_top(|ui| {
@@ -1057,6 +1227,16 @@ mod tests {
     }
 
     #[test]
+    fn closing_a_tab_shows_its_neighbour() {
+        let names: Vec<String> = ["a.asm", "b.asm", "c.asm"].map(String::from).to_vec();
+        assert_eq!(after_closing(&names, "a.asm").as_deref(), Some("b.asm"));
+        assert_eq!(after_closing(&names, "b.asm").as_deref(), Some("c.asm"));
+        assert_eq!(after_closing(&names, "c.asm").as_deref(), Some("b.asm"));
+        assert_eq!(after_closing(&names[..1], "a.asm"), None);
+        assert_eq!(after_closing(&names, "zzz"), None);
+    }
+
+    #[test]
     fn a_new_file_never_replaces_one_on_disk() {
         let dir = std::env::temp_dir().join(format!("dunbrec-code-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1068,11 +1248,41 @@ mod tests {
         // The file that was there is opened as it is.
         assert_eq!(doc.schematic().sources["main.asm"].text, "nop\nnop\n");
         assert!(!doc.can_undo(), "opening a file is not an edit");
-        // A name nothing has yet starts a new one, kept in memory until saved.
+        // A name nothing has yet makes a new file on disk straight away, and
+        // says so, so the app can list it in the project.
         editor.create(&mut doc, "fresh");
-        assert_eq!(doc.schematic().sources["fresh.asm"].text, "; fresh.asm\n");
-        assert!(!dir.join("fresh.asm").exists());
+        let on_disk = std::fs::read_to_string(dir.join("fresh.asm")).unwrap();
+        assert_eq!(doc.schematic().sources["fresh.asm"].text, on_disk);
+        assert_eq!(editor.take_created(), vec![dir.join("fresh.asm")]);
+        assert!(editor.take_created().is_empty(), "reported once");
+        assert!(!doc.can_undo(), "a file on disk is not an undoable edit");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_new_file_for_an_unsaved_circuit_waits_in_memory() {
+        let mut doc = Document::default();
+        let mut editor = CodeEditor::default();
+        editor.create(&mut doc, "fresh");
+        // The first file of a circuit starts as the blink program.
+        assert_eq!(doc.schematic().sources["fresh.asm"].text, STARTER);
+        assert!(doc.can_undo(), "it is an edit until the circuit is saved");
+        assert!(editor.take_created().is_empty());
+        assert_eq!(editor.take_problem(), None);
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_made_is_reported() {
+        let dir = std::env::temp_dir().join(format!("dunbrec-code-gone-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut doc = Document::default();
+        // The circuit's folder does not exist, so the file cannot be written.
+        doc.mark_saved(dir.join("x.dbr"));
+        let mut editor = CodeEditor::default();
+        editor.create(&mut doc, "fresh");
+        assert!(editor.take_problem().is_some());
+        assert!(!doc.schematic().sources.contains_key("fresh.asm"));
+        assert!(editor.take_created().is_empty());
     }
 
     #[test]

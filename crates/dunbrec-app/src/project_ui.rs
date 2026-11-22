@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use egui::{Color32, RichText, Ui};
 
+use crate::dialog::{self, Dialog};
 use crate::project::{Entry, EntryKind, Project, path_eq, relative_to, valid_name};
 
 /// What a new item is.
@@ -96,19 +97,28 @@ pub enum Command {
     CloseProject,
     OpenSchematic(PathBuf),
     OpenSource(PathBuf),
+    /// The user chose to add something; the app asks for its name (see
+    /// [`NamePrompt`]) and then sends [`Command::Create`].
+    AskCreate {
+        dir: PathBuf,
+        what: Create,
+    },
     Create {
         dir: PathBuf,
         name: String,
         what: Create,
     },
+    /// The user chose Rename; the app asks for the new name.
+    AskRename(PathBuf),
     Rename {
         from: PathBuf,
         to: PathBuf,
     },
     /// Take a file or folder out of the project, leaving it on the disk.
     RemoveFromProject(PathBuf),
-    /// Delete a file or folder from the disk (and so from the project).
-    Delete(PathBuf),
+    /// The user asked to delete a file or folder from the disk; the app
+    /// confirms in a message box before doing it.
+    AskDelete(PathBuf),
     /// Pick existing files to add to the project.
     AddExisting,
     Refresh,
@@ -116,23 +126,6 @@ pub enum Command {
     /// Take a project off the recent list.
     ForgetProject(PathBuf),
     ClearRecentProjects,
-}
-
-enum Form {
-    Create {
-        dir: PathBuf,
-        what: Create,
-        name: String,
-        fresh: bool,
-    },
-    Rename {
-        path: PathBuf,
-        name: String,
-        fresh: bool,
-    },
-    Delete {
-        path: PathBuf,
-    },
 }
 
 /// What the panel shows, borrowed for one frame.
@@ -146,9 +139,7 @@ pub struct View<'a> {
 }
 
 #[derive(Default)]
-pub struct ProjectPanel {
-    form: Option<Form>,
-}
+pub struct ProjectPanel;
 
 fn same(a: &Path, b: &Path) -> bool {
     path_eq(a, b)
@@ -177,7 +168,6 @@ fn icon(kind: EntryKind) -> &'static str {
 impl ProjectPanel {
     pub fn show(&mut self, ui: &mut Ui, view: &View) -> Option<Command> {
         let Some(project) = view.project else {
-            self.form = None;
             return no_project(ui, view.recent);
         };
         let mut out = None;
@@ -238,10 +228,6 @@ impl ProjectPanel {
                 }
             });
             ui.add_space(4.0);
-        }
-
-        if let Some(command) = self.form_ui(ui, project) {
-            out = Some(command);
         }
 
         // Right-clicking empty space adds to the project too. This is made
@@ -355,11 +341,9 @@ impl ProjectPanel {
         let mut out = None;
         for what in Create::ALL {
             if ui.button(what.menu_label()).clicked() {
-                self.form = Some(Form::Create {
+                out = Some(Command::AskCreate {
                     dir: dir.to_path_buf(),
                     what,
-                    name: what.suggest(dir),
-                    fresh: true,
                 });
                 ui.close();
             }
@@ -391,11 +375,7 @@ impl ProjectPanel {
     fn rename_delete(&mut self, ui: &mut Ui, e: &Entry) -> Option<Command> {
         let mut out = None;
         if ui.button("Rename…").clicked() {
-            self.form = Some(Form::Rename {
-                path: e.path.clone(),
-                name: e.name.clone(),
-                fresh: true,
-            });
+            out = Some(Command::AskRename(e.path.clone()));
             ui.close();
         }
         if ui
@@ -407,133 +387,143 @@ impl ProjectPanel {
             ui.close();
         }
         if ui.button("Delete from disk…").clicked() {
-            self.form = Some(Form::Delete {
-                path: e.path.clone(),
-            });
+            out = Some(Command::AskDelete(e.path.clone()));
             ui.close();
         }
         out
     }
+}
 
-    /// The small form for a name or a confirmation, above the tree.
-    fn form_ui(&mut self, ui: &mut Ui, project: &Project) -> Option<Command> {
-        let mut form = self.form.take()?;
-        let mut out = None;
-        let mut keep = true;
-        egui::Frame::group(ui.style()).show(ui, |ui| match &mut form {
-            Form::Create {
-                dir,
+/// A message box asking for the name of something new, or the new name of
+/// something that exists.
+pub struct NamePrompt {
+    kind: PromptKind,
+    name: String,
+    /// The first frame: focus the box and select the suggested name.
+    fresh: bool,
+}
+
+enum PromptKind {
+    Create { dir: PathBuf, what: Create },
+    Rename { path: PathBuf },
+}
+
+impl NamePrompt {
+    pub fn create(dir: &Path, what: Create) -> Self {
+        NamePrompt {
+            name: what.suggest(dir),
+            kind: PromptKind::Create {
+                dir: dir.to_path_buf(),
                 what,
-                name,
-                fresh,
-            } => {
+            },
+            fresh: true,
+        }
+    }
+
+    pub fn rename(path: &Path) -> Self {
+        NamePrompt {
+            name: file_name_of(path),
+            kind: PromptKind::Rename {
+                path: path.to_path_buf(),
+            },
+            fresh: true,
+        }
+    }
+
+    /// What the answer would ask the app to do, or `None` if the name is
+    /// not acceptable (empty, not a legal file name, or unchanged).
+    fn command(&self) -> Option<Command> {
+        let name = self.name.trim();
+        if !valid_name(name) {
+            return None;
+        }
+        match &self.kind {
+            PromptKind::Create { dir, what } => Some(Command::Create {
+                dir: dir.clone(),
+                name: name.to_string(),
+                what: *what,
+            }),
+            PromptKind::Rename { path } => (name != file_name_of(path)).then(|| Command::Rename {
+                from: path.clone(),
+                to: path.with_file_name(name),
+            }),
+        }
+    }
+
+    /// Draw the box. `None` while it is open; `Some(None)` when the user
+    /// cancelled; `Some(Some(command))` when they accepted a good name.
+    pub fn show(&mut self, ctx: &egui::Context, project: &Project) -> Option<Option<Command>> {
+        let (title, ok_label) = match &self.kind {
+            PromptKind::Create { what, .. } => (what.title(), "Create"),
+            PromptKind::Rename { .. } => ("Rename", "Rename"),
+        };
+        let heading = match &self.kind {
+            PromptKind::Create { dir, what } => {
                 let place = relative_to(&project.root, dir);
                 let place = if place.is_empty() {
                     project.name()
                 } else {
                     format!("{}/{place}", project.name())
                 };
-                ui.label(RichText::new(format!("{} in {place}", what.title())).strong());
-                let ok = valid_name(name);
-                let r = ui.add(
-                    egui::TextEdit::singleline(name)
-                        .hint_text(match what {
-                            Create::Folder => "folder name",
-                            _ => "file name",
-                        })
-                        .desired_width(f32::INFINITY),
-                );
-                if std::mem::take(fresh) {
-                    select_all(ui, &r, name);
-                }
-                let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                ui.horizontal(|ui| {
-                    if (ui.add_enabled(ok, egui::Button::new("Create")).clicked() || (enter && ok))
-                        && ok
-                    {
-                        out = Some(Command::Create {
-                            dir: dir.clone(),
-                            name: name.trim().to_string(),
-                            what: *what,
-                        });
-                        keep = false;
-                    }
-                    if ui.button("Cancel").clicked() {
-                        keep = false;
-                    }
-                });
-            }
-            Form::Rename { path, name, fresh } => {
-                let was = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                ui.label(RichText::new(format!("Rename {was}")).strong());
-                let ok = valid_name(name) && name.trim() != was;
-                let r = ui.add(egui::TextEdit::singleline(name).desired_width(f32::INFINITY));
-                if std::mem::take(fresh) {
-                    select_all(ui, &r, name);
-                }
-                let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                ui.label(
-                    RichText::new("Schematics that use it are updated to the new name.")
-                        .small()
-                        .weak(),
-                );
-                ui.horizontal(|ui| {
-                    if (ui.add_enabled(ok, egui::Button::new("Rename")).clicked() || (enter && ok))
-                        && ok
-                    {
-                        out = Some(Command::Rename {
-                            from: path.clone(),
-                            to: path.with_file_name(name.trim()),
-                        });
-                        keep = false;
-                    }
-                    if ui.button("Cancel").clicked() {
-                        keep = false;
-                    }
-                });
-            }
-            Form::Delete { path } => {
-                let name = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                let what = if path.is_dir() {
-                    format!("Delete the folder “{name}” and everything in it?")
-                } else {
-                    format!("Delete “{name}”?")
+                let noun = match what {
+                    Create::Folder => "folder",
+                    _ => "file",
                 };
-                ui.label(RichText::new(what).strong());
-                ui.label(
-                    RichText::new("This removes it from the disk and cannot be undone.")
-                        .small()
-                        .color(Color32::from_rgb(220, 150, 30)),
+                format!("Name of the new {noun}, in {place}:")
+            }
+            PromptKind::Rename { path } => format!("New name for “{}”:", file_name_of(path)),
+        };
+        let note = match &self.kind {
+            PromptKind::Rename { .. } => {
+                Some("Schematics that use it are updated to the new name.")
+            }
+            PromptKind::Create { .. } => None,
+        };
+        let name = &mut self.name;
+        let fresh = &mut self.fresh;
+        let answer = Dialog {
+            id: "project_name",
+            kind: dialog::Kind::Question,
+            title,
+            buttons: &[ok_label, "Cancel"],
+            default: 0,
+            cancel: Some(1),
+        }
+        .show(ctx, |ui| {
+            dialog::paragraph(ui, &heading);
+            ui.add_space(6.0);
+            let r = ui.add(
+                egui::TextEdit::singleline(name)
+                    .font(egui::TextStyle::Heading)
+                    .desired_width(f32::INFINITY),
+            );
+            if std::mem::take(fresh) {
+                select_all(ui, &r, name);
+            }
+            if !name.trim().is_empty() && !valid_name(name) {
+                ui.add_space(4.0);
+                ui.colored_label(
+                    Color32::from_rgb(225, 70, 70),
+                    "That is not a name a file can have.",
                 );
-                ui.horizontal(|ui| {
-                    if ui
-                        .button(RichText::new("Delete").color(Color32::from_rgb(225, 70, 70)))
-                        .clicked()
-                    {
-                        out = Some(Command::Delete(path.clone()));
-                        keep = false;
-                    }
-                    if ui.button("Cancel").clicked() {
-                        keep = false;
-                    }
-                });
+            }
+            if let Some(note) = note {
+                ui.add_space(4.0);
+                ui.label(RichText::new(note).weak());
             }
         });
-        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-            keep = false;
+        match answer {
+            Some(0) => self.command().map(Some),
+            Some(_) => Some(None),
+            None => None,
         }
-        if keep {
-            self.form = Some(form);
-        }
-        ui.add_space(4.0);
-        out
     }
+}
+
+fn file_name_of(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 /// Focus a text box and select what is in it, so typing replaces it.
@@ -639,7 +629,7 @@ mod tests {
 
     #[test]
     fn the_panel_draws_with_and_without_a_project() {
-        let mut panel = ProjectPanel::default();
+        let mut panel = ProjectPanel;
         let recent = vec![PathBuf::from("a"), PathBuf::from("b")];
         let none = View {
             project: None,
@@ -667,29 +657,50 @@ mod tests {
         };
         assert_eq!(draw(&mut panel, &view), None);
 
-        // Each kind of form draws, and an invalid or unchanged name does
-        // not ask for anything.
-        for form in [
-            Form::Create {
-                dir: dir.clone(),
-                what: Create::Assembly,
-                name: "bad/name".into(),
-                fresh: true,
-            },
-            Form::Rename {
-                path: dir.join("a.dbr"),
-                name: "a.dbr".into(),
-                fresh: true,
-            },
-            Form::Delete {
-                path: dir.join("fw"),
-            },
+        // The name boxes draw, and a bad or unchanged name asks for nothing.
+        for mut prompt in [
+            NamePrompt::create(&dir, Create::Assembly),
+            NamePrompt::rename(&dir.join("a.dbr")),
         ] {
-            panel.form = Some(form);
-            assert_eq!(draw(&mut panel, &view), None);
-            assert!(panel.form.is_some(), "the form stays open until answered");
+            let ctx = egui::Context::default();
+            let mut answer = None;
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                answer = prompt.show(ctx, &project);
+            });
+            assert_eq!(answer, None, "the box stays open until answered");
         }
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_name_prompt_accepts_only_good_names() {
+        let dir = PathBuf::from("proj");
+        let mut p = NamePrompt::create(&dir, Create::Assembly);
+        assert!(matches!(
+            p.command(),
+            Some(Command::Create {
+                what: Create::Assembly,
+                ..
+            })
+        ));
+        p.name = "  led.asm  ".into();
+        assert!(matches!(p.command(), Some(Command::Create { name, .. }) if name == "led.asm"));
+        for bad in ["", "   ", "bad/name", "a:b", ".."] {
+            p.name = bad.into();
+            assert_eq!(p.command(), None, "{bad:?}");
+        }
+
+        let mut r = NamePrompt::rename(&dir.join("a.dbr"));
+        assert_eq!(r.name, "a.dbr");
+        assert_eq!(r.command(), None, "an unchanged name asks for nothing");
+        r.name = "b.dbr".into();
+        assert_eq!(
+            r.command(),
+            Some(Command::Rename {
+                from: dir.join("a.dbr"),
+                to: dir.join("b.dbr"),
+            })
+        );
     }
 
     #[test]

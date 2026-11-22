@@ -16,7 +16,7 @@ use crate::canvas::{
 };
 use crate::code_ui::CodeEditor;
 use crate::debugger_ui::{Action as DebugAction, Debugger};
-use crate::dialog::{self, Dialog, Message};
+use crate::dialog::{self, Dialog, Message, Unsaved};
 use crate::dock::{self, LAYOUT_KEY, Pane};
 use crate::document::Document;
 use crate::examples::examples;
@@ -27,7 +27,7 @@ use crate::project::{self, Project};
 use crate::project_ui::{self, ProjectPanel};
 use crate::properties::Properties;
 use crate::serial_ui::SerialMonitor;
-use crate::settings::{STORAGE_KEY, Settings, Theme};
+use crate::settings::{STORAGE_KEY, Settings};
 
 /// Keyboard shortcuts shown under Help.
 const SHORTCUTS: &[(&str, &str)] = &[
@@ -65,6 +65,15 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("Mouse wheel / middle drag", "Zoom / pan"),
 ];
 
+/// Which project to go to when the user changes projects.
+#[derive(Debug, Clone, PartialEq)]
+enum ProjectTarget {
+    /// An existing project file.
+    Open(PathBuf),
+    /// A new project, at this file.
+    Create(PathBuf),
+}
+
 /// Something that would discard unsaved changes, waiting for confirmation.
 #[derive(Debug, Clone, PartialEq)]
 enum Pending {
@@ -74,7 +83,20 @@ enum Pending {
     Example(usize),
     ImportSpice,
     ImportKicad,
+    /// Close the project, and with it the circuit that belongs to it.
+    CloseProject,
+    /// Leave the open project (and its circuit) for another one.
+    SwitchProject(ProjectTarget),
     Quit,
+}
+
+/// A file or folder the user asked to delete, waiting for their answer.
+#[derive(Debug, Clone)]
+struct DeleteAsk {
+    path: PathBuf,
+    /// The open circuit is inside it and has unsaved changes: the user is
+    /// asked about losing those first.
+    discard_first: bool,
 }
 
 /// DC operating point shown on the canvas and in the results panel.
@@ -110,6 +132,12 @@ pub struct DunbrecApp {
     pub(crate) about: crate::about::AboutState,
     show_shortcuts: bool,
     settings: Settings,
+    settings_dialog: crate::settings_ui::SettingsDialog,
+    /// A project file or folder waiting for the user to confirm deleting it.
+    confirm_delete: Option<DeleteAsk>,
+    /// Asking for the name of a new project file or the new name of one.
+    name_prompt: Option<project_ui::NamePrompt>,
+    assistant: crate::assistant::Assistant,
 
     // ---- live simulation and instruments ----
     bench: Bench,
@@ -186,11 +214,12 @@ impl DunbrecApp {
         initial: Option<(Schematic, Option<PathBuf>)>,
         initial_project: Option<PathBuf>,
     ) -> Self {
-        let mut settings: Settings = cc
+        let settings: Settings = cc
             .storage
             .and_then(|s| eframe::get_value(s, STORAGE_KEY))
             .unwrap_or_default();
         cc.egui_ctx.set_theme(settings.theme.preference());
+        cc.egui_ctx.set_zoom_factor(settings.text_size.factor());
         let mut startup_problems = Vec::new();
         let doc = match initial {
             Some((mut s, path)) => {
@@ -212,19 +241,12 @@ impl DunbrecApp {
         let netlist = build_netlist(doc.schematic());
         let node_map = NodeMap::new(doc.schematic(), &netlist);
         let tags = node_tag_positions(doc.schematic(), &netlist);
-        let project = match settings.project.clone() {
-            Some(file) => match Project::open(&file) {
-                Ok(p) => Some(p),
-                Err(_) => {
-                    settings.forget_project(&file);
-                    None
-                }
-            },
-            None => None,
-        };
+        // No project is open until the user opens one: the last one is not
+        // reopened, so an open project is never a surprise.
+        let project: Option<Project> = None;
         let mut app = Self {
             project,
-            project_panel: ProjectPanel::default(),
+            project_panel: ProjectPanel,
             was_focused: true,
             dock,
             palette_search: String::new(),
@@ -259,6 +281,10 @@ impl DunbrecApp {
             about: Default::default(),
             show_shortcuts: false,
             settings,
+            settings_dialog: Default::default(),
+            confirm_delete: None,
+            name_prompt: None,
+            assistant: Default::default(),
         };
         if app.project.is_some() {
             dock::open(&mut app.dock, Pane::Project);
@@ -300,6 +326,11 @@ impl DunbrecApp {
                 }
             }
             Pending::ImportSpice | Pending::ImportKicad => self.import(action),
+            Pending::CloseProject => self.close_project(),
+            Pending::SwitchProject(to) => {
+                self.close_project();
+                self.go_to_project(to);
+            }
             Pending::Quit => {
                 self.allow_close = true;
             }
@@ -434,6 +465,8 @@ impl DunbrecApp {
         self.canvas.selection.clear();
         self.canvas.cancel();
         self.dc = None;
+        // A circuit that is opened is shown, not the Code tab beside it.
+        dock::bring_to_front(&mut self.dock, Pane::Schematic);
     }
 
     fn save(&mut self, ask: bool) -> bool {
@@ -496,6 +529,18 @@ impl DunbrecApp {
         }
     }
 
+    /// Close the project. The circuit that is open goes too if the project
+    /// lists it (and with it the source files shown in the Code panel), so
+    /// nothing stays open that belonged to the project.
+    fn close_project(&mut self) {
+        let related = circuit_belongs_to(self.project.as_ref(), self.doc.path());
+        self.project = None;
+        self.name_prompt = None;
+        if related {
+            self.replace(Document::default());
+        }
+    }
+
     fn show_project(&mut self, project: Project) {
         self.settings.remember_project(&project.file);
         self.project = Some(project);
@@ -524,7 +569,7 @@ impl DunbrecApp {
             .add_filter("Dunbrec project", &[project::EXTENSION])
             .pick_file()
         {
-            self.open_project_and_schematic(&file);
+            self.switch_project(ProjectTarget::Open(file));
         }
     }
 
@@ -540,14 +585,35 @@ impl DunbrecApp {
         else {
             return;
         };
-        match Project::create(&file) {
-            Ok((project, first)) => {
-                self.show_project(project);
-                self.request(Pending::OpenPath(first));
-            }
-            Err(e) => {
-                self.message = Some(Message::error("Could not create the project", e));
-            }
+        self.switch_project(ProjectTarget::Create(file));
+    }
+
+    /// Go to another project. The circuit of the project that is open now
+    /// goes too, so nothing of the old project stays open; if it has
+    /// unsaved changes the user is asked about them first.
+    fn switch_project(&mut self, to: ProjectTarget) {
+        let target = match &to {
+            ProjectTarget::Open(file) | ProjectTarget::Create(file) => file,
+        };
+        if leaves_circuit(self.project.as_ref(), self.doc.path(), target) {
+            self.request(Pending::SwitchProject(to));
+        } else {
+            self.go_to_project(to);
+        }
+    }
+
+    fn go_to_project(&mut self, to: ProjectTarget) {
+        match to {
+            ProjectTarget::Open(file) => self.open_project_and_schematic(&file),
+            ProjectTarget::Create(file) => match Project::create(&file) {
+                Ok((project, first)) => {
+                    self.show_project(project);
+                    self.request(Pending::OpenPath(first));
+                }
+                Err(e) => {
+                    self.message = Some(Message::error("Could not create the project", e));
+                }
+            },
         }
     }
 
@@ -557,10 +623,15 @@ impl DunbrecApp {
         match command {
             C::NewProject => self.new_project(),
             C::OpenProject => self.pick_and_open_project(),
-            C::OpenProjectPath(root) => self.open_project_and_schematic(&root),
+            C::OpenProjectPath(root) => self.switch_project(ProjectTarget::Open(root)),
             C::CloseProject => {
-                self.project = None;
-                self.settings.project = None;
+                // A circuit of the project goes with it, so ask first if it
+                // has unsaved changes; one that is not part of it stays.
+                if circuit_belongs_to(self.project.as_ref(), self.doc.path()) {
+                    self.request(Pending::CloseProject);
+                } else {
+                    self.close_project();
+                }
             }
             C::OpenSchematic(path) => self.request(Pending::OpenPath(path)),
             C::OpenSource(path) => self.open_source(&path),
@@ -604,7 +675,17 @@ impl DunbrecApp {
                 }
             }
             C::Rename { from, to } => self.rename_in_project(&from, &to),
-            C::Delete(path) => self.delete_in_project(&path),
+            C::AskCreate { dir, what } => {
+                self.name_prompt = Some(project_ui::NamePrompt::create(&dir, what));
+            }
+            C::AskRename(path) => self.name_prompt = Some(project_ui::NamePrompt::rename(&path)),
+            C::AskDelete(path) => {
+                let discard_first = self.doc.is_dirty() && self.open_circuit_is_in(&path);
+                self.confirm_delete = Some(DeleteAsk {
+                    path,
+                    discard_first,
+                });
+            }
             C::Refresh => self.refresh_project(),
             C::MoveSourcesToFiles => self.move_sources_to_files(),
             C::ForgetProject(path) => self.settings.forget_project(&path),
@@ -688,6 +769,65 @@ impl DunbrecApp {
         self.refresh_project();
     }
 
+    /// Whether the open circuit's file is `path` or inside the folder `path`.
+    fn open_circuit_is_in(&self, path: &std::path::Path) -> bool {
+        let gone = project::normalize(path);
+        self.doc
+            .path()
+            .is_some_and(|p| project::starts_with_ci(p, &gone))
+    }
+
+    /// The questions before a file or folder is deleted from the disk: first,
+    /// if the open circuit is in it and has unsaved changes, whether to lose
+    /// those; then whether to delete.
+    fn confirm_delete_dialog(&mut self, ctx: &egui::Context, ask: DeleteAsk) {
+        let name = ask
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if ask.discard_first {
+            match dialog::unsaved_changes(ctx, &self.doc.display_name(), false) {
+                Some(Unsaved::Discard) => {
+                    self.confirm_delete = Some(DeleteAsk {
+                        discard_first: false,
+                        ..ask
+                    });
+                }
+                Some(_) => self.confirm_delete = None,
+                None => {}
+            }
+            return;
+        }
+        let what = if ask.path.is_dir() {
+            format!("Delete the folder “{name}” and everything in it?")
+        } else {
+            format!("Delete “{name}”?")
+        };
+        // Cancel is the highlighted button: Enter must not delete a file.
+        let answer = Dialog {
+            id: "confirm_delete",
+            kind: dialog::Kind::Warning,
+            title: "Delete from disk",
+            buttons: &["Delete", "Cancel"],
+            default: 1,
+            cancel: Some(1),
+        }
+        .show(ctx, |ui| {
+            dialog::paragraph(ui, &what);
+            ui.add_space(4.0);
+            dialog::paragraph(ui, "This removes it from the disk and cannot be undone.");
+        });
+        match answer {
+            Some(0) => {
+                self.confirm_delete = None;
+                self.delete_in_project(&ask.path);
+            }
+            Some(_) => self.confirm_delete = None,
+            None => {}
+        }
+    }
+
     fn delete_in_project(&mut self, path: &std::path::Path) {
         let Some(project) = self.project.as_mut() else {
             return;
@@ -696,9 +836,13 @@ impl DunbrecApp {
             self.message = Some(Message::error("Could not delete it", e));
             return;
         }
-        let gone = project::normalize(path);
-        // Drop open source files that were deleted with it.
-        if let Some(dir) = self.firmware_dir() {
+        // A circuit that was deleted cannot be edited or simulated: it gives
+        // way to a new blank one, as File > New does.
+        if self.open_circuit_is_in(path) {
+            self.replace(Document::default());
+        } else if let Some(dir) = self.firmware_dir() {
+            // Drop open source files that were deleted with it.
+            let gone = project::normalize(path);
             let dead: Vec<String> = self
                 .doc
                 .schematic()
@@ -711,17 +855,6 @@ impl DunbrecApp {
             for name in dead {
                 self.doc.schematic_mut().sources.remove(&name);
             }
-        }
-        if self
-            .doc
-            .path()
-            .is_some_and(|p| project::starts_with_ci(p, &gone))
-        {
-            self.message = Some(Message::info(
-                "The open schematic's file is gone",
-                "The schematic you are working on was deleted from the disk. Save it (Ctrl+S) \
-                 to keep it.",
-            ));
         }
         self.refresh_project();
     }
@@ -1346,6 +1479,72 @@ impl DunbrecApp {
         }
     }
 
+    /// What the open instruments show, for the assistant: the oscilloscope's
+    /// channels, the multimeter, and the stopped microcontroller.
+    fn instrument_sections(&self) -> Vec<(String, Vec<String>)> {
+        let mut out = Vec::new();
+        let (s, netlist, map) = (self.doc.schematic(), &self.netlist.1, &self.node_map.1);
+        if self.bench.show_scope {
+            let mut lines = Vec::new();
+            for (i, channel) in self.bench.scope.channels.iter().enumerate() {
+                let (Some(point), true) = (self.bench.scope_probes[i], channel.enabled) else {
+                    continue;
+                };
+                // The captured screen of the oscilloscope.
+                let Some(sweep) = self.bench.scope.sweep() else {
+                    continue;
+                };
+                let Some(stats) = sweep.stats(i) else {
+                    continue;
+                };
+                let net = match map.node_at(s, netlist, point) {
+                    Some(n) if n.is_ground() => "0 (ground)".to_string(),
+                    Some(n) => netlist.nodes[n.0].name.clone(),
+                    None => "(not on a net)".to_string(),
+                };
+                let frequency = sweep
+                    .frequency(i)
+                    .map(|f| format!(", frequency {}", format_value(f, "Hz")))
+                    .unwrap_or_default();
+                lines.push(format!(
+                    "Channel {} on net {net}: min {}, max {}, mean {}, rms {}{frequency}",
+                    i + 1,
+                    format_value(stats.min, "V"),
+                    format_value(stats.max, "V"),
+                    format_value(stats.mean, "V"),
+                    format_value(stats.rms, "V"),
+                ));
+            }
+            if !lines.is_empty() {
+                out.push((
+                    format!(
+                        "Oscilloscope ({} per division, measured over the screen)",
+                        format_value(self.bench.scope.time_per_div, "s")
+                    ),
+                    lines,
+                ));
+            }
+        }
+        if self.bench.show_meter
+            && let Some(value) = self.bench.meter.reading()
+        {
+            let mode = self.bench.meter.mode;
+            out.push((
+                "Multimeter".to_string(),
+                vec![format!(
+                    "{}: {}",
+                    mode.label(),
+                    format_value(value, mode.unit())
+                )],
+            ));
+        }
+        let paused = self.live.as_ref().is_some_and(|l| l.paused);
+        if let Some(lines) = self.debugger.summary(paused) {
+            out.push(("Microcontroller (from the debugger)".to_string(), lines));
+        }
+        out
+    }
+
     /// Draw the dockable panels: schematic, palette, properties, checks and
     /// values.
     fn dock_area(&mut self, ctx: &egui::Context) {
@@ -1382,6 +1581,26 @@ impl DunbrecApp {
 
         let running = self.live.is_some();
         let mut project_command = None;
+        let mut open_settings = false;
+        let title = self.doc.display_name();
+        let generation = self.doc.generation();
+        let live_is_current = running && self.live_generation == generation;
+        let sections = if dock::is_open(&self.dock, Pane::Assistant) {
+            self.instrument_sections()
+        } else {
+            Vec::new()
+        };
+        let readings = || {
+            assistant_readings(
+                &self.netlist.1,
+                sections.clone(),
+                &self.latest,
+                live_is_current,
+                &self.dc,
+                generation,
+                &self.serial,
+            )
+        };
         let mut viewer = PaneViewer {
             doc: &mut self.doc,
             canvas: &mut self.canvas,
@@ -1393,6 +1612,7 @@ impl DunbrecApp {
             netlist: &self.netlist.1,
             dc: &self.dc,
             latest: &self.latest,
+            readings: &readings,
             running,
             annotations,
             markers: &markers,
@@ -1401,12 +1621,34 @@ impl DunbrecApp {
             recent_projects: &self.settings.recent_projects,
             project_panel: &mut self.project_panel,
             project_command: &mut project_command,
+            assistant: &mut self.assistant,
+            ai: &self.settings.ai,
+            title: &title,
+            open_settings: &mut open_settings,
         };
         DockArea::new(&mut self.dock)
             .style(egui_dock::Style::from_egui(ctx.style().as_ref()))
             .show(ctx, &mut viewer);
         if let Some(command) = project_command {
             self.run_project_command(command);
+        }
+        // Source files the Code panel made on disk belong to the project the
+        // circuit is in.
+        let created = self.code.take_created();
+        if !created.is_empty()
+            && let (Some(circuit), Some(project)) = (self.doc.path(), self.project.as_mut())
+            && project.contains(circuit)
+        {
+            if let Err(e) = project.add_files(&created) {
+                self.message = Some(Message::error("Could not update the project file", e));
+            }
+            project.refresh();
+        }
+        if let Some(problem) = self.code.take_problem() {
+            self.message = Some(Message::error("Could not create the file", problem));
+        }
+        if open_settings {
+            self.settings_dialog.open();
         }
         // "Edit" on a microcontroller's source file opens it in the editor.
         if let Some(name) = self.properties.open_code.take() {
@@ -1533,6 +1775,11 @@ impl DunbrecApp {
                         ui.close();
                     }
                     ui.separator();
+                    if ui.button("Settings…").clicked() {
+                        self.settings_dialog.open();
+                        ui.close();
+                    }
+                    ui.separator();
                     if ui.button("Quit").clicked() {
                         ctx.send_viewport_cmd(ViewportCommand::Close);
                         ui.close();
@@ -1613,8 +1860,6 @@ impl DunbrecApp {
                         self.run_dc();
                         ui.close();
                     }
-                    ui.separator();
-                    ui.label(RichText::new("Transient & instruments: coming in phase 6").weak());
                 });
                 ui.menu_button("Instruments", |ui| {
                     ui.checkbox(&mut self.bench.show_scope, "📈 Oscilloscope");
@@ -1630,22 +1875,23 @@ impl DunbrecApp {
                     );
                     ui.checkbox(&mut self.analyses.show_transfer, "↗ DC transfer (DC sweep)");
                     ui.checkbox(&mut self.analyses.show_tracer, "〽 Curve tracer");
+                    ui.separator();
+                    if ui
+                        .add_enabled(
+                            crate::float::any_popped(ctx),
+                            egui::Button::new("Dock all instruments"),
+                        )
+                        .on_hover_text(
+                            "Bring every instrument that is in a window of its own back \
+                             inside the main window",
+                        )
+                        .clicked()
+                    {
+                        crate::float::dock_all(ctx);
+                        ui.close();
+                    }
                 });
                 ui.menu_button("View", |ui| {
-                    ui.label(RichText::new("Theme").weak());
-                    for (theme, name) in [
-                        (Theme::System, "Follow Windows"),
-                        (Theme::Light, "Light"),
-                        (Theme::Dark, "Dark"),
-                    ] {
-                        if ui
-                            .radio_value(&mut self.settings.theme, theme, name)
-                            .clicked()
-                        {
-                            ctx.set_theme(theme.preference());
-                        }
-                    }
-                    ui.separator();
                     ui.checkbox(&mut self.show_voltages, "Node voltages on the schematic");
                     ui.separator();
                     ui.menu_button("Panels", |ui| {
@@ -1685,32 +1931,16 @@ impl DunbrecApp {
 
     fn dialogs(&mut self, ctx: &egui::Context) {
         if let Some(action) = self.pending.clone() {
-            let name = self.doc.display_name();
-            let answer = Dialog {
-                id: "confirm",
-                kind: dialog::Kind::Question,
-                title: "Unsaved changes",
-                buttons: &["Save", "Discard", "Cancel"],
-                default: 0,
-                cancel: Some(2),
-            }
-            .show(ctx, |ui| {
-                dialog::paragraph(ui, &format!("Save changes to “{name}” before continuing?"));
-                ui.add_space(4.0);
-                ui.label(
-                    RichText::new("Discarding loses every change since the last save.").weak(),
-                );
-            });
-            match answer {
-                Some(0) if self.save(false) => {
+            match dialog::unsaved_changes(ctx, &self.doc.display_name(), true) {
+                Some(Unsaved::Save) if self.save(false) => {
                     self.pending = None;
                     self.perform(action);
                 }
-                Some(1) => {
+                Some(Unsaved::Discard) => {
                     self.pending = None;
                     self.perform(action);
                 }
-                Some(2) => self.pending = None,
+                Some(Unsaved::KeepEditing) => self.pending = None,
                 _ => {}
             }
         }
@@ -1741,6 +1971,24 @@ impl DunbrecApp {
                     self.doc.edit(|s| s.add_label(name, at));
                 }
             }
+        }
+
+        if let (Some(prompt), Some(project)) = (&mut self.name_prompt, &self.project) {
+            match prompt.show(ctx, project) {
+                Some(Some(command)) => {
+                    self.name_prompt = None;
+                    self.run_project_command(command);
+                }
+                Some(None) => self.name_prompt = None,
+                None => {}
+            }
+        } else {
+            // The project was closed while a name was being asked for.
+            self.name_prompt = None;
+        }
+
+        if let Some(ask) = self.confirm_delete.clone() {
+            self.confirm_delete_dialog(ctx, ask);
         }
 
         if let Some(message) = &self.message
@@ -1791,8 +2039,77 @@ impl DunbrecApp {
     }
 }
 
+/// Whether `circuit`, the file of the open circuit, is one the project lists.
+fn circuit_belongs_to(project: Option<&Project>, circuit: Option<&std::path::Path>) -> bool {
+    matches!((project, circuit), (Some(p), Some(c)) if p.contains(c))
+}
+
+/// Whether going to the project file `target` leaves the open circuit
+/// behind: it belongs to the project that is open, which is a different one.
+fn leaves_circuit(
+    open: Option<&Project>,
+    circuit: Option<&std::path::Path>,
+    target: &std::path::Path,
+) -> bool {
+    circuit_belongs_to(open, circuit) && open.is_some_and(|p| !project::path_eq(&p.file, target))
+}
+
+/// What the circuit is doing, for the assistant: the running simulation if
+/// there is one for this circuit, else the DC point, plus serial output.
+fn assistant_readings(
+    netlist: &Netlist,
+    sections: Vec<(String, Vec<String>)>,
+    latest: &Option<Sample>,
+    running: bool,
+    dc: &Option<DcResults>,
+    generation: u64,
+    serial: &SerialMonitor,
+) -> crate::assistant::Readings {
+    let mut r = crate::assistant::Readings {
+        heading: "The simulation is not running and no DC point is calculated, so there \
+                  are no readings."
+            .into(),
+        serial: serial.tails(1500),
+        sections,
+        ..Default::default()
+    };
+    match (latest, dc) {
+        (Some(sample), _) if running => {
+            r.heading = format!(
+                "The simulation is running; this is a snapshot at t = {}.",
+                format_value(sample.time, "s")
+            );
+            let unused = netlist.unused_io_nets();
+            for (i, node) in netlist.nodes.iter().enumerate().skip(1) {
+                if let (false, Some(v)) = (unused.contains(&NodeId(i)), sample.voltages.get(i)) {
+                    r.voltages.push((node.name.clone(), *v));
+                }
+            }
+            for (e, i) in netlist.elements.iter().zip(&sample.currents) {
+                r.currents.push((e.designator.clone(), *i));
+            }
+        }
+        (
+            _,
+            Some(DcResults {
+                outcome: Ok(t),
+                generation: g,
+            }),
+        ) if *g == generation => {
+            r.heading = "The simulation is not running; this is the DC operating point.".into();
+            r.voltages = t.voltages.clone();
+            r.currents = t.currents.clone();
+            for w in &t.warnings {
+                r.heading.push_str(&format!("\nWarning: {w}"));
+            }
+        }
+        _ => {}
+    }
+    r
+}
+
 /// Explain a netlist problem in a sentence.
-fn describe_diagnostic(schematic: &Schematic, d: &Diagnostic) -> String {
+pub(crate) fn describe_diagnostic(schematic: &Schematic, d: &Diagnostic) -> String {
     let name = |id| {
         schematic
             .component(id)
@@ -2063,6 +2380,8 @@ struct PaneViewer<'a> {
     netlist: &'a Netlist,
     dc: &'a Option<DcResults>,
     latest: &'a Option<Sample>,
+    /// What the assistant is told the circuit is doing.
+    readings: &'a dyn Fn() -> crate::assistant::Readings,
     running: bool,
     annotations: &'a [Annotation],
     markers: &'a [Marker],
@@ -2072,6 +2391,10 @@ struct PaneViewer<'a> {
     project_panel: &'a mut ProjectPanel,
     /// What the Project panel asked for this frame.
     project_command: &'a mut Option<project_ui::Command>,
+    assistant: &'a mut crate::assistant::Assistant,
+    ai: &'a crate::ai::AiSettings,
+    title: &'a str,
+    open_settings: &'a mut bool,
 }
 
 impl TabViewer for PaneViewer<'_> {
@@ -2115,6 +2438,23 @@ impl TabViewer for PaneViewer<'_> {
                 };
                 if let Some(command) = self.project_panel.show(ui, &view) {
                     *self.project_command = Some(command);
+                }
+            }
+            Pane::Assistant => {
+                let view = crate::assistant::View {
+                    settings: self.ai,
+                    title: self.title,
+                    schematic: self.doc.schematic(),
+                    netlist: self.netlist,
+                    readings: self.readings,
+                };
+                match self.assistant.show(ui, &view) {
+                    Some(crate::assistant::Command::OpenSettings) => *self.open_settings = true,
+                    Some(crate::assistant::Command::Apply { key, edit }) => {
+                        let result = crate::edits::apply(self.doc, &edit);
+                        self.assistant.record(key, result);
+                    }
+                    None => {}
                 }
             }
             Pane::Retired => {}
@@ -2212,6 +2552,7 @@ impl eframe::App for DunbrecApp {
         });
 
         self.dialogs(ctx);
+        self.settings_dialog.show(ctx, &mut self.settings);
     }
 }
 
@@ -2219,6 +2560,49 @@ impl eframe::App for DunbrecApp {
 mod tests {
     use super::*;
     use crate::library::palette;
+
+    #[test]
+    fn only_a_circuit_the_project_lists_goes_with_it() {
+        let dir = std::env::temp_dir().join(format!("dunbrec-close-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (project, circuit) = Project::create(&dir.join("P")).unwrap();
+        assert!(circuit_belongs_to(Some(&project), Some(&circuit)));
+        // A circuit somewhere else, an unsaved one, or no project at all.
+        assert!(!circuit_belongs_to(
+            Some(&project),
+            Some(&dir.join("other.dbr"))
+        ));
+        assert!(!circuit_belongs_to(Some(&project), None));
+        assert!(!circuit_belongs_to(None, Some(&circuit)));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn changing_project_leaves_the_circuit_only_for_a_different_project() {
+        let dir = std::env::temp_dir().join(format!("dunbrec-switch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (project, circuit) = Project::create(&dir.join("A")).unwrap();
+        let other = dir.join("B.dbrproj");
+        // Another project: the open circuit of A is left behind.
+        assert!(leaves_circuit(Some(&project), Some(&circuit), &other));
+        // The same project again keeps it.
+        assert!(!leaves_circuit(
+            Some(&project),
+            Some(&circuit),
+            &project.file
+        ));
+        // A circuit that is not A's, an unsaved one, or no project: nothing to leave.
+        assert!(!leaves_circuit(
+            Some(&project),
+            Some(&dir.join("x.dbr")),
+            &other
+        ));
+        assert!(!leaves_circuit(Some(&project), None, &other));
+        assert!(!leaves_circuit(None, Some(&circuit), &other));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn the_j_key_picks_the_same_tool_as_the_palette_junction() {

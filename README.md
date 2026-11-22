@@ -9,6 +9,9 @@ integrated circuits (a 741 op-amp and a 555 timer), digital logic (gates, flip-f
 clocks) and microcontrollers running real firmware (an ATmega328P, as on the Arduino Uno) in
 one simulation.
 
+An optional **assistant**, a model running on your own computer (Ollama) or Claude, can help
+troubleshoot a circuit or its firmware and suggest changes that you approve one at a time.
+
 ## Installing
 
 Build the Windows installer (needs the WiX Toolset: `dotnet tool install --global wix`):
@@ -53,10 +56,20 @@ connections meet.
 **Panels.** The schematic, palette, properties, checks and live values are tabs you can drag.
 Drop one on the edge of another panel to split the window, on the middle of one to stack it as
 a tab, or outside the window area to float it. Drag the dividers to resize. Closing a tab hides
-it: bring Palette, Properties, Checks or Values back from View → Panels. The arrangement is
-remembered between sessions; View → Reset layout puts everything back. Instruments (the
-oscilloscope, multimeter and the rest) are separate floating windows that you can move and
-resize freely but that never dock; open them from the toolbar or the Instruments menu.
+it: bring Palette, Project, Properties, Checks, Values, Code or Assistant back from View →
+Panels. The arrangement is remembered between sessions; View → Reset layout puts everything
+back. Instruments (the oscilloscope, multimeter and the rest) are floating windows that you can
+move and resize freely but that never dock; open them from the toolbar or the Instruments menu.
+To take one outside the main window, for example onto a second monitor, press **⧉ Pop out** at
+the top right of its window; it becomes a window of its own, and **⧉ Dock** puts it back.
+Which instruments are popped out is remembered, but not where the windows were: they always
+reopen in a default place, so a window can never be lost. Instruments → **Dock all instruments**
+brings every popped-out one back at once.
+
+**Settings.** File → Settings… has a page for each group. *Appearance* sets the theme (follow
+Windows, light or dark) and the **text size** (normal, large, extra large, huge), which scales
+the whole interface. *Assistant* chooses the language model (see below). Changes apply at once and
+are remembered; the one exception is a Claude API key, which has its own *Save* button.
 
 **Checking.** The Checks panel lists wiring problems in plain English (missing ground,
 unconnected pins, missing models), and the DC operating point is recalculated after every edit
@@ -142,9 +155,12 @@ simply not part of the project and is never shown. The files are ordinary files 
 `.asm` and `.ino` sources) that other editors, Git and `arduino-cli` see as they are. File → *New
 project…* is a Save dialog: pick or make a folder and name the project; it creates the project
 file and a first circuit, `Circuit 1`, beside it. *Open project…* (and *Open recent project*)
-opens a `.dbrproj` (double-clicking one does too, once installed), and the app reopens the last
-project at start. A project can be taken off the recent list (✕ beside it) or the whole list
-cleared.
+opens a `.dbrproj` (double-clicking one does too, once installed). No project is open when the app
+starts. A project can be taken off the recent list (✕ beside it) or the whole list cleared.
+Every change to a project is saved to its file at once, so there is no project Save. *Close
+project*, and opening a different project, also close the open circuit if the project lists it,
+along with its source tabs, asking about unsaved changes first; a circuit that is not part of
+the project stays open.
 
 The **Project** panel (View → Panels; it opens beside the palette) shows the project's name and
 the files it lists, in folders as they are on disk. Circuits are listed by name, sources with
@@ -153,19 +169,26 @@ panel. Right-click the project's name, a folder or empty space to add: a new cir
 file, Arduino sketch or folder (made on disk and listed), or *Add existing file…* for files that
 are already there (the ＋ Add button does the same). Right-click a file or folder to rename it
 (circuits that use a renamed source are updated, a folder rename included), to **Remove from
-project** (the file stays on disk), or to **Delete from disk**. A listed file that has gone from
-the disk shows in red with a ⚠. New source files made from the Code panel are added to the project
-when the schematic is saved. Coming back to the window re-reads the project file and takes up
+project** (the file stays on disk), or to **Delete from disk**, which asks first and, if the
+circuit you are editing is in it, asks about its unsaved changes and then closes it. Names for
+new files and renames are asked for in a message box. A listed file that has gone from the disk
+shows in red with a ⚠. New source files made from the Code panel are listed in the project too
+(for a saved circuit at once, otherwise when the circuit is first saved). Coming back to the window re-reads the project file and takes up
 edits made to the sources in other programs, unless the open schematic has unsaved changes.
 Schematics saved by older versions keep their sources inside the `.dbr`; the panel offers *Move
 to files in this folder* for those.
 
 **Writing firmware in assembly.** View → Panels → *Code* opens an editor tab beside the
-schematic for AVR assembly. A source is a file beside the schematic (`main.asm`, or in a
-subfolder `fw/main.asm`); the schematic itself stores only the name, and Save writes the
-files. Create one with *New…* (or *Source file → New assembly file…* in a microcontroller's
-properties, which also points the part at it; or from the Project panel); the first one starts as
-a blink program for D13. The dialect is Atmel's: `ldi r16, 0xFF`,
+schematic for AVR assembly. Each source file of the open circuit is a tab along the top of the
+panel (✕ or a middle click closes a tab, which only stops showing the file; Ctrl+Z brings it
+back), and each file keeps its own cursor and scroll position when you switch. A source is a
+file beside the schematic (`main.asm`, or in a subfolder `fw/main.asm`); the schematic itself
+stores only the name. Create one with *＋ New…* (or *Source file → New assembly file…* in a
+microcontroller's properties, which also points the part at it; or from the Project panel). For
+a circuit that has been saved, the new file is made on disk at once, as the Project panel does,
+and listed in the project if the circuit belongs to one; for an Untitled circuit it is written
+beside the circuit when you first save it, and a line under the tabs says which. The first one
+starts as a blink program for D13. The dialect is Atmel's: `ldi r16, 0xFF`,
 `sbi PORTB, PB5`, labels, `.equ`, `.def`, `.org`, `.db`, `.dw`, expressions with `low()` and
 `high()`, and the register, bit and vector names from `m328Pdef.inc`. Text is coloured as you
 type and built on every change: mistakes are underlined, listed under the editor (click one to
@@ -178,6 +201,44 @@ are built by the Arduino command-line tool, which Dunbrec finds but does not inc
 (`winget install ArduinoSA.CLI` on Windows), then run `arduino-cli core install arduino:avr`.
 Press **Build**; compile errors are underlined on their lines and listed under the editor. The
 circuit runs the last build of exactly the text in the file, so build again after a change.
+
+**Assistant.** View → Panels → *Assistant* opens a chat beside the properties panel. First choose
+a model in File → Settings… → Assistant:
+
+- **Ollama** runs a model on your own computer (or another you can reach). Enter the server
+  address (the default is `http://localhost:11434`), press *Test connection* to list its models,
+  and pick one. Set the **context size** (default 16 384 tokens): Ollama's own default is far too
+  small for a circuit and its firmware. Everything stays on your machine.
+- **Claude** is Anthropic's service. Enter your API key, which is kept in the Windows Credential
+  Manager and never in Dunbrec's settings file, and pick a model. The circuit and firmware are
+  sent to Anthropic with each question.
+
+Type a question and press **Enter** to send (Shift+Enter for a new line). Every question goes out
+with the current state of the document: the circuit as a SPICE netlist, what the Checks panel
+says, the firmware source files, and live readings (the running simulation's node voltages and
+currents, or the DC operating point; the serial output; the oscilloscope channels and multimeter
+while those windows are open; and a paused microcontroller's registers while the debugger window
+is open). So you can ask "why is VOUT 0.9 V when I expected 5 V?" without describing anything.
+
+The assistant can also **suggest changes**. They appear as cards under its answer, and nothing
+happens until you press **Apply**; each Apply is one undo step (Ctrl+Z), and **Dismiss** hides
+the card.
+
+- *Values*: a card such as `R2: 100 Ω → 1 kΩ` for resistors, capacitors, inductors, DC sources,
+  potentiometers and switches.
+- *Firmware*: the whole replacement of a source file, shown as a before-and-after diff.
+- *Adding parts*: resistors, capacitors, inductors, potentiometers, switches, DC sources, diodes,
+  transistors, MOSFETs, op-amps, 555 timers, gates, flip-flops, counters, clocks and logic parts.
+  A two-pin part between nets that already exist is drawn next to them with real wires; any other
+  part goes below the drawing and is joined by net labels, which you can tidy by hand. Before you
+  can apply it, Dunbrec checks that every new pin lands on the net asked for and that no
+  existing nets would be joined or split. If that cannot be done, the card says why and Apply is
+  disabled.
+- *Removing parts*: the part and any stubs or ground drawn for it go; wires you drew stay.
+
+The assistant cannot add controlled sources, the CD4066, microcontrollers or discrete LEDs, and
+it can be wrong: small local models are good at explaining and at firmware, and weaker at
+diagnosing a circuit, and a figure it calculates is worth checking against the simulation.
 
 **Parts library.** Besides generic parts, the palette has real ones: the 2N3904 and 2N3906
 transistors and the 1N4148, 1N914 and 1N750 (4.7 V zener) diodes, using the published manufacturer
@@ -221,6 +282,8 @@ written as a subcircuit call with its `.subckt` definition included.
 11. Microcontrollers: ATmega328P emulation, `.hex` firmware, GPIO/timers/PWM/ADC/serial ✅
 12. Integrated circuits: composite parts, 741 op-amp (Boyle macromodel), 555 timer ✅
 13. Dockable, draggable panels (egui_dock) with a remembered layout ✅
+14. 0.4.0: Settings, the assistant (Ollama or Claude) with approved edits, pop-out instruments,
+    text size, message boxes for every question, Code panel tabs, tidier project behaviour ✅
 
 Known limits: fixed temperature (27 °C); MOSFETs are level 1 only; one logic family (5 V
 CMOS-style); logic parts, microcontrollers and 555 timers are not exported to SPICE; the 555

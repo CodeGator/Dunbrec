@@ -8,25 +8,31 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod about;
+mod ai;
 mod analyses_ui;
 mod app;
+mod assistant;
 mod canvas;
 mod code_ui;
 mod debugger_ui;
 mod dialog;
 mod dock;
 mod document;
+mod edits;
 mod examples;
+mod float;
 mod instruments_ui;
 mod library;
 mod live;
 mod logic_ui;
+mod part_edits;
 mod plot;
 mod project;
 mod project_ui;
 mod properties;
 mod serial_ui;
 mod settings;
+mod settings_ui;
 mod symbols;
 
 use std::path::PathBuf;

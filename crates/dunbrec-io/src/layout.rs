@@ -29,7 +29,7 @@ pub struct Part {
 const SPACING_X: i32 = 14;
 const SPACING_Y: i32 = 12;
 /// Length of the wire stub from a pin to its label.
-const STUB: i32 = 2;
+pub const STUB: i32 = 2;
 
 pub fn is_ground(net: &str) -> bool {
     net == "0" || net.eq_ignore_ascii_case("gnd")
@@ -68,7 +68,7 @@ fn connection_order(parts: &[Part]) -> Vec<usize> {
 }
 
 /// Unit direction pointing away from the part at a pin with this offset.
-fn outward(offset: Point) -> Point {
+pub fn outward(offset: Point) -> Point {
     if offset.x.abs() >= offset.y.abs() {
         Point::new(offset.x.signum(), 0)
     } else {
