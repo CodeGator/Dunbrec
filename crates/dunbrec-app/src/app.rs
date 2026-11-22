@@ -113,6 +113,8 @@ pub struct DunbrecApp {
     settings_dialog: crate::settings_ui::SettingsDialog,
     /// A project file or folder waiting for the user to confirm deleting it.
     confirm_delete: Option<PathBuf>,
+    /// Asking for the name of a new project file or the new name of one.
+    name_prompt: Option<project_ui::NamePrompt>,
     assistant: crate::assistant::Assistant,
 
     // ---- live simulation and instruments ----
@@ -229,7 +231,7 @@ impl DunbrecApp {
         };
         let mut app = Self {
             project,
-            project_panel: ProjectPanel::default(),
+            project_panel: ProjectPanel,
             was_focused: true,
             dock,
             palette_search: String::new(),
@@ -266,6 +268,7 @@ impl DunbrecApp {
             settings,
             settings_dialog: Default::default(),
             confirm_delete: None,
+            name_prompt: None,
             assistant: Default::default(),
         };
         if app.project.is_some() {
@@ -612,6 +615,10 @@ impl DunbrecApp {
                 }
             }
             C::Rename { from, to } => self.rename_in_project(&from, &to),
+            C::AskCreate { dir, what } => {
+                self.name_prompt = Some(project_ui::NamePrompt::create(&dir, what));
+            }
+            C::AskRename(path) => self.name_prompt = Some(project_ui::NamePrompt::rename(&path)),
             C::AskDelete(path) => self.confirm_delete = Some(path),
             C::Refresh => self.refresh_project(),
             C::MoveSourcesToFiles => self.move_sources_to_files(),
@@ -1762,6 +1769,20 @@ impl DunbrecApp {
                     self.doc.edit(|s| s.add_label(name, at));
                 }
             }
+        }
+
+        if let (Some(prompt), Some(project)) = (&mut self.name_prompt, &self.project) {
+            match prompt.show(ctx, project) {
+                Some(Some(command)) => {
+                    self.name_prompt = None;
+                    self.run_project_command(command);
+                }
+                Some(None) => self.name_prompt = None,
+                None => {}
+            }
+        } else {
+            // The project was closed while a name was being asked for.
+            self.name_prompt = None;
         }
 
         if let Some(path) = self.confirm_delete.clone() {
