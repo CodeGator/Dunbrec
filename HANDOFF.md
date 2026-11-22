@@ -3,7 +3,7 @@
 State of the project for whoever picks it up next. User-facing documentation is in
 [README.md](README.md); this file covers status, decisions and open work.
 
-*Last updated: 2026-11-21, Phase 12 (integrated circuits).*
+*Last updated: 2026-11-22, version 0.4.0 in progress (assistant, settings, message boxes, project behaviour).*
 
 ## Status
 
@@ -26,8 +26,10 @@ drafts the GitHub release (see `.github/workflows/release.yml`).
 | 12 | Composite parts; 741 op-amp (Boyle macromodel); 555 timer; examples 12–14 |
 | 13 | Dockable panels: every panel is an `egui_dock` tab; layout saved between sessions |
 | 0.2.0 | Switches group: SPST, SPDT, DPST, DPDT (`ComponentKind::MultiSwitch`, `SwitchContacts` device) and hold-to-press push buttons (`Switch { momentary }`, `Canvas::push_buttons`) |
+| 0.3.0 | Projects (a `.dbrproj` file listing circuits and firmware files), Junction and hops, J key, CD4066, Linear group |
+| 0.4.0 (in progress) | Settings dialog; Assistant (Ollama or Claude); pop-out instruments; text size; every confirmation a message box; Code panel tabs; project behaviour changes. See "0.4.0" below |
 
-Health at handoff: `cargo test --workspace` 237 passed, 0 failed (1 ignored: an emulator speed
+Health at handoff: `cargo test --workspace` 412 passed, 0 failed (1 ignored: an emulator speed
 benchmark); `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --check`
 clean. Toolchain: Rust 1.99 (edition 2024, MSRV 1.90), Windows 11.
 
@@ -51,7 +53,7 @@ powershell -ExecutionPolicy Bypass -File tools\build-installer.ps1   # MSI; need
 | `dunbrec-mcu` | Standalone ATmega328P emulator, Intel HEX, firmware loading, assembler, demo programs |
 | `dunbrec-io` | `.dbr` (RON), SPICE import/export, KiCad import, auto layout |
 | `dunbrec-instruments` | Scope/meter signal processing |
-| `dunbrec-app` | eframe app; `live.rs` runs the transient on a worker thread |
+| `dunbrec-app` | eframe app; `live.rs` runs the transient on a worker thread. The 0.4.0 modules are listed under "0.4.0" below |
 
 UI layout (`dock.rs`, `PaneViewer` in `app.rs`):
 
@@ -59,9 +61,12 @@ UI layout (`dock.rs`, `PaneViewer` in `app.rs`):
   `egui_dock::DockState`. The menu bar, run toolbar and status bar are fixed. `dock.rs` has the
   pane list, `default_layout`, `open` / `close` placement and `sanitize`; `PaneViewer` (in
   `app.rs`) draws each pane from borrowed app state.
-- **Instruments never dock** (the user's decision): each is a floating `egui::Window`
+- **Instruments never dock** (the user's decision): each is a floating window
   (`Bench::scope_window` / `meter_window` / `logic_window`, `Analyses::show`,
-  `SerialMonitor::window`), switched by the `show_*` flags. They briefly were dock tabs in the
+  `SerialMonitor::window`, `Debugger::window`), switched by the `show_*` flags. Since 0.4.0 each
+  goes through `float::window`, which draws it as an `egui::Window` inside the main window or,
+  after its "Pop out" button, as a real OS window (an immediate viewport) that can leave the main
+  window (see "0.4.0"). They briefly were dock tabs in the
   first version of Phase 13. `Pane::Retired` (`#[serde(other)]`) lets layouts saved then still
   load; those tabs are dropped on load.
 - In `egui_dock` splits, `fraction` is the share of the *first* child (left or top), which is
@@ -121,6 +126,24 @@ Key mechanisms worth knowing before changing the engine:
     bumped. An older Dunbrec opening a file that has sources ignores them.
 - The user wants technical options explained in plain terms, with a recommendation, and
   confirmed before they become plans.
+- **Readability.** The user has poor eyesight: every confirmation or question is the standard
+  message box (`dialog.rs`, large type, one fixed width), never a small inline form. There is
+  one text-size setting that scales the whole interface (`Settings.text_size`, applied with
+  `set_zoom_factor`).
+- **Destructive prompts default to the safe button.** In "Delete from disk" Cancel is
+  highlighted, so a stray Enter cannot delete; in the unsaved-changes question Enter presses
+  Save (when there is one) or Keep editing, and Escape keeps editing.
+- **One unsaved-changes question** everywhere (`dialog::unsaved_changes`): "<name> has unsaved
+  changes. Keep editing or discard those changes?" with Save / Discard changes / Keep editing, or
+  only the last two where saving first makes no sense (deleting the file).
+- **No project is reopened at startup**, so an open project is never a surprise (the old
+  `Settings.project` is gone; old settings files still load). A project given on the command
+  line still opens.
+- Window positions of popped-out instruments are deliberately **not** remembered: a window that
+  always reopens at the default place is the escape hatch if one is ever lost. Only the choice of
+  "popped out" is kept. Instruments > Dock all instruments is the other way back.
+- Don't search the user's personal folders (Desktop, Documents, OneDrive) for files without
+  asking; stay in the repo, `projects/` or the scratchpad.
 - Don't drive the user's mouse or keyboard for UI testing without asking. Window screenshots
   are fine.
 
@@ -137,8 +160,12 @@ Key mechanisms worth knowing before changing the engine:
 3. **UI verification of phase 11 in the running app.**
    - Covered so far by worker-thread tests and a screenshot of the schematic.
    - Pressing Run and watching the serial monitor in the window has not been done.
-4. **Stale text:** the Simulate menu still says "Transient & instruments: coming in phase 6"
-   (`crates/dunbrec-app/src/app.rs`).
+4. **Assistant (0.4.0).** Not yet done: adding parts with more than two pins is drawn on labels
+   only (no real wires); rewiring (moving a pin to another net) is not a suggestion; controlled
+   sources, the CD4066, discrete LEDs and microcontrollers cannot be added; the logic analyser's
+   data is not in its context; it has not been run against a real model for long, so the prompt
+   may need tuning (small local models are weak at circuit diagnosis). None of the 0.4.0 screens
+   was checked by anything but the user looking at them and tests of the logic underneath.
 5. **More chips.**
    - Op-amps such as the LM358 and TL072, and a comparator such as the LM393, would reuse the
      composite machinery.
@@ -146,13 +173,12 @@ Key mechanisms worth knowing before changing the engine:
    - The ngspice cross-check (item 1) can now also cover the exported 741 subcircuit.
 6. **MCU firmware development** (debugger, assembly text, Arduino C++ builds): phases A and B
    and C (Arduino C++ via arduino-cli) built; D (more chips) is not. See
-   [docs/mcu-firmware-development.md](docs/mcu-firmware-development.md). None of the new
-   windows (debugger, code panel) has been looked at on screen yet.
+   [docs/mcu-firmware-development.md](docs/mcu-firmware-development.md).
 7. **Not yet supported:**
    - MCU: SPI, I²C, EEPROM, watchdog, serial receive and other chips.
    - Simulation: a fixed temperature of 27 °C, MOSFET level 1 only, and a single logic family.
    - Import: KiCad hierarchical sheets, SPICE `.param` expressions and EXP/SFFM sources.
-8. **Projects** (built in 0.3.0; **not seen on screen yet**). A project is a *file*,
+8. **Projects** (built in 0.3.0; changed in 0.4.0, see "0.4.0"). A project is a *file*,
    `<name>.dbrproj` (JSON, `project::EXTENSION`), listing the project's files relative to its
    own folder (`files`) and any folders to show while empty (`folders`); `version` 1. The
    `.dbr` circuits and the `.asm`/`.ino` sources are ordinary files, and the project view shows
@@ -177,12 +203,14 @@ Key mechanisms worth knowing before changing the engine:
      *Move to files* button).
    - `dunbrec_sim::load_firmware` accepts `source:<name>`, a path of a source file (from
      `sources` if open, else read from disk beside the schematic) and `.hex`/`builtin:` as before.
-   - `project_ui.rs` is the panel (`Pane::Project`, a tab beside the palette): tree, a small
-     form for new/rename/delete, context menus on the name, folders, files and empty space, and it
-     returns a `Command` that `DunbrecApp::run_project_command` carries out. File → New project
-     (Save dialog) / Open project / Open recent project / Close project. The last project file is
-     saved in `Settings.project` and reopened at start (one that cannot be read is forgotten);
-     `dunbrec.exe <file>.dbrproj` opens a project, and the installer associates `.dbrproj`.
+   - `project_ui.rs` is the panel (`Pane::Project`, a tab beside the palette): tree and context
+     menus on the name, folders, files and empty space. It returns a `Command` that
+     `DunbrecApp::run_project_command` carries out; the questions it needs (a name for a new file,
+     folder or circuit, a new name, confirming a delete) are message boxes, not inline forms
+     (`NamePrompt` in `project_ui.rs`, `DeleteAsk` in `app.rs`). File → New project (Save dialog) /
+     Open project / Open recent project / Close project. `dunbrec.exe <file>.dbrproj` opens a
+     project, and the installer associates `.dbrproj`. Every change to the project is written to
+     the project file at once (there is no project "Save").
      Focus returning to the window re-reads the file and the sources (`refresh_project`).
    - **Not done yet:** multi-file C++ builds (a sketch folder with several `.cpp`/`.h`; the
      Arduino build still takes one file's text) and a per-project build cache with the `.hex`
@@ -192,10 +220,66 @@ Key mechanisms worth knowing before changing the engine:
      project-wide search; the installer's `.dbrproj` association is built but not installed or
      tried.
 
+## 0.4.0
+
+New modules in `crates/dunbrec-app/src`:
+
+| Module | Role |
+|---|---|
+| `settings_ui.rs` | File > Settings dialog, one page per category (Appearance: theme and text size; Assistant: provider, models, context size, Claude key). Choices apply at once |
+| `ai.rs` | Providers: Ollama (`/api/chat`, `/api/tags`) and Claude (`/v1/messages`, `/v1/models`). Requests are built and replies parsed by plain functions (tested without a network); the HTTP runs on a worker thread (`ureq`) and streams `Event`s back. `AiSettings` is in `Settings`; the **Claude API key lives in the Windows Credential Manager** (`keyring`, entry `Dunbrec` / `claude-api-key`), never in the settings file |
+| `assistant.rs` | The Assistant panel (`Pane::Assistant`, a tab beside Properties): chat, Enter sends (Shift+Enter newline), replies stream in. Builds the system prompt (instructions, the circuit as SPICE, Checks, firmware, live readings) fresh for each question. Draws suggested changes as cards |
+| `edits.rs` | Suggested changes and applying them: `Edit::{Set, File, Add, Remove}`. `dunbrec-set` blocks (`R2 = 1k`, `RV1.wiper = 0.5`, `SW1 = closed`), `dunbrec-file NAME` blocks (whole new file, shown as a diff) |
+| `part_edits.rs` | `dunbrec-add` (`R5 resistor 10k VOUT 0`: designator, kind, value, then a net per pin in pin order; `0` is ground) and `dunbrec-remove` blocks. The `KINDS` table drives parsing, the pin-order help given to the model, and a test, so they cannot disagree |
+| `float.rs` | `float::window`: an instrument as an inline window or, popped out, a real OS window. `dock_all`, `any_popped`; the popped state is egui persisted data keyed `("popped", title)` |
+| `dialog.rs` | Message boxes, and `unsaved_changes` (see Decisions) |
+
+How the assistant works (the rules worth keeping):
+
+- **It only talks, plus cards.** Nothing changes until the user presses Apply on a card. Apply is
+  one undo step and all-or-nothing; an edit that cannot be made leaves the document untouched.
+  Apply is disabled while the answer is still streaming.
+- **Context per question:** SPICE export (or a parts list when the circuit has digital parts or
+  errors), Checks, firmware sources (each capped), live readings (running simulation snapshot or
+  DC point, ignored if older than the last edit; serial tail; oscilloscope channels from the
+  captured sweep; multimeter; the paused MCU's registers when the debugger window is open and not
+  stale). Readings are built lazily on send (`assistant_readings`, `instrument_sections` in
+  `app.rs`).
+- **Adding parts** (`part_edits.rs`): a two-pin part between existing nets is *drawn beside them
+  with real right-angle wires*: candidate positions and rotations near the closest points on each
+  net (pins, wire ends, points along wires, the existing ground symbol) are scored by wire length
+  and crossings, rejected if they run through parts or along wires, then the best few are checked
+  electrically. Anything else is laid out below the drawing with stubs and net labels
+  (`dunbrec_io::layout`); a net the circuit never named first gets a label on one of its pins.
+  **Every addition is verified** against the netlist (each new pin on the requested net; no
+  existing net joined or split) or nothing changes. Removal deletes the part and the stubs or
+  ground drawn for it; wires the user drew stay.
+- **Parts it cannot add:** controlled sources, CD4066, microcontrollers, discrete LEDs (there is
+  no such part; only the logic LED).
+
+Other 0.4.0 behaviour:
+
+- **Code panel.** One tab per source file of the open circuit (`CodeEditor::tabs`), each with its
+  own text and scroll state (ids keyed by file name). "＋ New…" on a saved circuit creates the
+  file **on disk at once** (like the Project panel) and lists it in the project if the circuit is
+  in it; an Untitled circuit keeps it in memory until first save. The panel says where the file
+  is, or that it is not on disk yet.
+- **Projects.** Closing a project, or switching to another, also closes the open circuit if the
+  project lists it (and with it its source tabs), asking the unsaved-changes question first;
+  a circuit the project does not list stays open (`circuit_belongs_to`, `leaves_circuit`).
+  Deleting the open circuit's file asks about unsaved changes, then the delete, then closes it
+  (blank Untitled circuit).
+- **There is always a document.** With nothing open you see a blank "Untitled" circuit (File >
+  New does the same). A real "no document" state was considered and rejected as too invasive.
+
 ## Gotchas
 
 - Running the release exe locks `target\release\dunbrec.exe`. Close the app before rebuilding.
 - At 2.5 V an ADC input reads 511 or 512 depending on source impedance (pin leakage). Tests
   accept both.
 - When scripting file edits from Git Bash, heredocs can turn `\r\n` and `\` line
-  continuations into literal characters. Prefer direct file edits for strings with escapes.
+  continuations into literal characters. Prefer direct file edits for strings with escapes. In a
+  Python script, a single `\` at the end of a line inside a normal string is a continuation and
+  silently joins the lines, which is how stray runs of spaces got into a Rust string once.
+- Rebuilding while the app is running fails (the exe is locked). Close it normally first, so the
+  unsaved-changes prompt still appears; do not kill it.

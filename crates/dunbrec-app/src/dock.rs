@@ -103,6 +103,13 @@ pub fn close(dock: &mut DockState<Pane>, pane: Pane) {
     }
 }
 
+/// Bring `pane`'s tab to the front of its tab group, if it is open.
+pub fn bring_to_front(dock: &mut DockState<Pane>, pane: Pane) {
+    if let Some(at) = dock.find_tab(&pane) {
+        dock.set_active_tab(at);
+    }
+}
+
 /// Add `pane` where it belongs by default. A panel that is already open is
 /// left where the user put it.
 pub fn open(dock: &mut DockState<Pane>, pane: Pane) {
@@ -270,6 +277,32 @@ mod tests {
             leaf_of(&dock, Pane::Schematic),
             leaf_of(&dock, Pane::Properties)
         );
+    }
+
+    /// Which tab of `pane`'s group is in front.
+    fn front_of(dock: &DockState<Pane>, pane: Pane) -> usize {
+        let (surface, node, _) = dock.find_tab(&pane).expect("pane is open");
+        match &dock[surface][node] {
+            Node::Leaf(leaf) => leaf.active.0,
+            _ => panic!("a pane sits in a leaf"),
+        }
+    }
+
+    #[test]
+    fn bringing_a_tab_to_the_front_shows_it_over_its_neighbour() {
+        let mut dock = default_layout();
+        open(&mut dock, Pane::Code); // a tab beside the schematic
+        let code = dock.find_tab(&Pane::Code).unwrap();
+        let schematic = dock.find_tab(&Pane::Schematic).unwrap();
+        assert_eq!((code.0, code.1), (schematic.0, schematic.1), "same group");
+        bring_to_front(&mut dock, Pane::Code);
+        assert_eq!(front_of(&dock, Pane::Schematic), code.2.0);
+        // Opening a circuit brings the schematic back in front of the code.
+        bring_to_front(&mut dock, Pane::Schematic);
+        assert_eq!(front_of(&dock, Pane::Schematic), schematic.2.0);
+        // A pane that is not open is left alone.
+        close(&mut dock, Pane::Code);
+        bring_to_front(&mut dock, Pane::Code);
     }
 
     #[test]

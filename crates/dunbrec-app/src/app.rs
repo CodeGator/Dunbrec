@@ -65,6 +65,15 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("Mouse wheel / middle drag", "Zoom / pan"),
 ];
 
+/// Which project to go to when the user changes projects.
+#[derive(Debug, Clone, PartialEq)]
+enum ProjectTarget {
+    /// An existing project file.
+    Open(PathBuf),
+    /// A new project, at this file.
+    Create(PathBuf),
+}
+
 /// Something that would discard unsaved changes, waiting for confirmation.
 #[derive(Debug, Clone, PartialEq)]
 enum Pending {
@@ -76,6 +85,8 @@ enum Pending {
     ImportKicad,
     /// Close the project, and with it the circuit that belongs to it.
     CloseProject,
+    /// Leave the open project (and its circuit) for another one.
+    SwitchProject(ProjectTarget),
     Quit,
 }
 
@@ -316,6 +327,10 @@ impl DunbrecApp {
             }
             Pending::ImportSpice | Pending::ImportKicad => self.import(action),
             Pending::CloseProject => self.close_project(),
+            Pending::SwitchProject(to) => {
+                self.close_project();
+                self.go_to_project(to);
+            }
             Pending::Quit => {
                 self.allow_close = true;
             }
@@ -450,6 +465,8 @@ impl DunbrecApp {
         self.canvas.selection.clear();
         self.canvas.cancel();
         self.dc = None;
+        // A circuit that is opened is shown, not the Code tab beside it.
+        dock::bring_to_front(&mut self.dock, Pane::Schematic);
     }
 
     fn save(&mut self, ask: bool) -> bool {
@@ -552,7 +569,7 @@ impl DunbrecApp {
             .add_filter("Dunbrec project", &[project::EXTENSION])
             .pick_file()
         {
-            self.open_project_and_schematic(&file);
+            self.switch_project(ProjectTarget::Open(file));
         }
     }
 
@@ -568,14 +585,35 @@ impl DunbrecApp {
         else {
             return;
         };
-        match Project::create(&file) {
-            Ok((project, first)) => {
-                self.show_project(project);
-                self.request(Pending::OpenPath(first));
-            }
-            Err(e) => {
-                self.message = Some(Message::error("Could not create the project", e));
-            }
+        self.switch_project(ProjectTarget::Create(file));
+    }
+
+    /// Go to another project. The circuit of the project that is open now
+    /// goes too, so nothing of the old project stays open; if it has
+    /// unsaved changes the user is asked about them first.
+    fn switch_project(&mut self, to: ProjectTarget) {
+        let target = match &to {
+            ProjectTarget::Open(file) | ProjectTarget::Create(file) => file,
+        };
+        if leaves_circuit(self.project.as_ref(), self.doc.path(), target) {
+            self.request(Pending::SwitchProject(to));
+        } else {
+            self.go_to_project(to);
+        }
+    }
+
+    fn go_to_project(&mut self, to: ProjectTarget) {
+        match to {
+            ProjectTarget::Open(file) => self.open_project_and_schematic(&file),
+            ProjectTarget::Create(file) => match Project::create(&file) {
+                Ok((project, first)) => {
+                    self.show_project(project);
+                    self.request(Pending::OpenPath(first));
+                }
+                Err(e) => {
+                    self.message = Some(Message::error("Could not create the project", e));
+                }
+            },
         }
     }
 
@@ -585,7 +623,7 @@ impl DunbrecApp {
         match command {
             C::NewProject => self.new_project(),
             C::OpenProject => self.pick_and_open_project(),
-            C::OpenProjectPath(root) => self.open_project_and_schematic(&root),
+            C::OpenProjectPath(root) => self.switch_project(ProjectTarget::Open(root)),
             C::CloseProject => {
                 // A circuit of the project goes with it, so ask first if it
                 // has unsaved changes; one that is not part of it stays.
@@ -2006,6 +2044,16 @@ fn circuit_belongs_to(project: Option<&Project>, circuit: Option<&std::path::Pat
     matches!((project, circuit), (Some(p), Some(c)) if p.contains(c))
 }
 
+/// Whether going to the project file `target` leaves the open circuit
+/// behind: it belongs to the project that is open, which is a different one.
+fn leaves_circuit(
+    open: Option<&Project>,
+    circuit: Option<&std::path::Path>,
+    target: &std::path::Path,
+) -> bool {
+    circuit_belongs_to(open, circuit) && open.is_some_and(|p| !project::path_eq(&p.file, target))
+}
+
 /// What the circuit is doing, for the assistant: the running simulation if
 /// there is one for this circuit, else the DC point, plus serial output.
 fn assistant_readings(
@@ -2527,6 +2575,32 @@ mod tests {
         ));
         assert!(!circuit_belongs_to(Some(&project), None));
         assert!(!circuit_belongs_to(None, Some(&circuit)));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn changing_project_leaves_the_circuit_only_for_a_different_project() {
+        let dir = std::env::temp_dir().join(format!("dunbrec-switch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (project, circuit) = Project::create(&dir.join("A")).unwrap();
+        let other = dir.join("B.dbrproj");
+        // Another project: the open circuit of A is left behind.
+        assert!(leaves_circuit(Some(&project), Some(&circuit), &other));
+        // The same project again keeps it.
+        assert!(!leaves_circuit(
+            Some(&project),
+            Some(&circuit),
+            &project.file
+        ));
+        // A circuit that is not A's, an unsaved one, or no project: nothing to leave.
+        assert!(!leaves_circuit(
+            Some(&project),
+            Some(&dir.join("x.dbr")),
+            &other
+        ));
+        assert!(!leaves_circuit(Some(&project), None, &other));
+        assert!(!leaves_circuit(None, Some(&circuit), &other));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
