@@ -1388,6 +1388,18 @@ impl DunbrecApp {
         let mut project_command = None;
         let mut open_settings = false;
         let title = self.doc.display_name();
+        let generation = self.doc.generation();
+        let live_is_current = running && self.live_generation == generation;
+        let readings = || {
+            assistant_readings(
+                &self.netlist.1,
+                &self.latest,
+                live_is_current,
+                &self.dc,
+                generation,
+                &self.serial,
+            )
+        };
         let mut viewer = PaneViewer {
             doc: &mut self.doc,
             canvas: &mut self.canvas,
@@ -1399,6 +1411,7 @@ impl DunbrecApp {
             netlist: &self.netlist.1,
             dc: &self.dc,
             latest: &self.latest,
+            readings: &readings,
             running,
             annotations,
             markers: &markers,
@@ -1795,6 +1808,58 @@ impl DunbrecApp {
     }
 }
 
+/// What the circuit is doing, for the assistant: the running simulation if
+/// there is one for this circuit, else the DC point, plus serial output.
+fn assistant_readings(
+    netlist: &Netlist,
+    latest: &Option<Sample>,
+    running: bool,
+    dc: &Option<DcResults>,
+    generation: u64,
+    serial: &SerialMonitor,
+) -> crate::assistant::Readings {
+    let mut r = crate::assistant::Readings {
+        heading: "The simulation is not running and no DC point is calculated, so there \
+                  are no readings."
+            .into(),
+        serial: serial.tails(1500),
+        ..Default::default()
+    };
+    match (latest, dc) {
+        (Some(sample), _) if running => {
+            r.heading = format!(
+                "The simulation is running; this is a snapshot at t = {}.",
+                format_value(sample.time, "s")
+            );
+            let unused = netlist.unused_io_nets();
+            for (i, node) in netlist.nodes.iter().enumerate().skip(1) {
+                if let (false, Some(v)) = (unused.contains(&NodeId(i)), sample.voltages.get(i)) {
+                    r.voltages.push((node.name.clone(), *v));
+                }
+            }
+            for (e, i) in netlist.elements.iter().zip(&sample.currents) {
+                r.currents.push((e.designator.clone(), *i));
+            }
+        }
+        (
+            _,
+            Some(DcResults {
+                outcome: Ok(t),
+                generation: g,
+            }),
+        ) if *g == generation => {
+            r.heading = "The simulation is not running; this is the DC operating point.".into();
+            r.voltages = t.voltages.clone();
+            r.currents = t.currents.clone();
+            for w in &t.warnings {
+                r.heading.push_str(&format!("\nWarning: {w}"));
+            }
+        }
+        _ => {}
+    }
+    r
+}
+
 /// Explain a netlist problem in a sentence.
 pub(crate) fn describe_diagnostic(schematic: &Schematic, d: &Diagnostic) -> String {
     let name = |id| {
@@ -2067,6 +2132,8 @@ struct PaneViewer<'a> {
     netlist: &'a Netlist,
     dc: &'a Option<DcResults>,
     latest: &'a Option<Sample>,
+    /// What the assistant is told the circuit is doing.
+    readings: &'a dyn Fn() -> crate::assistant::Readings,
     running: bool,
     annotations: &'a [Annotation],
     markers: &'a [Marker],
@@ -2131,9 +2198,15 @@ impl TabViewer for PaneViewer<'_> {
                     title: self.title,
                     schematic: self.doc.schematic(),
                     netlist: self.netlist,
+                    readings: self.readings,
                 };
-                if self.assistant.show(ui, &view).is_some() {
-                    *self.open_settings = true;
+                match self.assistant.show(ui, &view) {
+                    Some(crate::assistant::Command::OpenSettings) => *self.open_settings = true,
+                    Some(crate::assistant::Command::Apply { key, edit }) => {
+                        let result = crate::edits::apply(self.doc, &edit);
+                        self.assistant.record(key, result);
+                    }
+                    None => {}
                 }
             }
             Pane::Retired => {}

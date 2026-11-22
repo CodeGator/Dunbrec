@@ -18,6 +18,7 @@ mod debugger_ui;
 mod dialog;
 mod dock;
 mod document;
+mod edits;
 mod examples;
 mod float;
 mod instruments_ui;

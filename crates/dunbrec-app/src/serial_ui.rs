@@ -55,6 +55,20 @@ impl SerialMonitor {
         }
     }
 
+    /// The last `max` characters of each microcontroller's output.
+    pub fn tails(&self, max: usize) -> Vec<(String, String)> {
+        self.logs
+            .iter()
+            .filter(|(_, log)| !log.is_empty())
+            .map(|(name, log)| {
+                let start = (log.len().saturating_sub(max)..=log.len())
+                    .find(|&i| log.is_char_boundary(i))
+                    .unwrap_or(log.len());
+                (name.clone(), log[start..].to_string())
+            })
+            .collect()
+    }
+
     #[cfg(test)]
     pub fn text(&self, designator: &str) -> Option<&str> {
         self.logs.get(designator).map(|s| s.as_str())
