@@ -8,6 +8,30 @@
 
 use egui::{Align, Context, Id, Layout, Pos2, Ui, ViewportBuilder, ViewportId};
 
+/// The instruments that can be popped out, by window title.
+pub const OSCILLOSCOPE: &str = "Oscilloscope";
+pub const MULTIMETER: &str = "Multimeter";
+pub const LOGIC_ANALYSER: &str = "Logic analyser";
+pub const BODE_PLOTTER: &str = "Bode plotter";
+pub const DC_TRANSFER: &str = "DC transfer";
+pub const CURVE_TRACER: &str = "Curve tracer";
+pub const FUNCTION_GENERATOR: &str = "Function generator";
+pub const MCU_DEBUGGER: &str = "MCU debugger";
+pub const SERIAL_MONITOR: &str = "Serial monitor";
+
+/// Every instrument above.
+pub const ALL: [&str; 9] = [
+    OSCILLOSCOPE,
+    MULTIMETER,
+    LOGIC_ANALYSER,
+    BODE_PLOTTER,
+    DC_TRANSFER,
+    CURVE_TRACER,
+    FUNCTION_GENERATOR,
+    MCU_DEBUGGER,
+    SERIAL_MONITOR,
+];
+
 /// How an instrument's window starts out.
 pub struct Spec {
     pub title: &'static str,
@@ -25,6 +49,21 @@ fn popped_key(title: &str) -> Id {
 pub fn is_popped(ctx: &Context, title: &str) -> bool {
     ctx.data_mut(|d| d.get_persisted::<bool>(popped_key(title)))
         .unwrap_or(false)
+}
+
+/// Whether any instrument is in a window of its own.
+pub fn any_popped(ctx: &Context) -> bool {
+    ALL.iter().any(|title| is_popped(ctx, title))
+}
+
+/// Bring every popped-out instrument back inside the main window: the way
+/// out if one ever misbehaves as a window of its own.
+pub fn dock_all(ctx: &Context) {
+    for title in ALL {
+        if is_popped(ctx, title) {
+            ctx.data_mut(|d| d.insert_persisted(popped_key(title), false));
+        }
+    }
 }
 
 /// Draw the instrument while `open` is true. Closing the window, either
@@ -138,6 +177,24 @@ mod tests {
         });
         assert_eq!(drawn, 1);
         assert!(open);
+    }
+
+    #[test]
+    fn docking_all_brings_every_popped_out_instrument_back() {
+        let ctx = Context::default();
+        assert!(!any_popped(&ctx));
+        for title in ALL {
+            ctx.data_mut(|d| d.insert_persisted(popped_key(title), true));
+        }
+        assert!(any_popped(&ctx));
+        assert!(is_popped(&ctx, OSCILLOSCOPE));
+        dock_all(&ctx);
+        assert!(!any_popped(&ctx));
+        // Every title is distinct, so docking one cannot dock another.
+        let mut titles = ALL.to_vec();
+        titles.sort();
+        titles.dedup();
+        assert_eq!(titles.len(), ALL.len());
     }
 
     #[test]

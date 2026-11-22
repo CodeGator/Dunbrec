@@ -31,8 +31,8 @@ use std::collections::{HashMap, HashSet};
 
 use dunbrec_core::units::{format_value, parse_eng};
 use dunbrec_core::{
-    ComponentId, ComponentKind as K, ModelKind, ModelLibrary, Netlist, NodeId, Point, Polarity,
-    Rotation, Schematic, Waveform, build_netlist,
+    ComponentId, ComponentKind as K, DEFAULT_LOGIC_DELAY, GateOp, ModelKind, ModelLibrary, Netlist,
+    NodeId, OPAMP_PARTS, Point, Polarity, Rotation, Schematic, Waveform, build_netlist,
 };
 use dunbrec_io::layout::{self, Part, STUB, is_ground, outward};
 
@@ -138,8 +138,53 @@ pub fn parse_remove(body: &str) -> Result<Vec<String>, String> {
     Ok(names)
 }
 
-const KINDS: &str = "resistor, capacitor, inductor, potentiometer, switch, vsource, isource, \
-                     diode, npn, pnp, nmos, pmos";
+/// The parts that can be added: the word that names each, a value that is
+/// valid for it, and what the value means. The assistant is told this list,
+/// with the pin order read from the real part, so the two cannot disagree.
+const KINDS: &[(&str, &str, &str)] = &[
+    ("resistor", "1k", "ohms"),
+    ("capacitor", "100n", "farads"),
+    ("inductor", "1m", "henries"),
+    ("potentiometer", "10k", "total ohms"),
+    ("switch", "open", "open or closed"),
+    ("vsource", "5", "DC volts"),
+    ("isource", "1m", "DC amps"),
+    ("diode", "generic", "generic, or a model such as 1N4148"),
+    ("npn", "generic", "generic, or 2N3904"),
+    ("pnp", "generic", "generic, or 2N3906"),
+    ("nmos", "generic", "generic"),
+    ("pmos", "generic", "generic"),
+    ("opamp", "uA741", "the part (uA741)"),
+    ("timer555", "default", "the word default"),
+    ("and", "default", "default, or a delay such as 10n"),
+    ("or", "default", "default, or a delay such as 10n"),
+    ("nand", "default", "default, or a delay such as 10n"),
+    ("nor", "default", "default, or a delay such as 10n"),
+    ("xor", "default", "default, or a delay such as 10n"),
+    ("xnor", "default", "default, or a delay such as 10n"),
+    ("not", "default", "default, or a delay such as 10n"),
+    ("dff", "default", "default, or a delay such as 10n"),
+    ("counter4", "default", "default, or a delay such as 10n"),
+    ("clock", "1k", "frequency in hertz"),
+    ("logicswitch", "low", "low or high"),
+    ("logicled", "default", "the word default"),
+];
+
+/// The kinds, values and pin orders, one per line, for the assistant.
+pub fn help() -> String {
+    KINDS
+        .iter()
+        .filter_map(|(word, example, meaning)| {
+            let (kind, _) = build_kind(word, example).ok()?;
+            let pins: Vec<&str> = kind.pins().iter().map(|p| p.name).collect();
+            Some(format!(
+                "- {word}: value is {meaning}; pins in order: {}",
+                pins.join(" ")
+            ))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 
 fn build_kind(word: &str, value: &str) -> Result<(K, String), String> {
     let number = || parse_eng(value).map_err(|e| e.to_string());
@@ -268,8 +313,101 @@ fn build_kind(word: &str, value: &str) -> Result<(K, String), String> {
                 format!("{word} {model}"),
             )
         }
-        other => return Err(format!("“{other}” is not a part I can add. Use: {KINDS}.")),
+        "opamp" => {
+            let canonical = dunbrec_core::schematic::opamp_subckt(value).map(|(name, _)| name);
+            let part = OPAMP_PARTS
+                .iter()
+                .find(|p| {
+                    canonical.is_some()
+                        && dunbrec_core::schematic::opamp_subckt(p).map(|(name, _)| name)
+                            == canonical
+                })
+                .ok_or_else(|| format!("there is no op-amp called {value}; use uA741."))?;
+            (
+                K::OpAmp {
+                    part: part.to_string(),
+                },
+                format!("op-amp {part}"),
+            )
+        }
+        "timer555" => (K::Timer555, "555 timer".to_string()),
+        "and" | "or" | "nand" | "nor" | "xor" | "xnor" => {
+            let op = match word {
+                "and" => GateOp::And,
+                "or" => GateOp::Or,
+                "nand" => GateOp::Nand,
+                "nor" => GateOp::Nor,
+                "xor" => GateOp::Xor,
+                _ => GateOp::Xnor,
+            };
+            (
+                K::Gate {
+                    op,
+                    delay: logic_delay(value)?,
+                },
+                format!("{} gate", word.to_ascii_uppercase()),
+            )
+        }
+        "not" => (
+            K::Inverter {
+                delay: logic_delay(value)?,
+            },
+            "inverter".to_string(),
+        ),
+        "dff" => (
+            K::DFlipFlop {
+                delay: logic_delay(value)?,
+            },
+            "D flip-flop".to_string(),
+        ),
+        "counter4" => (
+            K::Counter4 {
+                delay: logic_delay(value)?,
+            },
+            "4-bit counter".to_string(),
+        ),
+        "clock" => {
+            let f = positive()?;
+            (
+                K::Clock {
+                    frequency: f,
+                    duty: 0.5,
+                },
+                format!("clock {}", format_value(f, "Hz")),
+            )
+        }
+        "logicswitch" => {
+            let high = match value.to_ascii_lowercase().as_str() {
+                "high" => true,
+                "low" => false,
+                _ => return Err("a logic switch is either low or high.".into()),
+            };
+            (
+                K::LogicSwitch { high },
+                format!("logic switch, {}", value.to_ascii_lowercase()),
+            )
+        }
+        "logicled" => (K::LogicLed, "logic LED".to_string()),
+        other => {
+            let words: Vec<&str> = KINDS.iter().map(|k| k.0).collect();
+            return Err(format!(
+                "“{other}” is not a part I can add. Use: {}.",
+                words.join(", ")
+            ));
+        }
     })
+}
+
+/// The delay of a logic part: the word `default`, or seconds.
+fn logic_delay(value: &str) -> Result<f64, String> {
+    if value.eq_ignore_ascii_case("default") {
+        return Ok(DEFAULT_LOGIC_DELAY);
+    }
+    match parse_eng(value) {
+        Ok(v) if v > 0.0 && v.is_finite() => Ok(v),
+        Ok(_) => Err("the delay must be above zero.".into()),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 /// The library's spelling of the model `value` (or the generic model for
@@ -1051,6 +1189,55 @@ mod tests {
             let e = parse_add(text).unwrap_err();
             assert!(e.contains(needle), "{text}: {e}");
         }
+    }
+
+    #[test]
+    fn every_listed_kind_builds_and_the_help_names_its_pins() {
+        let mut words: Vec<&str> = KINDS.iter().map(|k| k.0).collect();
+        for (word, example, _) in KINDS {
+            assert!(build_kind(word, example).is_ok(), "{word} {example}");
+        }
+        words.sort();
+        words.dedup();
+        assert_eq!(words.len(), KINDS.len(), "each word once");
+        let help = help();
+        assert_eq!(help.lines().count(), KINDS.len());
+        assert!(
+            help.contains("- opamp: value is the part (uA741); pins in order: in+ in- V+ V- out")
+        );
+        assert!(help.contains("- npn:") && help.contains("C B E"), "{help}");
+        assert!(
+            help.contains("- dff:") && help.contains("D CLK Q QN"),
+            "{help}"
+        );
+    }
+
+    #[test]
+    fn logic_and_ic_lines_are_read() {
+        let p = parse_add(
+            "U1 opamp 741 INP INN VCC VEE OUT\nU2 timer555 default 0 TR OUT RS CT TH DIS VCC\n\
+             G1 nand 10n A B Y\nFF1 dff default D CLK Q QN\nCK1 clock 1k CLK\nSW9 logicswitch high D",
+        )
+        .unwrap();
+        assert_eq!(p.len(), 6);
+        assert!(matches!(&p[0].kind, K::OpAmp { part } if part == "uA741"));
+        assert!(
+            matches!(p[2].kind, K::Gate { op: GateOp::Nand, delay } if (delay - 10e-9).abs() < 1e-15)
+        );
+        assert_eq!(p[3].nets.len(), 4);
+        assert!(parse_add("U1 opamp 9999 A B C D E").is_err());
+        assert!(parse_add("G1 nand -1 A B Y").is_err());
+        assert!(parse_add("S1 logicswitch maybe A").is_err());
+    }
+
+    #[test]
+    fn an_op_amp_is_added_on_labels_and_joins_its_nets() {
+        let mut s = divider();
+        let parts = parse_add("U1 opamp uA741 VOUT FB VCC VEE OUTX").unwrap();
+        add_parts(&mut s, &parts).unwrap();
+        assert_eq!(node_of(&s, "U1", 0), "VOUT");
+        assert_eq!(node_of(&s, "U1", 4), "OUTX");
+        assert_eq!(node_of(&s, "R1", 1), "VOUT");
     }
 
     #[test]

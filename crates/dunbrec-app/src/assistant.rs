@@ -64,12 +64,10 @@ R5 resistor 10k VOUT 0
 C3 capacitor 100n VOUT 0
 Q2 npn 2N3904 NODEC NODEB 0
 ```
-Kinds, values and pin order: resistor, capacitor, inductor (value in engineering units; \
-pins p n); potentiometer (total resistance; pins A B W); switch (open or closed; pins p n); \
-vsource and isource (DC value; pins + - and in out); diode (generic or a model such as \
-1N4148; pins A K); npn and pnp (generic or 2N3904 / 2N3906; pins C B E); nmos and pmos \
-(generic; pins D G S). Choose designators that are not already in use. Nothing else can \
-be added this way (no LEDs, logic, op-amps or microcontrollers), so describe those in \
+Kinds, what the value means, and the order of the pins (list the nets in that order):
+{PARTS}
+Choose designators that are not already in use. Controlled sources, the CD4066 and \
+microcontrollers cannot be added this way, nor can discrete LEDs, so describe those in \
 words. A two-pin part between nets that already exist is drawn beside them with real \
 wires; any other part goes below the drawing, joined by net labels.
 
@@ -88,6 +86,8 @@ pub struct Readings {
     pub currents: Vec<(String, f64)>,
     /// The latest serial output of each microcontroller.
     pub serial: Vec<(String, String)>,
+    /// What the open instruments show: (heading, lines).
+    pub sections: Vec<(String, Vec<String>)>,
 }
 
 /// Most values listed, so a big circuit cannot flood the question.
@@ -111,6 +111,13 @@ impl Readings {
                 "\nSerial output of {mcu} (most recent):\n{text}\n"
             ));
         }
+        for (heading, lines) in &self.sections {
+            out.push_str(&format!("\n{heading}:\n"));
+            for line in lines {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
         out
     }
 }
@@ -122,7 +129,10 @@ pub fn build_system_prompt(
     netlist: &Netlist,
     readings: &Readings,
 ) -> String {
-    let mut out = format!("{INSTRUCTIONS}\n\n# Document: {title}\n\n");
+    let mut out = format!(
+        "{}\n\n# Document: {title}\n\n",
+        INSTRUCTIONS.replace("{PARTS}", &part_edits::help())
+    );
 
     out.push_str("## Circuit\n\n");
     if schematic.components.is_empty() {
@@ -782,6 +792,12 @@ mod tests {
         assert!(p.contains("# Document: Untitled"));
         assert!(p.contains("empty schematic"));
         assert!(p.contains("## Live readings"));
+        // The list of parts the assistant may add, with real pin orders, is in it.
+        assert!(
+            p.contains("- opamp:") && p.contains("in+ in- V+ V- out"),
+            "{p}"
+        );
+        assert!(!p.contains("{PARTS}"));
     }
 
     #[test]
@@ -791,8 +807,10 @@ mod tests {
             voltages: vec![("VOUT".into(), 0.909)],
             currents: vec![("R1".into(), 0.00909)],
             serial: vec![("U1".into(), "hello".into())],
+            sections: vec![("Oscilloscope".into(), vec!["Channel 1: rms 5 V".into()])],
         };
         let t = r.to_text();
+        assert!(t.contains("Oscilloscope:\nChannel 1: rms 5 V"), "{t}");
         assert!(t.starts_with("Simulation running"));
         assert!(t.contains("V(VOUT) = 909"), "{t}");
         assert!(t.contains("I(R1) = 9.09"), "{t}");

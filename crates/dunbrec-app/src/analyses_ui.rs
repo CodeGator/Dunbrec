@@ -43,7 +43,7 @@ impl Analyses {
         if self.show_bode {
             let mut open = true;
             let spec = Spec {
-                title: "Bode plotter",
+                title: float::BODE_PLOTTER,
                 size: [560.0, 520.0],
                 resizable: true,
                 pos: None,
@@ -56,7 +56,7 @@ impl Analyses {
         if self.show_transfer {
             let mut open = true;
             let spec = Spec {
-                title: "DC transfer",
+                title: float::DC_TRANSFER,
                 size: [520.0, 400.0],
                 resizable: true,
                 pos: None,
@@ -69,7 +69,7 @@ impl Analyses {
         if self.show_tracer {
             let mut open = true;
             let spec = Spec {
-                title: "Curve tracer",
+                title: float::CURVE_TRACER,
                 size: [520.0, 440.0],
                 resizable: true,
                 pos: None,
@@ -80,7 +80,7 @@ impl Analyses {
         if self.show_fgen {
             let mut open = true;
             let spec = Spec {
-                title: "Function generator",
+                title: float::FUNCTION_GENERATOR,
                 size: [320.0, 240.0],
                 resizable: false,
                 pos: None,

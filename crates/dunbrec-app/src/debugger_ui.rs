@@ -399,6 +399,47 @@ impl Debugger {
         true
     }
 
+    /// What the assistant is told about the microcontroller the debugger is
+    /// showing: only while the simulation is paused and the window has
+    /// fetched its state since (otherwise the registers would be old).
+    pub fn summary(&self, paused: bool) -> Option<Vec<String>> {
+        if !paused || !self.show || self.stale {
+            return None;
+        }
+        let mcu = self.mcus.get(self.selected)?;
+        let snap = &self.stopped.as_ref()?.snapshot;
+        let flags: String = "CZNVSHTI"
+            .chars()
+            .enumerate()
+            .filter(|(bit, _)| snap.sreg & (1 << bit) != 0)
+            .map(|(_, c)| c)
+            .collect();
+        let mut lines = vec![format!(
+            "{} is paused: PC = 0x{:04X} (word address), SP = 0x{:04X}, SREG = 0x{:02X} \
+                 (flags set: {}), cycle {}, sleeping: {}.",
+            mcu.designator,
+            snap.pc,
+            snap.sp,
+            snap.sreg,
+            if flags.is_empty() { "none" } else { &flags },
+            snap.cycle,
+            if snap.sleeping { "yes" } else { "no" },
+        )];
+        for (row, chunk) in snap.regs.chunks(8).enumerate() {
+            let values: Vec<String> = chunk.iter().map(|r| format!("{r:02X}")).collect();
+            lines.push(format!(
+                "r{}..r{}: {}",
+                row * 8,
+                row * 8 + 7,
+                values.join(" ")
+            ));
+        }
+        if let Some(fault) = &snap.fault {
+            lines.push(format!("Fault: {fault}"));
+        }
+        Some(lines)
+    }
+
     // ------------------------------------------------------------ window ---
 
     /// Draw the window if it is open.
@@ -409,7 +450,7 @@ impl Debugger {
         let mut action = Action::None;
         let mut open = true;
         let spec = Spec {
-            title: "MCU debugger",
+            title: float::MCU_DEBUGGER,
             size: [640.0, 620.0],
             resizable: true,
             pos: None,

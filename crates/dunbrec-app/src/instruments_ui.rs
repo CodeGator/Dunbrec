@@ -360,7 +360,7 @@ impl Bench {
         let mut result = (false, false);
         let mut open = self.show_scope;
         let spec = Spec {
-            title: "Oscilloscope",
+            title: float::OSCILLOSCOPE,
             size: [520.0, 520.0],
             resizable: true,
             // Top right, over the properties panel, leaving the schematic clear.
@@ -549,7 +549,7 @@ impl Bench {
         let mut probe_clicked = false;
         let mut open = self.show_meter;
         let spec = Spec {
-            title: "Multimeter",
+            title: float::MULTIMETER,
             size: [300.0, 220.0],
             resizable: false,
             pos: Some(ctx.content_rect().left_bottom() + vec2(150.0, -440.0)),
@@ -734,7 +734,7 @@ impl Bench {
         let mut probe_clicked = false;
         let mut open = self.show_logic;
         let spec = Spec {
-            title: "Logic analyser",
+            title: float::LOGIC_ANALYSER,
             size: [560.0, 420.0],
             resizable: true,
             pos: None,

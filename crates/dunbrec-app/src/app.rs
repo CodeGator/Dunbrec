@@ -201,7 +201,7 @@ impl DunbrecApp {
         initial: Option<(Schematic, Option<PathBuf>)>,
         initial_project: Option<PathBuf>,
     ) -> Self {
-        let mut settings: Settings = cc
+        let settings: Settings = cc
             .storage
             .and_then(|s| eframe::get_value(s, STORAGE_KEY))
             .unwrap_or_default();
@@ -228,16 +228,9 @@ impl DunbrecApp {
         let netlist = build_netlist(doc.schematic());
         let node_map = NodeMap::new(doc.schematic(), &netlist);
         let tags = node_tag_positions(doc.schematic(), &netlist);
-        let project = match settings.project.clone() {
-            Some(file) => match Project::open(&file) {
-                Ok(p) => Some(p),
-                Err(_) => {
-                    settings.forget_project(&file);
-                    None
-                }
-            },
-            None => None,
-        };
+        // No project is open until the user opens one: the last one is not
+        // reopened, so an open project is never a surprise.
+        let project: Option<Project> = None;
         let mut app = Self {
             project,
             project_panel: ProjectPanel,
@@ -580,7 +573,6 @@ impl DunbrecApp {
             C::OpenProjectPath(root) => self.open_project_and_schematic(&root),
             C::CloseProject => {
                 self.project = None;
-                self.settings.project = None;
             }
             C::OpenSchematic(path) => self.request(Pending::OpenPath(path)),
             C::OpenSource(path) => self.open_source(&path),
@@ -1428,6 +1420,72 @@ impl DunbrecApp {
         }
     }
 
+    /// What the open instruments show, for the assistant: the oscilloscope's
+    /// channels, the multimeter, and the stopped microcontroller.
+    fn instrument_sections(&self) -> Vec<(String, Vec<String>)> {
+        let mut out = Vec::new();
+        let (s, netlist, map) = (self.doc.schematic(), &self.netlist.1, &self.node_map.1);
+        if self.bench.show_scope {
+            let mut lines = Vec::new();
+            for (i, channel) in self.bench.scope.channels.iter().enumerate() {
+                let (Some(point), true) = (self.bench.scope_probes[i], channel.enabled) else {
+                    continue;
+                };
+                // The captured screen of the oscilloscope.
+                let Some(sweep) = self.bench.scope.sweep() else {
+                    continue;
+                };
+                let Some(stats) = sweep.stats(i) else {
+                    continue;
+                };
+                let net = match map.node_at(s, netlist, point) {
+                    Some(n) if n.is_ground() => "0 (ground)".to_string(),
+                    Some(n) => netlist.nodes[n.0].name.clone(),
+                    None => "(not on a net)".to_string(),
+                };
+                let frequency = sweep
+                    .frequency(i)
+                    .map(|f| format!(", frequency {}", format_value(f, "Hz")))
+                    .unwrap_or_default();
+                lines.push(format!(
+                    "Channel {} on net {net}: min {}, max {}, mean {}, rms {}{frequency}",
+                    i + 1,
+                    format_value(stats.min, "V"),
+                    format_value(stats.max, "V"),
+                    format_value(stats.mean, "V"),
+                    format_value(stats.rms, "V"),
+                ));
+            }
+            if !lines.is_empty() {
+                out.push((
+                    format!(
+                        "Oscilloscope ({} per division, measured over the screen)",
+                        format_value(self.bench.scope.time_per_div, "s")
+                    ),
+                    lines,
+                ));
+            }
+        }
+        if self.bench.show_meter
+            && let Some(value) = self.bench.meter.reading()
+        {
+            let mode = self.bench.meter.mode;
+            out.push((
+                "Multimeter".to_string(),
+                vec![format!(
+                    "{}: {}",
+                    mode.label(),
+                    format_value(value, mode.unit())
+                )],
+            ));
+        }
+        let paused = self.live.as_ref().is_some_and(|l| l.paused);
+        if let Some(lines) = self.debugger.summary(paused) {
+            out.push(("Microcontroller (from the debugger)".to_string(), lines));
+        }
+        out
+    }
+
     /// Draw the dockable panels: schematic, palette, properties, checks and
     /// values.
     fn dock_area(&mut self, ctx: &egui::Context) {
@@ -1468,9 +1526,15 @@ impl DunbrecApp {
         let title = self.doc.display_name();
         let generation = self.doc.generation();
         let live_is_current = running && self.live_generation == generation;
+        let sections = if dock::is_open(&self.dock, Pane::Assistant) {
+            self.instrument_sections()
+        } else {
+            Vec::new()
+        };
         let readings = || {
             assistant_readings(
                 &self.netlist.1,
+                sections.clone(),
                 &self.latest,
                 live_is_current,
                 &self.dc,
@@ -1508,6 +1572,21 @@ impl DunbrecApp {
             .show(ctx, &mut viewer);
         if let Some(command) = project_command {
             self.run_project_command(command);
+        }
+        // Source files the Code panel made on disk belong to the project the
+        // circuit is in.
+        let created = self.code.take_created();
+        if !created.is_empty()
+            && let (Some(circuit), Some(project)) = (self.doc.path(), self.project.as_mut())
+            && project.contains(circuit)
+        {
+            if let Err(e) = project.add_files(&created) {
+                self.message = Some(Message::error("Could not update the project file", e));
+            }
+            project.refresh();
+        }
+        if let Some(problem) = self.code.take_problem() {
+            self.message = Some(Message::error("Could not create the file", problem));
         }
         if open_settings {
             self.settings_dialog.open();
@@ -1722,8 +1801,6 @@ impl DunbrecApp {
                         self.run_dc();
                         ui.close();
                     }
-                    ui.separator();
-                    ui.label(RichText::new("Transient & instruments: coming in phase 6").weak());
                 });
                 ui.menu_button("Instruments", |ui| {
                     ui.checkbox(&mut self.bench.show_scope, "📈 Oscilloscope");
@@ -1739,6 +1816,21 @@ impl DunbrecApp {
                     );
                     ui.checkbox(&mut self.analyses.show_transfer, "↗ DC transfer (DC sweep)");
                     ui.checkbox(&mut self.analyses.show_tracer, "〽 Curve tracer");
+                    ui.separator();
+                    if ui
+                        .add_enabled(
+                            crate::float::any_popped(ctx),
+                            egui::Button::new("Dock all instruments"),
+                        )
+                        .on_hover_text(
+                            "Bring every instrument that is in a window of its own back \
+                             inside the main window",
+                        )
+                        .clicked()
+                    {
+                        crate::float::dock_all(ctx);
+                        ui.close();
+                    }
                 });
                 ui.menu_button("View", |ui| {
                     ui.checkbox(&mut self.show_voltages, "Node voltages on the schematic");
@@ -1892,6 +1984,7 @@ impl DunbrecApp {
 /// there is one for this circuit, else the DC point, plus serial output.
 fn assistant_readings(
     netlist: &Netlist,
+    sections: Vec<(String, Vec<String>)>,
     latest: &Option<Sample>,
     running: bool,
     dc: &Option<DcResults>,
@@ -1903,6 +1996,7 @@ fn assistant_readings(
                   are no readings."
             .into(),
         serial: serial.tails(1500),
+        sections,
         ..Default::default()
     };
     match (latest, dc) {

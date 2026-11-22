@@ -82,7 +82,7 @@ impl SerialMonitor {
         }
         let mut open = true;
         let spec = Spec {
-            title: "Serial monitor",
+            title: float::SERIAL_MONITOR,
             size: [460.0, 300.0],
             resizable: true,
             pos: None,
