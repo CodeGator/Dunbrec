@@ -96,6 +96,16 @@ pub fn file_key(typed: &str, chosen: SourceLanguage) -> (String, SourceLanguage)
     }
 }
 
+/// The tab to show after `closed` is closed: the one after it, else the one
+/// before, else none.
+fn after_closing(names: &[String], closed: &str) -> Option<String> {
+    let at = names.iter().position(|n| n == closed)?;
+    names
+        .get(at + 1)
+        .or_else(|| at.checked_sub(1).and_then(|before| names.get(before)))
+        .cloned()
+}
+
 /// The name Arduino's tool should give the sketch built from the source
 /// called `name`: the file's own name without its extension.
 fn sketch_name(name: &str) -> String {
@@ -547,7 +557,8 @@ impl CodeEditor {
 
         egui::TopBottomPanel::top("code_header").show_inside(ui, |ui| {
             ui.add_space(2.0);
-            self.header(ui, doc, &names);
+            self.tabs(ui, doc, &names);
+            self.header(ui, doc);
             self.location_note(ui, doc);
             ui.add_space(2.0);
         });
@@ -769,22 +780,15 @@ impl CodeEditor {
         self.new_fresh = fresh;
     }
 
-    fn header(&mut self, ui: &mut Ui, doc: &mut Document, names: &[String]) {
+    /// One tab per source file of the circuit, with a button to add another.
+    /// Closing a tab that is a file only stops showing it here (it stays on
+    /// disk); closing one kept inside the circuit removes it. Either way
+    /// Ctrl+Z brings it back.
+    fn tabs(&mut self, ui: &mut Ui, doc: &mut Document, names: &[String]) {
+        let mut close = None;
         ui.horizontal(|ui| {
-            let mut picked = self.selected.clone();
-            egui::ComboBox::from_id_salt("code_file")
-                .selected_text(picked.as_deref().unwrap_or("(no files)"))
-                .show_ui(ui, |ui| {
-                    for n in names {
-                        ui.selectable_value(&mut picked, Some(n.clone()), n);
-                    }
-                });
-            if picked != self.selected {
-                self.selected = picked;
-                self.typing = false;
-            }
             if ui
-                .button("New…")
+                .button("＋ New…")
                 .on_hover_text("Add another source file to this schematic")
                 .clicked()
             {
@@ -792,22 +796,59 @@ impl CodeEditor {
                 self.new_name = Some(free.trim_end_matches(".asm").to_string());
                 self.new_fresh = true;
             }
+            ui.separator();
+            egui::ScrollArea::horizontal()
+                .id_salt("code_tabs")
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        for name in names {
+                            let selected = self.selected.as_deref() == Some(name.as_str());
+                            let is_file = crate::project::is_file_source(name);
+                            let tab = ui.selectable_label(selected, name);
+                            if tab.clicked() && !selected {
+                                self.selected = Some(name.clone());
+                                self.typing = false;
+                            }
+                            if tab.middle_clicked() {
+                                close = Some(name.clone());
+                            }
+                            tab.on_hover_text(if is_file {
+                                "A file beside the circuit"
+                            } else {
+                                "Kept inside the circuit file"
+                            });
+                            if ui
+                                .small_button("✕")
+                                .on_hover_text(if is_file {
+                                    "Close this tab. The file stays on disk; delete it in the \
+                                     Project panel. (Ctrl+Z brings the tab back)"
+                                } else {
+                                    "Remove this file from the circuit (Ctrl+Z brings it back)"
+                                })
+                                .clicked()
+                            {
+                                close = Some(name.clone());
+                            }
+                            ui.add_space(6.0);
+                        }
+                    });
+                });
+        });
+        if let Some(name) = close {
+            let next = after_closing(names, &name);
+            doc.edit(|s| s.sources.remove(&name));
+            if self.selected.as_deref() == Some(name.as_str()) {
+                self.selected = next;
+                self.typing = false;
+            }
+        }
+    }
+
+    /// What the selected file builds to: its size, or how many errors.
+    fn header(&mut self, ui: &mut Ui, doc: &Document) {
+        ui.horizontal(|ui| {
             if let Some(name) = self.selected.clone() {
-                let is_file = crate::project::is_file_source(&name);
-                if ui
-                    .button(if is_file { "Close" } else { "Delete" })
-                    .on_hover_text(if is_file {
-                        "Stop showing this file here. It stays on disk; delete it in the \
-                         Project panel. (Ctrl+Z brings it back)"
-                    } else {
-                        "Remove this file (Ctrl+Z brings it back)"
-                    })
-                    .clicked()
-                {
-                    doc.edit(|s| s.sources.remove(&name));
-                    self.selected = None;
-                }
-                ui.separator();
                 let sketch = doc
                     .schematic()
                     .sources
@@ -967,7 +1008,9 @@ impl CodeEditor {
         let font = egui::TextStyle::Monospace.resolve(ui.style());
         let row_height = ui.fonts_mut(|f| f.row_height(&font));
         let rows = ((ui.available_height() / row_height).ceil() as usize).max(8);
-        let id = Id::new("code_text");
+        // Each file has its own text box and scroll position, so switching
+        // tabs keeps your place in every file.
+        let id = Id::new(("code_text", name));
         let plain = ui.visuals().text_color();
         let palette = Palette::new(ui.visuals().dark_mode, plain);
         let weak = ui.visuals().weak_text_color();
@@ -997,6 +1040,7 @@ impl CodeEditor {
         let mut changed = false;
         let mut has_focus = false;
         egui::ScrollArea::both()
+            .id_salt(("code_scroll", name))
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.horizontal_top(|ui| {
@@ -1180,6 +1224,16 @@ mod tests {
             ("x.S".into(), SourceLanguage::Asm)
         );
         assert_eq!(sketch_name("fw/blink.ino"), "blink");
+    }
+
+    #[test]
+    fn closing_a_tab_shows_its_neighbour() {
+        let names: Vec<String> = ["a.asm", "b.asm", "c.asm"].map(String::from).to_vec();
+        assert_eq!(after_closing(&names, "a.asm").as_deref(), Some("b.asm"));
+        assert_eq!(after_closing(&names, "b.asm").as_deref(), Some("c.asm"));
+        assert_eq!(after_closing(&names, "c.asm").as_deref(), Some("b.asm"));
+        assert_eq!(after_closing(&names[..1], "a.asm"), None);
+        assert_eq!(after_closing(&names, "zzz"), None);
     }
 
     #[test]

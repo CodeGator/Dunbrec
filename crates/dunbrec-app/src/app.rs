@@ -74,6 +74,8 @@ enum Pending {
     Example(usize),
     ImportSpice,
     ImportKicad,
+    /// Close the project, and with it the circuit that belongs to it.
+    CloseProject,
     Quit,
 }
 
@@ -313,6 +315,7 @@ impl DunbrecApp {
                 }
             }
             Pending::ImportSpice | Pending::ImportKicad => self.import(action),
+            Pending::CloseProject => self.close_project(),
             Pending::Quit => {
                 self.allow_close = true;
             }
@@ -509,6 +512,18 @@ impl DunbrecApp {
         }
     }
 
+    /// Close the project. The circuit that is open goes too if the project
+    /// lists it (and with it the source files shown in the Code panel), so
+    /// nothing stays open that belonged to the project.
+    fn close_project(&mut self) {
+        let related = circuit_belongs_to(self.project.as_ref(), self.doc.path());
+        self.project = None;
+        self.name_prompt = None;
+        if related {
+            self.replace(Document::default());
+        }
+    }
+
     fn show_project(&mut self, project: Project) {
         self.settings.remember_project(&project.file);
         self.project = Some(project);
@@ -572,7 +587,13 @@ impl DunbrecApp {
             C::OpenProject => self.pick_and_open_project(),
             C::OpenProjectPath(root) => self.open_project_and_schematic(&root),
             C::CloseProject => {
-                self.project = None;
+                // A circuit of the project goes with it, so ask first if it
+                // has unsaved changes; one that is not part of it stays.
+                if circuit_belongs_to(self.project.as_ref(), self.doc.path()) {
+                    self.request(Pending::CloseProject);
+                } else {
+                    self.close_project();
+                }
             }
             C::OpenSchematic(path) => self.request(Pending::OpenPath(path)),
             C::OpenSource(path) => self.open_source(&path),
@@ -1980,6 +2001,11 @@ impl DunbrecApp {
     }
 }
 
+/// Whether `circuit`, the file of the open circuit, is one the project lists.
+fn circuit_belongs_to(project: Option<&Project>, circuit: Option<&std::path::Path>) -> bool {
+    matches!((project, circuit), (Some(p), Some(c)) if p.contains(c))
+}
+
 /// What the circuit is doing, for the assistant: the running simulation if
 /// there is one for this circuit, else the DC point, plus serial output.
 fn assistant_readings(
@@ -2486,6 +2512,23 @@ impl eframe::App for DunbrecApp {
 mod tests {
     use super::*;
     use crate::library::palette;
+
+    #[test]
+    fn only_a_circuit_the_project_lists_goes_with_it() {
+        let dir = std::env::temp_dir().join(format!("dunbrec-close-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (project, circuit) = Project::create(&dir.join("P")).unwrap();
+        assert!(circuit_belongs_to(Some(&project), Some(&circuit)));
+        // A circuit somewhere else, an unsaved one, or no project at all.
+        assert!(!circuit_belongs_to(
+            Some(&project),
+            Some(&dir.join("other.dbr"))
+        ));
+        assert!(!circuit_belongs_to(Some(&project), None));
+        assert!(!circuit_belongs_to(None, Some(&circuit)));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn the_j_key_picks_the_same_tool_as_the_palette_junction() {
