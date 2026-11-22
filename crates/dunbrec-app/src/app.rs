@@ -16,7 +16,7 @@ use crate::canvas::{
 };
 use crate::code_ui::CodeEditor;
 use crate::debugger_ui::{Action as DebugAction, Debugger};
-use crate::dialog::{self, Dialog, Message};
+use crate::dialog::{self, Dialog, Message, Unsaved};
 use crate::dock::{self, LAYOUT_KEY, Pane};
 use crate::document::Document;
 use crate::examples::examples;
@@ -736,27 +736,8 @@ impl DunbrecApp {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
         if ask.discard_first {
-            let open_name = self.doc.display_name();
-            // Cancel is the highlighted button, as for the question after.
-            let answer = Dialog {
-                id: "confirm_delete_unsaved",
-                kind: dialog::Kind::Warning,
-                title: "Unsaved changes",
-                buttons: &["Discard changes", "Cancel"],
-                default: 1,
-                cancel: Some(1),
-            }
-            .show(ctx, |ui| {
-                dialog::paragraph(
-                    ui,
-                    &format!(
-                        "“{open_name}” has changes you have not saved. If you delete it, \
-                         they are lost."
-                    ),
-                );
-            });
-            match answer {
-                Some(0) => {
+            match dialog::unsaved_changes(ctx, &self.doc.display_name(), false) {
+                Some(Unsaved::Discard) => {
                     self.confirm_delete = Some(DeleteAsk {
                         discard_first: false,
                         ..ask
@@ -1799,32 +1780,16 @@ impl DunbrecApp {
 
     fn dialogs(&mut self, ctx: &egui::Context) {
         if let Some(action) = self.pending.clone() {
-            let name = self.doc.display_name();
-            let answer = Dialog {
-                id: "confirm",
-                kind: dialog::Kind::Question,
-                title: "Unsaved changes",
-                buttons: &["Save", "Discard", "Cancel"],
-                default: 0,
-                cancel: Some(2),
-            }
-            .show(ctx, |ui| {
-                dialog::paragraph(ui, &format!("Save changes to “{name}” before continuing?"));
-                ui.add_space(4.0);
-                ui.label(
-                    RichText::new("Discarding loses every change since the last save.").weak(),
-                );
-            });
-            match answer {
-                Some(0) if self.save(false) => {
+            match dialog::unsaved_changes(ctx, &self.doc.display_name(), true) {
+                Some(Unsaved::Save) if self.save(false) => {
                     self.pending = None;
                     self.perform(action);
                 }
-                Some(1) => {
+                Some(Unsaved::Discard) => {
                     self.pending = None;
                     self.perform(action);
                 }
-                Some(2) => self.pending = None,
+                Some(Unsaved::KeepEditing) => self.pending = None,
                 _ => {}
             }
         }

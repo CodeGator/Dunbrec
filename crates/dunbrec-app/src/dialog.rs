@@ -155,6 +155,47 @@ impl Dialog<'_> {
     }
 }
 
+/// What the user chose when asked about unsaved changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unsaved {
+    Save,
+    Discard,
+    KeepEditing,
+}
+
+/// The one question asked whenever a circuit with unsaved changes is about
+/// to be closed or replaced (quitting, opening another, deleting its file).
+/// `can_save` adds a Save button where saving first makes sense. The
+/// highlighted button, which Enter presses, is the one that loses nothing:
+/// Save when there is one, otherwise Keep editing. Escape keeps editing.
+pub fn unsaved_changes(ctx: &Context, name: &str, can_save: bool) -> Option<Unsaved> {
+    let (buttons, default): (&[&str], usize) = if can_save {
+        (&["Save", "Discard changes", "Keep editing"], 0)
+    } else {
+        (&["Discard changes", "Keep editing"], 1)
+    };
+    let keep = buttons.len() - 1;
+    let answer = Dialog {
+        id: "unsaved_changes",
+        kind: Kind::Warning,
+        title: "Unsaved changes",
+        buttons,
+        default,
+        cancel: Some(keep),
+    }
+    .show(ctx, |ui| {
+        paragraph(
+            ui,
+            &format!("“{name}” has unsaved changes. Keep editing or discard those changes?"),
+        );
+    })?;
+    Some(match (can_save, answer) {
+        (true, 0) => Unsaved::Save,
+        (_, i) if i == keep => Unsaved::KeepEditing,
+        _ => Unsaved::Discard,
+    })
+}
+
 /// The body text of a dialog: readable size, wrapped to the dialog's width.
 pub fn paragraph(ui: &mut Ui, text: &str) {
     ui.label(RichText::new(text).size(14.5));
@@ -219,6 +260,25 @@ mod tests {
             answer = dialog.show(ctx, |ui| paragraph(ui, "Save changes first?"));
         });
         answer
+    }
+
+    #[test]
+    fn the_unsaved_changes_question_is_the_same_everywhere() {
+        let run = |input: egui::RawInput, can_save: bool| {
+            let ctx = Context::default();
+            let mut answer = None;
+            let _ = ctx.run(input, |ctx| {
+                answer = unsaved_changes(ctx, "Circuit 1.dbr", can_save);
+            });
+            answer
+        };
+        // With a Save button, Enter saves and Escape keeps editing.
+        assert_eq!(run(egui::RawInput::default(), true), None);
+        assert_eq!(run(key(Key::Enter), true), Some(Unsaved::Save));
+        assert_eq!(run(key(Key::Escape), true), Some(Unsaved::KeepEditing));
+        // Without one, neither key can throw the changes away.
+        assert_eq!(run(key(Key::Enter), false), Some(Unsaved::KeepEditing));
+        assert_eq!(run(key(Key::Escape), false), Some(Unsaved::KeepEditing));
     }
 
     #[test]
