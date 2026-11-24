@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 pub const STORAGE_KEY: &str = "dunbrec.settings";
 /// Most recent files remembered.
 const RECENT_LIMIT: usize = 8;
+/// Most projects the Projects screen remembers (it shows them in pages).
+pub const RECENT_PROJECT_LIMIT: usize = 50;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum Theme {
@@ -93,7 +95,7 @@ impl Settings {
     pub fn remember_project(&mut self, path: &Path) {
         self.recent_projects.retain(|p| p != path);
         self.recent_projects.insert(0, path.to_path_buf());
-        self.recent_projects.truncate(RECENT_LIMIT);
+        self.recent_projects.truncate(RECENT_PROJECT_LIMIT);
     }
 
     /// Empty the recent-files list.
@@ -108,6 +110,15 @@ impl Settings {
 
     pub fn forget_project(&mut self, path: &Path) {
         self.recent_projects.retain(|p| p != path);
+    }
+
+    /// A project file was renamed: its entry in the list follows it.
+    pub fn rename_project(&mut self, from: &Path, to: &Path) {
+        for p in &mut self.recent_projects {
+            if p == from {
+                *p = to.to_path_buf();
+            }
+        }
     }
 }
 
@@ -144,9 +155,21 @@ mod tests {
         assert_eq!(s.recent_projects, [PathBuf::from("a"), PathBuf::from("b")]);
         s.forget_project(Path::new("a"));
         assert_eq!(s.recent_projects, [PathBuf::from("b")]);
+        s.rename_project(Path::new("b"), Path::new("b2"));
+        assert_eq!(s.recent_projects, [PathBuf::from("b2")]);
+        s.rename_project(Path::new("b2"), Path::new("b"));
         s.remember_project(Path::new("c"));
         s.clear_recent_projects();
         assert!(s.recent_projects.is_empty());
+        for i in 0..RECENT_PROJECT_LIMIT + 5 {
+            s.remember_project(Path::new(&format!("p{i}")));
+        }
+        assert_eq!(s.recent_projects.len(), RECENT_PROJECT_LIMIT);
+        assert_eq!(
+            s.recent_projects[0],
+            PathBuf::from(format!("p{}", RECENT_PROJECT_LIMIT + 4))
+        );
+        s.clear_recent_projects();
         s.remember(Path::new("f.dbr"));
         s.clear_recent();
         assert!(s.recent.is_empty());

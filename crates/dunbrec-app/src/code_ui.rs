@@ -819,7 +819,7 @@ impl CodeEditor {
                                 "Kept inside the circuit file"
                             });
                             if ui
-                                .small_button("✕")
+                                .small_button("×")
                                 .on_hover_text(if is_file {
                                     "Close this tab. The file stays on disk; delete it in the \
                                      Project panel. (Ctrl+Z brings the tab back)"

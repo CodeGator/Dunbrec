@@ -29,6 +29,7 @@ mod part_edits;
 mod plot;
 mod project;
 mod project_ui;
+mod projects_screen;
 mod properties;
 mod serial_ui;
 mod settings;

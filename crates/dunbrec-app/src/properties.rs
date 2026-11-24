@@ -685,7 +685,7 @@ impl Properties {
                         *buffer = format_value(*value, "");
                     }
                     if ui
-                        .small_button("✕")
+                        .small_button("×")
                         .on_hover_text("Remove (use the default)")
                         .clicked()
                     {

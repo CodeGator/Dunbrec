@@ -20,7 +20,7 @@ pub enum Create {
 
 impl Create {
     /// Everything the panel can add, in menu order.
-    const ALL: [Create; 4] = [
+    pub const ALL: [Create; 4] = [
         Create::Schematic,
         Create::Assembly,
         Create::Sketch,
@@ -78,7 +78,7 @@ impl Create {
     }
 
     /// The menu entry.
-    fn menu_label(self) -> &'static str {
+    pub fn menu_label(self) -> &'static str {
         match self {
             Create::Schematic => "Circuit…",
             Create::Assembly => "Assembly source file…",
@@ -187,7 +187,7 @@ impl ProjectPanel {
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
-                    .small_button("✕")
+                    .small_button("×")
                     .on_hover_text("Close the project (no file is touched)")
                     .clicked()
                 {
@@ -270,7 +270,7 @@ impl ProjectPanel {
                     out = Some(command);
                 }
                 header.header_response.context_menu(|ui| {
-                    if let Some(command) = self.new_menu(ui, &e.path) {
+                    if let Some(command) = self.context_new(ui, &e.path) {
                         out = Some(command);
                     }
                     ui.separator();
@@ -327,6 +327,10 @@ impl ProjectPanel {
                     out = Some(command);
                     ui.close();
                 }
+                if let Some(command) = self.context_new(ui, e.path.parent().unwrap_or(Path::new(""))) {
+                    out = Some(command);
+                }
+                ui.separator();
                 if let Some(command) = self.rename_delete(ui, e) {
                     out = Some(command);
                 }
@@ -335,9 +339,8 @@ impl ProjectPanel {
         out
     }
 
-    /// The entries that add something to the project, in the folder `dir`:
-    /// a new file or folder, or a file that exists already.
-    fn new_menu(&mut self, ui: &mut Ui, dir: &Path) -> Option<Command> {
+    /// The choices of something new in the folder `dir`.
+    fn creates(&mut self, ui: &mut Ui, dir: &Path) -> Option<Command> {
         let mut out = None;
         for what in Create::ALL {
             if ui.button(what.menu_label()).clicked() {
@@ -348,21 +351,49 @@ impl ProjectPanel {
                 ui.close();
             }
         }
-        ui.separator();
-        if ui
+        out
+    }
+
+    fn add_existing(&mut self, ui: &mut Ui) -> Option<Command> {
+        let clicked = ui
             .button("Add existing file…")
             .on_hover_text("List files that are already on the disk as part of the project")
-            .clicked()
-        {
-            out = Some(Command::AddExisting);
+            .clicked();
+        if clicked {
             ui.close();
+        }
+        clicked.then_some(Command::AddExisting)
+    }
+
+    /// The entries that add something to the project, in the folder `dir`:
+    /// a new file or folder, or a file that exists already. For the Add button.
+    fn new_menu(&mut self, ui: &mut Ui, dir: &Path) -> Option<Command> {
+        let mut out = self.creates(ui, dir);
+        ui.separator();
+        if let Some(command) = self.add_existing(ui) {
+            out = Some(command);
+        }
+        out
+    }
+
+    /// The same for a right-click menu: the choices of something new sit in
+    /// a New submenu, as in the File menu.
+    fn context_new(&mut self, ui: &mut Ui, dir: &Path) -> Option<Command> {
+        let mut out = None;
+        ui.menu_button("New", |ui| {
+            if let Some(command) = self.creates(ui, dir) {
+                out = Some(command);
+            }
+        });
+        if let Some(command) = self.add_existing(ui) {
+            out = Some(command);
         }
         out
     }
 
     /// The menu of the project's name and of empty space.
     fn root_menu(&mut self, ui: &mut Ui, root: &Path) -> Option<Command> {
-        let mut out = self.new_menu(ui, root);
+        let mut out = self.context_new(ui, root);
         ui.separator();
         if ui.button("Close project").clicked() {
             out = Some(Command::CloseProject);
@@ -585,7 +616,7 @@ fn no_project(ui: &mut Ui, recent: &[PathBuf]) -> Option<Command> {
                     out = Some(Command::OpenProjectPath(path.clone()));
                 }
                 if ui
-                    .small_button("✕")
+                    .small_button("×")
                     .on_hover_text("Remove from the list (the folder is not touched)")
                     .clicked()
                 {

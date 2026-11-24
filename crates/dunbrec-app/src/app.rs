@@ -31,7 +31,7 @@ use crate::settings::{STORAGE_KEY, Settings};
 
 /// Keyboard shortcuts shown under Help.
 const SHORTCUTS: &[(&str, &str)] = &[
-    ("Ctrl+N / Ctrl+O / Ctrl+S", "New, open, save"),
+    ("Ctrl+N / Ctrl+O / Ctrl+S", "New circuit, open, save"),
     ("Ctrl+Shift+S", "Save as"),
     ("Ctrl+Z / Ctrl+Y", "Undo, redo"),
     ("Ctrl+C / Ctrl+X / Ctrl+V", "Copy, cut, paste"),
@@ -77,7 +77,6 @@ enum ProjectTarget {
 /// Something that would discard unsaved changes, waiting for confirmation.
 #[derive(Debug, Clone, PartialEq)]
 enum Pending {
-    New,
     Open,
     OpenPath(PathBuf),
     Example(usize),
@@ -137,6 +136,11 @@ pub struct DunbrecApp {
     confirm_delete: Option<DeleteAsk>,
     /// Asking for the name of a new project file or the new name of one.
     name_prompt: Option<project_ui::NamePrompt>,
+    /// The screen shown while no project is open.
+    projects_screen: crate::projects_screen::ProjectsScreen,
+    /// A circuit file the program was started with that is in no project;
+    /// the Projects screen offers to make one for it.
+    waiting_circuit: Option<PathBuf>,
     assistant: crate::assistant::Assistant,
 
     // ---- live simulation and instruments ----
@@ -221,6 +225,16 @@ impl DunbrecApp {
         cc.egui_ctx.set_theme(settings.theme.preference());
         cc.egui_ctx.set_zoom_factor(settings.text_size.factor());
         let mut startup_problems = Vec::new();
+        // A circuit file given at start with no project to put it in waits on
+        // the Projects screen; nothing of it is opened until it has a project.
+        let mut waiting_circuit = None;
+        let initial = match initial {
+            Some((_, Some(path))) if initial_project.is_none() => {
+                waiting_circuit = Some(path);
+                None
+            }
+            other => other,
+        };
         let doc = match initial {
             Some((mut s, path)) => {
                 if let Some(dir) = path.as_deref().and_then(|p| p.parent()) {
@@ -284,6 +298,8 @@ impl DunbrecApp {
             settings_dialog: Default::default(),
             confirm_delete: None,
             name_prompt: None,
+            projects_screen: Default::default(),
+            waiting_circuit,
             assistant: Default::default(),
         };
         if app.project.is_some() {
@@ -310,7 +326,6 @@ impl DunbrecApp {
 
     fn perform(&mut self, action: Pending) {
         match action {
-            Pending::New => self.replace(Document::default()),
             Pending::Open => {
                 let picked = rfd::FileDialog::new()
                     .add_filter("Dunbrec schematic", &["dbr"])
@@ -533,12 +548,11 @@ impl DunbrecApp {
     /// lists it (and with it the source files shown in the Code panel), so
     /// nothing stays open that belonged to the project.
     fn close_project(&mut self) {
-        let related = circuit_belongs_to(self.project.as_ref(), self.doc.path());
         self.project = None;
         self.name_prompt = None;
-        if related {
-            self.replace(Document::default());
-        }
+        // With no project open only the Projects screen is shown, so the
+        // circuit goes too (the user was asked about unsaved changes first).
+        self.replace(Document::default());
     }
 
     fn show_project(&mut self, project: Project) {
@@ -588,6 +602,79 @@ impl DunbrecApp {
         self.switch_project(ProjectTarget::Create(file));
     }
 
+    /// Make something new in the open project (a circuit, a source file or
+    /// a folder): ask for its name, then list it in the project and open it.
+    fn new_in_project(&mut self, what: project_ui::Create) {
+        if let Some(project) = &self.project {
+            let dir = project.root.clone();
+            self.run_project_command(project_ui::Command::AskCreate { dir, what });
+        }
+    }
+
+    /// Make a project around the circuit file `circuit`: the usual Save
+    /// dialog names the project file (beside the circuit file to begin with).
+    /// The circuit file stays where it is and is listed by its path.
+    fn new_project_for(&mut self, circuit: &std::path::Path) {
+        let stem = circuit
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "My project".into());
+        let mut dialog = rfd::FileDialog::new()
+            .set_title(format!("New project for “{stem}”"))
+            .add_filter("Dunbrec project", &[project::EXTENSION])
+            .set_file_name(stem);
+        if let Some(dir) = circuit.parent() {
+            dialog = dialog.set_directory(dir);
+        }
+        let Some(file) = dialog.save_file() else {
+            return;
+        };
+        match Project::create_for(&file, circuit) {
+            Ok(project) => {
+                self.waiting_circuit = None;
+                self.show_project(project);
+                self.request(Pending::OpenPath(circuit.to_path_buf()));
+            }
+            Err(e) => self.message = Some(Message::error("Could not make the project", e)),
+        }
+    }
+
+    /// What the user chose on the Projects screen.
+    fn run_screen_command(&mut self, command: crate::projects_screen::Command) {
+        use crate::projects_screen::Command as S;
+        match command {
+            S::NewProject => self.new_project(),
+            S::OpenProject => self.pick_and_open_project(),
+            S::OpenRecent(file) => self.open_project_and_schematic(&file),
+            S::Forget(file) => self.settings.forget_project(&file),
+            S::ClearRecent => self.settings.clear_recent_projects(),
+            S::Rename { from, to } => {
+                let name = to
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                match project::rename_file(&from, &name) {
+                    Ok(new) => self.settings.rename_project(&from, &new),
+                    Err(e) => self.message = Some(Message::error("Could not rename it", e)),
+                }
+            }
+            S::ShowFolder(file) => {
+                if let Err(e) = crate::projects_screen::show_in_folder(&file) {
+                    self.message = Some(Message::error("Could not show the folder", e));
+                }
+            }
+            S::Settings => self.settings_dialog.open(),
+            // No project is open, so nothing can be unsaved.
+            S::Quit => self.allow_close = true,
+            S::ProjectForWaiting => {
+                if let Some(circuit) = self.waiting_circuit.clone() {
+                    self.new_project_for(&circuit);
+                }
+            }
+            S::DismissWaiting => self.waiting_circuit = None,
+        }
+    }
+
     /// Go to another project. The circuit of the project that is open now
     /// goes too, so nothing of the old project stays open; if it has
     /// unsaved changes the user is asked about them first.
@@ -624,15 +711,9 @@ impl DunbrecApp {
             C::NewProject => self.new_project(),
             C::OpenProject => self.pick_and_open_project(),
             C::OpenProjectPath(root) => self.switch_project(ProjectTarget::Open(root)),
-            C::CloseProject => {
-                // A circuit of the project goes with it, so ask first if it
-                // has unsaved changes; one that is not part of it stays.
-                if circuit_belongs_to(self.project.as_ref(), self.doc.path()) {
-                    self.request(Pending::CloseProject);
-                } else {
-                    self.close_project();
-                }
-            }
+            // The open circuit goes with the project, so ask first if it has
+            // unsaved changes.
+            C::CloseProject => self.request(Pending::CloseProject),
             C::OpenSchematic(path) => self.request(Pending::OpenPath(path)),
             C::OpenSource(path) => self.open_source(&path),
             C::Create { dir, name, what } => {
@@ -1017,7 +1098,7 @@ impl DunbrecApp {
             self.request(Pending::Open);
         }
         if pressed(cmd(Key::N)) {
-            self.request(Pending::New);
+            self.new_in_project(project_ui::Create::Schematic);
         }
         if pressed(cmd(Key::C)) {
             self.copy();
@@ -1666,10 +1747,21 @@ impl DunbrecApp {
         egui::TopBottomPanel::top("menu").show(ctx, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("File", |ui| {
-                    if ui.button("New        Ctrl+N").clicked() {
-                        self.request(Pending::New);
-                        ui.close();
-                    }
+                    ui.menu_button("New", |ui| {
+                        for what in project_ui::Create::ALL {
+                            let label = if what == project_ui::Create::Schematic {
+                                format!("{}   Ctrl+N", what.menu_label())
+                            } else {
+                                what.menu_label().to_string()
+                            };
+                            if ui.button(label).clicked() {
+                                self.new_in_project(what);
+                                ui.close();
+                            }
+                        }
+                    })
+                    .response
+                    .on_hover_text("Make something new in the project");
                     if ui.button("Open…      Ctrl+O").clicked() {
                         self.request(Pending::Open);
                         ui.close();
@@ -1706,52 +1798,14 @@ impl DunbrecApp {
                         }
                     });
                     ui.separator();
-                    if ui.button("New project…").clicked() {
-                        self.new_project();
+                    if ui
+                        .button("Close project")
+                        .on_hover_text("Go back to the Projects screen")
+                        .clicked()
+                    {
+                        self.run_project_command(project_ui::Command::CloseProject);
                         ui.close();
                     }
-                    if ui.button("Open project…").clicked() {
-                        self.pick_and_open_project();
-                        ui.close();
-                    }
-                    ui.add_enabled_ui(!self.settings.recent_projects.is_empty(), |ui| {
-                        ui.menu_button("Open recent project", |ui| {
-                            for path in self.settings.recent_projects.clone() {
-                                let name = path.file_name().map_or_else(
-                                    || path.display().to_string(),
-                                    |n| n.to_string_lossy().into_owned(),
-                                );
-                                ui.horizontal(|ui| {
-                                    if ui
-                                        .button(name)
-                                        .on_hover_text(path.display().to_string())
-                                        .clicked()
-                                    {
-                                        self.open_project_and_schematic(&path);
-                                        ui.close();
-                                    }
-                                    if ui
-                                        .small_button("✕")
-                                        .on_hover_text("Remove from the list")
-                                        .clicked()
-                                    {
-                                        self.settings.forget_project(&path);
-                                    }
-                                });
-                            }
-                            ui.separator();
-                            if ui.button("Clear list").clicked() {
-                                self.settings.clear_recent_projects();
-                                ui.close();
-                            }
-                        });
-                    });
-                    ui.add_enabled_ui(self.project.is_some(), |ui| {
-                        if ui.button("Close project").clicked() {
-                            self.run_project_command(project_ui::Command::CloseProject);
-                            ui.close();
-                        }
-                    });
                     ui.separator();
                     if ui.button("Import SPICE netlist…").clicked() {
                         self.request(Pending::ImportSpice);
@@ -2208,7 +2262,7 @@ fn palette_ui(ui: &mut egui::Ui, canvas: &mut Canvas, search: &mut String) {
             );
             if searching
                 && ui
-                    .small_button("✕")
+                    .small_button("×")
                     .on_hover_text("Clear the search")
                     .clicked()
             {
@@ -2512,6 +2566,25 @@ impl eframe::App for DunbrecApp {
             self.refresh_project();
         }
         self.was_focused = focused;
+
+        // With no project open, the Projects screen is all there is: no
+        // menu, toolbar, panels or instrument windows.
+        if self.project.is_none() {
+            if self.title != "Dunbrec" {
+                ctx.send_viewport_cmd(ViewportCommand::Title("Dunbrec".into()));
+                self.title = "Dunbrec".into();
+            }
+            let view = crate::projects_screen::View {
+                recent: &self.settings.recent_projects,
+                waiting: self.waiting_circuit.as_deref(),
+            };
+            if let Some(command) = self.projects_screen.show(ctx, &view) {
+                self.run_screen_command(command);
+            }
+            self.dialogs(ctx);
+            self.settings_dialog.show(ctx, &mut self.settings);
+            return;
+        }
 
         self.shortcuts(ctx);
         self.refresh_netlist();

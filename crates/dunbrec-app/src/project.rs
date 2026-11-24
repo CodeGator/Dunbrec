@@ -175,10 +175,9 @@ impl Project {
         Ok(Self::from_data(file, data))
     }
 
-    /// Make a new project: write the project file `file` (`.dbrproj` is added
-    /// if missing) and a first, empty circuit beside it, `Circuit 1.dbr` or the
-    /// next name nothing there has. Returns the project and the circuit.
-    pub fn create(file: &Path) -> Result<(Self, PathBuf), String> {
+    /// The project file a name stands for: the project extension is added if
+    /// missing, the name must be usable, and nothing may be there already.
+    fn new_file_path(file: &Path) -> Result<PathBuf, String> {
         let mut file = file.to_path_buf();
         if file
             .extension()
@@ -197,6 +196,14 @@ impl Project {
             return Err(format!("“{name}” cannot be used as a file name"));
         }
         ensure_free(&file).map_err(|e| format!("{e}. Use Open project to open it."))?;
+        Ok(file)
+    }
+
+    /// Make a new project: write the project file `file` (the extension is
+    /// added if missing) and a first, empty circuit beside it, `Circuit 1` or
+    /// the next name nothing there has. Returns the project and the circuit.
+    pub fn create(file: &Path) -> Result<(Self, PathBuf), String> {
+        let file = Self::new_file_path(file)?;
         let dir = file.parent().unwrap_or(Path::new("")).to_path_buf();
         let circuit = free_circuit_in(&dir);
         dunbrec_io::dbr::save(&Schematic::new(), &circuit).map_err(|e| e.to_string())?;
@@ -209,6 +216,26 @@ impl Project {
         );
         project.add_file(&circuit)?;
         Ok((project, circuit))
+    }
+
+    /// Make a new project around a circuit file that exists already: the
+    /// project file `file` is written and lists `circuit` where it is. The
+    /// circuit file is not moved or copied, and no new circuit is made.
+    pub fn create_for(file: &Path, circuit: &Path) -> Result<Self, String> {
+        if !circuit.is_file() {
+            return Err(format!("{} does not exist", circuit.display()));
+        }
+        let file = Self::new_file_path(file)?;
+        let mut project = Self::from_data(
+            &file,
+            ProjectData {
+                version: FORMAT_VERSION,
+                ..ProjectData::default()
+            },
+        );
+        project.add_file(circuit)?;
+        project.save()?;
+        Ok(project)
     }
 
     /// Write the project file.
@@ -597,6 +624,34 @@ fn ensure_free(path: &Path) -> Result<(), String> {
     }
 }
 
+/// Rename the project file `file` to `name` (the extension is added if
+/// missing), in the same folder. Only the project's own file changes: the
+/// circuit files it lists, and their folder, are left alone. Returns the new
+/// path.
+pub fn rename_file(file: &Path, name: &str) -> Result<PathBuf, String> {
+    let name = with_extension(name, EXTENSION);
+    if !valid_name(&name) {
+        return Err(format!("“{name}” cannot be used as a file name"));
+    }
+    if !file.is_file() {
+        return Err(format!("{} no longer exists", file.display()));
+    }
+    let to = file.with_file_name(&name);
+    if file == to {
+        return Ok(to);
+    }
+    // A different spelling of the same name (only the case changes) is fine
+    // on a case-insensitive disk; anything else must not exist already.
+    let case_only = file
+        .file_name()
+        .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case(&name));
+    if !case_only {
+        ensure_free(&to)?;
+    }
+    std::fs::rename(file, &to).map_err(|e| format!("cannot rename {}: {e}", file.display()))?;
+    Ok(to)
+}
+
 /// Create an empty schematic `name` (`.dbr` added) in `dir`.
 pub fn new_schematic(dir: &Path, name: &str) -> Result<PathBuf, String> {
     if !valid_name(name) {
@@ -940,6 +995,50 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn a_project_is_made_around_a_circuit_file_where_it_is() {
+        let dir = scratch("around");
+        let circuit_dir = dir.join("circuits");
+        std::fs::create_dir_all(&circuit_dir).unwrap();
+        let circuit = circuit_dir.join("amp.dbr");
+        dunbrec_io::dbr::save(&Schematic::new(), &circuit).unwrap();
+        // The project goes in another folder; the circuit file is not moved.
+        let file = dir.join("work").join("Amp project");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let project = Project::create_for(&file, &circuit).unwrap();
+        assert!(circuit.is_file());
+        assert_eq!(project.name(), "Amp project");
+        assert!(project.contains(&circuit));
+        assert_eq!(project.files().len(), 1, "no new circuit is made");
+        // Opening it again lists the same circuit.
+        let again = Project::open(&project.file).unwrap();
+        assert_eq!(again.schematics(), vec![normalize(&circuit)]);
+        // Not over an existing project, and not around a file that is not there.
+        assert!(Project::create_for(&file, &circuit).is_err());
+        assert!(Project::create_for(&dir.join("x"), &dir.join("nope.dbr")).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn renaming_a_project_file_leaves_its_circuits_alone() {
+        let dir = scratch("rename-file");
+        let (project, circuit) = Project::create(&dir.join("Old")).unwrap();
+        let new = rename_file(&project.file, "New name").unwrap();
+        assert_eq!(new, dir.join("New name.dbrproj"));
+        assert!(new.is_file() && !project.file.is_file());
+        assert!(circuit.is_file());
+        assert_eq!(Project::open(&new).unwrap().name(), "New name");
+        // Not onto a file that exists, and not to an unusable name.
+        let (other, _) = Project::create(&dir.join("Other")).unwrap();
+        assert!(rename_file(&new, "Other").is_err());
+        assert!(rename_file(&new, "a/b").is_err());
+        assert!(other.file.is_file() && new.is_file());
+        // Only the case changing works too.
+        let upper = rename_file(&new, "NEW NAME").unwrap();
+        assert_eq!(upper.file_name().unwrap().to_string_lossy(), "NEW NAME.dbrproj");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     fn mcu(firmware: &str) -> ComponentKind {
