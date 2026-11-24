@@ -3,7 +3,7 @@
 State of the project for whoever picks it up next. User-facing documentation is in
 [README.md](README.md); this file covers status, decisions and open work.
 
-*Last updated: 2026-11-22, version 0.5.0 started (0.4.0 released: assistant, settings, message boxes, project behaviour).*
+*Last updated: 2026-11-24, version 0.5.0 in progress (0.4.0 released: assistant, settings, message boxes, project behaviour). Next task: the multi-document editor, designed in [docs/multi-document-editor.md](docs/multi-document-editor.md), not started.*
 
 ## Status
 
@@ -28,9 +28,10 @@ drafts the GitHub release (see `.github/workflows/release.yml`).
 | 13 | Dockable panels: every panel is an `egui_dock` tab; layout saved between sessions |
 | 0.2.0 | Switches group: SPST, SPDT, DPST, DPDT (`ComponentKind::MultiSwitch`, `SwitchContacts` device) and hold-to-press push buttons (`Switch { momentary }`, `Canvas::push_buttons`) |
 | 0.3.0 | Projects (a `.dbrproj` file listing circuits and firmware files), Junction and hops, J key, CD4066, Linear group |
+| 0.5.0 (in progress) | Projects screen (nothing else shown without a project); assistant draws new circuits with real wires and can add sine sources; no circuit open until one is opened; a central area that never collapses; closable schematic tab. See "0.5.0" below |
 | 0.4.0 | Settings dialog; Assistant (Ollama or Claude); pop-out instruments; text size; every confirmation a message box; Code panel tabs; project behaviour changes. See "0.4.0" below |
 
-Health at handoff: `cargo test --workspace` 413 passed, 0 failed (1 ignored: an emulator speed
+Health at handoff: `cargo test --workspace` 426 passed, 0 failed (1 ignored: an emulator speed
 benchmark); `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --check`
 clean. Toolchain: Rust 1.99 (edition 2024, MSRV 1.90), Windows 11.
 
@@ -74,8 +75,8 @@ UI layout (`dock.rs`, `PaneViewer` in `app.rs`):
   the new panel for `split_left` despite the crate's wording. `dock.rs` has a test on the real
   proportions.
 - The layout is saved under `dunbrec.layout.v1` in eframe storage, separate from `Settings`,
-  and restored through `sanitize` (retired tabs dropped, duplicates removed, no schematic means
-  default). Bump the key suffix if panes change in a way old layouts cannot express.
+  and restored through `sanitize` (retired tabs dropped, duplicates removed; a layout with neither
+  the schematic nor the empty central area `Pane::Workspace` means default). Bump the key suffix if panes change in a way old layouts cannot express.
 
 Key mechanisms worth knowing before changing the engine:
 
@@ -270,8 +271,62 @@ Other 0.4.0 behaviour:
   a circuit the project does not list stays open (`circuit_belongs_to`, `leaves_circuit`).
   Deleting the open circuit's file asks about unsaved changes, then the delete, then closes it
   (blank Untitled circuit).
-- **There is always a document.** With nothing open you see a blank "Untitled" circuit (File >
-  New does the same). A real "no document" state was considered and rejected as too invasive.
+- **There is always a document.** *Superseded in 0.5.0: see "0.5.0". A `Document` still always
+  exists in memory, but `circuit_open` says whether it is shown.*
+
+## 0.5.0 (in progress)
+
+The branch is `0.5.0`. What it adds, and the decisions behind it (all agreed with the user):
+
+**Assistant builds circuits properly.**
+
+- `dunbrec-io/src/tidy.rs`: a new circuit made only of new nets is drawn like a schematic, not on
+  labels: supply rails along the top (nets a voltage source's + pin is on, or named VCC/VDD/...),
+  a ground symbol on each ground pin, parts in three rows (rail side, middle, ground side) in
+  columns that follow the signal (BFS from an input net). A transistor gets the part on its
+  collector above and on its emitter below; a resistor to the rail and one to ground that share
+  a net form one column (a divider). Wires come from an orthogonal router (Dijkstra over grid
+  cells, bend and crossing costs; never through a body; crosses another net only straight across
+  a plain wire, since crossing wires do not connect and an end on a wire does). Every net gets a
+  label so it keeps its name (`verify` looks nets up by name).
+- `part_edits::place_tidy` tries it on a copy and runs the same `verify` as everything else; on
+  any failure it falls back to the old label layout (`place_with_labels`). It is only used when
+  every new net is new or ground; parts added to existing nets still use `try_wire` or labels.
+- New part kind **`vsine`** (value `amplitude@frequency`, e.g. `10m@1k`; sine, no offset) and
+  aliases for kind words models tend to use (`voltage`, `battery`, `ac`, `cap`, ...). The prompt now
+  tells the model never to claim it changed anything, to list every pin's net, to add new parts
+  (including sources) with `dunbrec-add` only, and shows a full common-emitter stage as an example.
+
+**Projects screen** (`projects_screen.rs`). With no project open it is the whole window (no menu,
+toolbar, panels or instrument windows): New project, Open project, Recent projects (open, Rename,
+Show folder, remove, Clear list) with search, sort (recent, name, folder), a filter (all /
+available / file missing) and paging (10 per page; `RECENT_PROJECT_LIMIT` is 50), Settings, Quit.
+A circuit file given on the command line waits there with an offer to make a project for it
+(`waiting_circuit`; `Project::create_for` lists it where it is, nothing is copied). Renaming
+changes only the project file (`project::rename_file`); `Settings::rename_project` keeps the list.
+Closing a project closes its circuit (`close_circuit`). File > New is a submenu (circuit, assembly
+file, sketch, folder) that creates in the project, and the Project panel's right-click menus have
+the same New submenu. The File menu keeps only Close project for projects. The close icon is a
+plain "x" (U+00D7): the dingbat "x" had no glyph in egui's fonts.
+
+**No circuit until one is opened.** `circuit_open` is true only after a circuit is opened, made or
+imported (`replace`), false after `close_circuit`. Opening or making a project opens no circuit.
+While it is false, Save, Export, Edit, Simulate, Instruments, the run toolbar and all shortcuts
+except Ctrl+N and Ctrl+O are disabled, and the title shows the project name.
+
+**Central area that never collapses.** egui_dock deletes an area when its last tab goes, and its
+neighbours spread into the space. `Pane::Workspace` is an uncloseable, invisible tab (styled in
+`tab_style_override`) that holds the central area while no circuit is open;
+`dock::sync_documents(dock, circuit_open)` (called from `dock_area`) swaps it with the schematic
+and closes the Code tab (its files belong to the circuit). `Pane::floats()` keeps the schematic and
+workspace from being dragged into windows. The schematic tab has a close button; middle-click and
+the tab's right-click Close come through `TabViewer::on_close`, which asks to close the circuit
+(`Pending::CloseCircuit`, with the unsaved-changes question). File > Close circuit, Ctrl+W.
+
+**Still single-document.** One circuit at a time. The next task is the multi-document editor: see
+[docs/multi-document-editor.md](docs/multi-document-editor.md) (an `OpenCircuit` struct per open
+circuit, tabs per circuit and per source file, one simulation at a time; three proposed decisions
+await the user's confirmation).
 
 ## Gotchas
 
@@ -282,5 +337,7 @@ Other 0.4.0 behaviour:
   continuations into literal characters. Prefer direct file edits for strings with escapes. In a
   Python script, a single `\` at the end of a line inside a normal string is a continuation and
   silently joins the lines, which is how stray runs of spaces got into a Rust string once.
+- A long Python edit script inline in a Git Bash heredoc can fail to parse (the shell choked on
+  it once, applying nothing); write the script to a file in the scratchpad and run that.
 - Rebuilding while the app is running fails (the exe is locked). Close it normally first, so the
   unsaved-changes prompt still appears; do not kill it.

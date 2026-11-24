@@ -82,12 +82,7 @@ fn offsets(kind: &ComponentKind, t: Turn) -> Vec<Point> {
         .collect()
 }
 
-const ROTATIONS: [Rotation; 4] = [
-    Rotation::R0,
-    Rotation::R90,
-    Rotation::R270,
-    Rotation::R180,
-];
+const ROTATIONS: [Rotation; 4] = [Rotation::R0, Rotation::R90, Rotation::R270, Rotation::R180];
 
 /// A turn that puts pin `top` of a two-pin part straight above the other.
 fn vertical_with_top(kind: &ComponentKind, top: usize) -> Option<Turn> {
@@ -239,18 +234,18 @@ fn route(g: &Grid, me: usize, tree: &HashSet<Point>, from: Point) -> Option<Vec<
                         continue;
                     }
                     let o = others[0];
-                    let across = if d.y == 0 {
-                        o.v && !o.h
-                    } else {
-                        o.h && !o.v
-                    };
+                    let across = if d.y == 0 { o.v && !o.h } else { o.h && !o.v };
                     if !across {
                         continue;
                     }
                     extra = CROSS_COST;
                 }
             }
-            let turn = if din != NONE && k != din { TURN_COST } else { 0 };
+            let turn = if din != NONE && k != din {
+                TURN_COST
+            } else {
+                0
+            };
             let nc = cost + 1 + extra + turn;
             let ns = (n, k);
             if best.get(&ns).is_none_or(|&b| nc < b) {
@@ -299,7 +294,13 @@ fn body_cells(pins: &[Point]) -> Vec<Point> {
     let x1 = pins.iter().map(|p| p.x).max().unwrap_or(0);
     let y0 = pins.iter().map(|p| p.y).min().unwrap_or(0);
     let y1 = pins.iter().map(|p| p.y).max().unwrap_or(0);
-    let span = |lo: i32, hi: i32| if hi > lo { lo + 1..=hi - 1 } else { lo - 1..=lo + 1 };
+    let span = |lo: i32, hi: i32| {
+        if hi > lo {
+            lo + 1..=hi - 1
+        } else {
+            lo - 1..=lo + 1
+        }
+    };
     let mut out = Vec::new();
     for x in span(x0, x1) {
         for y in span(y0, y1) {
@@ -454,7 +455,10 @@ pub fn tidy(parts: &[Part], models: ModelLibrary) -> Option<Schematic> {
         let (above, below) = if flipped {
             (None, Some(parts[i].nets[0].as_str()))
         } else {
-            (Some(parts[i].nets[0].as_str()), Some(parts[i].nets[2].as_str()))
+            (
+                Some(parts[i].nets[0].as_str()),
+                Some(parts[i].nets[2].as_str()),
+            )
         };
         let mut col = Column {
             mid: Some(i),
@@ -594,10 +598,7 @@ pub fn tidy(parts: &[Part], models: ModelLibrary) -> Option<Schematic> {
     let mut grid = Grid {
         occ: HashMap::new(),
         blocked: HashSet::new(),
-        lo: Point::new(
-            all_pins.iter().map(|p| p.x).min()? - 8,
-            RAIL_Y - top_y - 4,
-        ),
+        lo: Point::new(all_pins.iter().map(|p| p.x).min()? - 8, RAIL_Y - top_y - 4),
         hi: Point::new(
             all_pins.iter().map(|p| p.x).max()? + 8,
             all_pins.iter().map(|p| p.y).max()? + 8,

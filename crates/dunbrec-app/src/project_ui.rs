@@ -327,7 +327,9 @@ impl ProjectPanel {
                     out = Some(command);
                     ui.close();
                 }
-                if let Some(command) = self.context_new(ui, e.path.parent().unwrap_or(Path::new(""))) {
+                if let Some(command) =
+                    self.context_new(ui, e.path.parent().unwrap_or(Path::new("")))
+                {
                     out = Some(command);
                 }
                 ui.separator();

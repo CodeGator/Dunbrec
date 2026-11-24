@@ -7,6 +7,7 @@ use dunbrec_core::{
 };
 use dunbrec_sim::{Circuit, Sample, SimWarning, operating_point};
 use egui::{Color32, Key, KeyboardShortcut, Modifiers, RichText, ViewportCommand};
+use egui_dock::tab_viewer::OnCloseResponse;
 use egui_dock::{DockArea, DockState, TabViewer};
 
 use crate::analyses_ui::{Analyses, Inputs};
@@ -32,6 +33,7 @@ use crate::settings::{STORAGE_KEY, Settings};
 /// Keyboard shortcuts shown under Help.
 const SHORTCUTS: &[(&str, &str)] = &[
     ("Ctrl+N / Ctrl+O / Ctrl+S", "New circuit, open, save"),
+    ("Ctrl+W", "Close the circuit"),
     ("Ctrl+Shift+S", "Save as"),
     ("Ctrl+Z / Ctrl+Y", "Undo, redo"),
     ("Ctrl+C / Ctrl+X / Ctrl+V", "Copy, cut, paste"),
@@ -84,6 +86,8 @@ enum Pending {
     ImportKicad,
     /// Close the project, and with it the circuit that belongs to it.
     CloseProject,
+    /// Close the circuit (the project stays open).
+    CloseCircuit,
     /// Leave the open project (and its circuit) for another one.
     SwitchProject(ProjectTarget),
     Quit,
@@ -138,6 +142,9 @@ pub struct DunbrecApp {
     name_prompt: Option<project_ui::NamePrompt>,
     /// The screen shown while no project is open.
     projects_screen: crate::projects_screen::ProjectsScreen,
+    /// A circuit is open (opened, made, or imported). With none open the
+    /// schematic is not shown and nothing that acts on a circuit can be done.
+    circuit_open: bool,
     /// A circuit file the program was started with that is in no project;
     /// the Projects screen offers to make one for it.
     waiting_circuit: Option<PathBuf>,
@@ -235,6 +242,7 @@ impl DunbrecApp {
             }
             other => other,
         };
+        let circuit_open = initial.is_some();
         let doc = match initial {
             Some((mut s, path)) => {
                 if let Some(dir) = path.as_deref().and_then(|p| p.parent()) {
@@ -299,6 +307,7 @@ impl DunbrecApp {
             confirm_delete: None,
             name_prompt: None,
             projects_screen: Default::default(),
+            circuit_open,
             waiting_circuit,
             assistant: Default::default(),
         };
@@ -306,7 +315,7 @@ impl DunbrecApp {
             dock::open(&mut app.dock, Pane::Project);
         }
         if let Some(file) = initial_project {
-            app.open_project_and_schematic(&file);
+            app.open_project(&file);
         }
         if !startup_problems.is_empty() {
             app.message = Some(source_problems(&startup_problems));
@@ -342,6 +351,7 @@ impl DunbrecApp {
             }
             Pending::ImportSpice | Pending::ImportKicad => self.import(action),
             Pending::CloseProject => self.close_project(),
+            Pending::CloseCircuit => self.close_circuit(),
             Pending::SwitchProject(to) => {
                 self.close_project();
                 self.go_to_project(to);
@@ -474,6 +484,7 @@ impl DunbrecApp {
     }
 
     fn replace(&mut self, doc: Document) {
+        self.circuit_open = true;
         self.stop_sim();
         self.bench = Bench::default();
         self.doc = doc;
@@ -482,6 +493,12 @@ impl DunbrecApp {
         self.dc = None;
         // A circuit that is opened is shown, not the Code tab beside it.
         dock::bring_to_front(&mut self.dock, Pane::Schematic);
+    }
+
+    /// Close the circuit: nothing is open, and the schematic is not shown.
+    fn close_circuit(&mut self) {
+        self.replace(Document::default());
+        self.circuit_open = false;
     }
 
     fn save(&mut self, ask: bool) -> bool {
@@ -533,7 +550,8 @@ impl DunbrecApp {
 
     // ------------------------------------------------------ projects ---
 
-    /// Make the project file `file` the open project and show its panel.
+    /// Make the project file `file` the open project and show its panel. No
+    /// circuit is opened: the user picks one from the panel.
     fn open_project(&mut self, file: &std::path::Path) {
         match Project::open(file) {
             Ok(p) => self.show_project(p),
@@ -552,7 +570,7 @@ impl DunbrecApp {
         self.name_prompt = None;
         // With no project open only the Projects screen is shown, so the
         // circuit goes too (the user was asked about unsaved changes first).
-        self.replace(Document::default());
+        self.close_circuit();
     }
 
     fn show_project(&mut self, project: Project) {
@@ -561,19 +579,6 @@ impl DunbrecApp {
         dock::open(&mut self.dock, Pane::Project);
         if let Some(at) = self.dock.find_tab(&Pane::Project) {
             self.dock.set_active_tab(at);
-        }
-    }
-
-    /// Open a project file; if it lists a single schematic and none of the
-    /// project is open yet, open that too.
-    fn open_project_and_schematic(&mut self, file: &std::path::Path) {
-        self.open_project(file);
-        let Some(project) = &self.project else { return };
-        let inside = self.doc.path().is_some_and(|p| project.contains(p));
-        if let [only] = project.schematics().as_slice()
-            && !inside
-        {
-            self.request(Pending::OpenPath(only.clone()));
         }
     }
 
@@ -645,7 +650,7 @@ impl DunbrecApp {
         match command {
             S::NewProject => self.new_project(),
             S::OpenProject => self.pick_and_open_project(),
-            S::OpenRecent(file) => self.open_project_and_schematic(&file),
+            S::OpenRecent(file) => self.open_project(&file),
             S::Forget(file) => self.settings.forget_project(&file),
             S::ClearRecent => self.settings.clear_recent_projects(),
             S::Rename { from, to } => {
@@ -691,12 +696,11 @@ impl DunbrecApp {
 
     fn go_to_project(&mut self, to: ProjectTarget) {
         match to {
-            ProjectTarget::Open(file) => self.open_project_and_schematic(&file),
+            ProjectTarget::Open(file) => self.open_project(&file),
             ProjectTarget::Create(file) => match Project::create(&file) {
-                Ok((project, first)) => {
-                    self.show_project(project);
-                    self.request(Pending::OpenPath(first));
-                }
+                // The first circuit is made and listed, but it is not opened:
+                // no circuit is shown until the user opens one.
+                Ok((project, _first)) => self.show_project(project),
                 Err(e) => {
                     self.message = Some(Message::error("Could not create the project", e));
                 }
@@ -917,10 +921,9 @@ impl DunbrecApp {
             self.message = Some(Message::error("Could not delete it", e));
             return;
         }
-        // A circuit that was deleted cannot be edited or simulated: it gives
-        // way to a new blank one, as File > New does.
+        // A circuit that was deleted cannot be edited or simulated: it is closed.
         if self.open_circuit_is_in(path) {
-            self.replace(Document::default());
+            self.close_circuit();
         } else if let Some(dir) = self.firmware_dir() {
             // Drop open source files that were deleted with it.
             let gone = project::normalize(path);
@@ -1082,6 +1085,18 @@ impl DunbrecApp {
         let cmd = |key| KeyboardShortcut::new(Modifiers::COMMAND, key);
         let cmd_shift = |key| KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, key);
         let pressed = |s: KeyboardShortcut| ctx.input_mut(|i| i.consume_shortcut(&s));
+        if !self.circuit_open {
+            if pressed(cmd(Key::O)) {
+                self.request(Pending::Open);
+            }
+            if pressed(cmd(Key::N)) {
+                self.new_in_project(project_ui::Create::Schematic);
+            }
+            return;
+        }
+        if pressed(cmd(Key::W)) {
+            self.request(Pending::CloseCircuit);
+        }
         if pressed(cmd_shift(Key::Z)) || pressed(cmd(Key::Y)) {
             self.doc.redo();
         }
@@ -1396,6 +1411,9 @@ impl DunbrecApp {
         let frame = self.run_frame(ctx);
         egui::TopBottomPanel::top("run").frame(frame).show(ctx, |ui| {
             ui.horizontal(|ui| {
+                if !self.circuit_open {
+                    ui.disable();
+                }
                 match &self.live {
                     None => {
                         if ui.button("▶ Run").on_hover_text("Start the live simulation (Space)").clicked() {
@@ -1629,6 +1647,9 @@ impl DunbrecApp {
     /// Draw the dockable panels: schematic, palette, properties, checks and
     /// values.
     fn dock_area(&mut self, ctx: &egui::Context) {
+        // The central area holds the schematic while a circuit is open, and
+        // nothing (but stays) when none is.
+        dock::sync_documents(&mut self.dock, self.circuit_open);
         // Live values while simulating, otherwise the DC point.
         let live_tags: Vec<Annotation>;
         let annotations: &[Annotation] = match (&self.live, &self.latest, &self.dc) {
@@ -1662,6 +1683,7 @@ impl DunbrecApp {
 
         let running = self.live.is_some();
         let mut project_command = None;
+        let mut close_circuit = false;
         let mut open_settings = false;
         let title = self.doc.display_name();
         let generation = self.doc.generation();
@@ -1706,12 +1728,16 @@ impl DunbrecApp {
             ai: &self.settings.ai,
             title: &title,
             open_settings: &mut open_settings,
+            close_circuit: &mut close_circuit,
         };
         DockArea::new(&mut self.dock)
             .style(egui_dock::Style::from_egui(ctx.style().as_ref()))
             .show(ctx, &mut viewer);
         if let Some(command) = project_command {
             self.run_project_command(command);
+        }
+        if close_circuit {
+            self.request(Pending::CloseCircuit);
         }
         // Source files the Code panel made on disk belong to the project the
         // circuit is in.
@@ -1815,16 +1841,42 @@ impl DunbrecApp {
                         self.request(Pending::ImportKicad);
                         ui.close();
                     }
-                    if ui.button("Export SPICE netlist…").clicked() {
+                    if ui
+                        .add_enabled(
+                            self.circuit_open,
+                            egui::Button::new("Export SPICE netlist…"),
+                        )
+                        .clicked()
+                    {
                         self.export_spice();
                         ui.close();
                     }
                     ui.separator();
-                    if ui.button("Save       Ctrl+S").clicked() {
+                    if ui
+                        .add_enabled(
+                            self.circuit_open,
+                            egui::Button::new("Close circuit   Ctrl+W"),
+                        )
+                        .on_hover_text("Close the circuit; the project stays open")
+                        .clicked()
+                    {
+                        self.request(Pending::CloseCircuit);
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(self.circuit_open, egui::Button::new("Save       Ctrl+S"))
+                        .clicked()
+                    {
                         self.save(false);
                         ui.close();
                     }
-                    if ui.button("Save as…   Ctrl+Shift+S").clicked() {
+                    if ui
+                        .add_enabled(
+                            self.circuit_open,
+                            egui::Button::new("Save as…   Ctrl+Shift+S"),
+                        )
+                        .clicked()
+                    {
                         self.save(true);
                         ui.close();
                     }
@@ -1840,6 +1892,9 @@ impl DunbrecApp {
                     }
                 });
                 ui.menu_button("Edit", |ui| {
+                    if !self.circuit_open {
+                        ui.disable();
+                    }
                     if ui
                         .add_enabled(self.doc.can_undo(), egui::Button::new("Undo   Ctrl+Z"))
                         .clicked()
@@ -1908,6 +1963,9 @@ impl DunbrecApp {
                     }
                 });
                 ui.menu_button("Simulate", |ui| {
+                    if !self.circuit_open {
+                        ui.disable();
+                    }
                     ui.checkbox(&mut self.live_dc, "Live DC operating point");
                     ui.checkbox(&mut self.show_voltages, "Show node voltages on schematic");
                     if ui.button("Recalculate DC now").clicked() {
@@ -1916,6 +1974,9 @@ impl DunbrecApp {
                     }
                 });
                 ui.menu_button("Instruments", |ui| {
+                    if !self.circuit_open {
+                        ui.disable();
+                    }
                     ui.checkbox(&mut self.bench.show_scope, "📈 Oscilloscope");
                     ui.checkbox(&mut self.bench.show_meter, "🔢 Multimeter");
                     ui.checkbox(&mut self.bench.show_logic, "📊 Logic analyser");
@@ -2449,6 +2510,8 @@ struct PaneViewer<'a> {
     ai: &'a crate::ai::AiSettings,
     title: &'a str,
     open_settings: &'a mut bool,
+    /// The user closed the schematic's tab: the circuit is to be closed.
+    close_circuit: &'a mut bool,
 }
 
 impl TabViewer for PaneViewer<'_> {
@@ -2511,7 +2574,7 @@ impl TabViewer for PaneViewer<'_> {
                     None => {}
                 }
             }
-            Pane::Retired => {}
+            Pane::Workspace | Pane::Retired => {}
         }
     }
 
@@ -2520,7 +2583,19 @@ impl TabViewer for PaneViewer<'_> {
     }
 
     fn allowed_in_windows(&self, tab: &mut Pane) -> bool {
-        tab.closeable()
+        tab.floats()
+    }
+
+    /// Closing the schematic's tab (its close button, a middle click, or the
+    /// tab's menu) closes the circuit, after the question about unsaved
+    /// changes; the tab itself is taken out by the circuit closing.
+    fn on_close(&mut self, tab: &mut Pane) -> OnCloseResponse {
+        if *tab == Pane::Schematic {
+            *self.close_circuit = true;
+            OnCloseResponse::Ignore
+        } else {
+            OnCloseResponse::Close
+        }
     }
 
     /// Every panel scrolls itself, or draws edge to edge.
@@ -2534,11 +2609,33 @@ impl TabViewer for PaneViewer<'_> {
         tab: &Pane,
         global: &egui_dock::TabStyle,
     ) -> Option<egui_dock::TabStyle> {
-        (*tab == Pane::Schematic).then(|| {
-            let mut style = global.clone();
-            style.tab_body.inner_margin = egui::Margin::ZERO;
-            style
-        })
+        match tab {
+            Pane::Schematic => {
+                let mut style = global.clone();
+                style.tab_body.inner_margin = egui::Margin::ZERO;
+                Some(style)
+            }
+            // The empty central area: its tab is not drawn.
+            Pane::Workspace => {
+                let mut style = global.clone();
+                for s in [
+                    &mut style.active,
+                    &mut style.inactive,
+                    &mut style.focused,
+                    &mut style.hovered,
+                    &mut style.inactive_with_kb_focus,
+                    &mut style.active_with_kb_focus,
+                    &mut style.focused_with_kb_focus,
+                ] {
+                    s.bg_fill = egui::Color32::TRANSPARENT;
+                    s.outline_color = egui::Color32::TRANSPARENT;
+                    s.text_color = egui::Color32::TRANSPARENT;
+                }
+                style.minimum_width = Some(0.0);
+                Some(style)
+            }
+            _ => None,
+        }
     }
 }
 
@@ -2594,11 +2691,16 @@ impl eframe::App for DunbrecApp {
             ctx.request_repaint();
         }
 
-        let title = format!(
-            "{}{} — Dunbrec",
-            self.doc.display_name(),
-            if self.doc.is_dirty() { " •" } else { "" }
-        );
+        let title = if self.circuit_open {
+            format!(
+                "{}{} — Dunbrec",
+                self.doc.display_name(),
+                if self.doc.is_dirty() { " •" } else { "" }
+            )
+        } else {
+            let name = self.project.as_ref().map(|p| p.name());
+            format!("{} — Dunbrec", name.unwrap_or_default())
+        };
         if title != self.title {
             ctx.send_viewport_cmd(ViewportCommand::Title(title.clone()));
             self.title = title;

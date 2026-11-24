@@ -1334,7 +1334,6 @@ mod tests {
         assert_eq!(node_of(&s, "R1", 1), "VOUT");
     }
 
-
     /// Draw the schematic as text: wires `-` `|`, pins and parts by the first
     /// letter of their designator, ground `G`, labels in lower case.
     fn ascii(s: &Schematic) -> String {
@@ -1367,7 +1366,10 @@ mod tests {
         }
         for l in &s.labels {
             for (i, ch) in l.name.chars().enumerate() {
-                cells.insert((l.position.x + 1 + i as i32, l.position.y), ch.to_ascii_lowercase());
+                cells.insert(
+                    (l.position.x + 1 + i as i32, l.position.y),
+                    ch.to_ascii_lowercase(),
+                );
             }
         }
         let (x1, y1) = (
@@ -1403,8 +1405,11 @@ Q1 npn 2N3904 COL BASE EMIT",
         )
         .unwrap();
         let notes = add_parts(&mut s, &parts).unwrap();
-        println!("{}
-{notes:?}", ascii(&s));
+        println!(
+            "{}
+{notes:?}",
+            ascii(&s)
+        );
         assert!(notes.iter().any(|n| n.contains("with wires")), "{notes:?}");
         for (d, pin, net) in [
             ("V1", 0, "VCC"),
@@ -1422,7 +1427,6 @@ Q1 npn 2N3904 COL BASE EMIT",
         }
         assert_eq!(node_of(&s, "Re", 1), "0");
     }
-
 
     #[test]
     fn other_new_circuits_are_drawn_and_stay_correct() {
@@ -1459,14 +1463,16 @@ C1 capacitor 10u THR 0
             let mut s = Schematic::new();
             let parts = parse_add(text).unwrap();
             let notes = add_parts(&mut s, &parts).unwrap_or_else(|e| panic!("{name}: {e}"));
-            println!("== {name}: {notes:?}
-{}", ascii(&s));
+            println!(
+                "== {name}: {notes:?}
+{}",
+                ascii(&s)
+            );
             for (d, pin, net) in checks {
                 assert_eq!(node_of(&s, d, pin), net, "{name}: {d} pin {pin}");
             }
         }
     }
-
 
     #[test]
     fn a_sine_source_is_added_to_an_existing_input() {
@@ -1489,8 +1495,11 @@ C1 capacitor 10u INPUT BASE
                 if (amplitude - 0.01).abs() < 1e-12 && (frequency - 1000.0).abs() < 1e-9
         ));
         let notes = add_parts(&mut s, &src).unwrap();
-        println!("{}
-{notes:?}", ascii(&s));
+        println!(
+            "{}
+{notes:?}",
+            ascii(&s)
+        );
         assert_eq!(node_of(&s, "Vin", 0), "INPUT");
         assert_eq!(node_of(&s, "Vin", 1), "0");
         assert!(parse_add("Vin vsine 5 INPUT 0").is_err());

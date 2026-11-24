@@ -1037,7 +1037,10 @@ mod tests {
         assert!(other.file.is_file() && new.is_file());
         // Only the case changing works too.
         let upper = rename_file(&new, "NEW NAME").unwrap();
-        assert_eq!(upper.file_name().unwrap().to_string_lossy(), "NEW NAME.dbrproj");
+        assert_eq!(
+            upper.file_name().unwrap().to_string_lossy(),
+            "NEW NAME.dbrproj"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

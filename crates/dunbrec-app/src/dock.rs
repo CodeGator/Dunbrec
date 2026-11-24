@@ -26,6 +26,10 @@ pub enum Pane {
     Project,
     /// Chat with a language model about the open circuit and firmware.
     Assistant,
+    /// Nothing, held in the central area while no file is open in it, so the
+    /// area stays and the layout around it does not collapse. Its tab is
+    /// drawn invisible.
+    Workspace,
     /// A panel an older build could dock (the instruments). Layouts saved by
     /// those builds still load; these tabs are dropped on the way in.
     #[serde(other)]
@@ -54,13 +58,20 @@ impl Pane {
             Pane::Code => "Code",
             Pane::Project => "Project",
             Pane::Assistant => "Assistant",
-            Pane::Retired => "",
+            Pane::Workspace | Pane::Retired => "",
         }
     }
 
-    /// The schematic is the one panel that cannot be closed.
+    /// Every panel can be closed except the empty central area. Closing the
+    /// schematic closes the circuit.
     pub fn closeable(self) -> bool {
-        self != Pane::Schematic
+        self != Pane::Workspace
+    }
+
+    /// Whether the panel may be dragged out into a window of its own. The
+    /// central area's contents stay in it, or the layout would collapse.
+    pub fn floats(self) -> bool {
+        !matches!(self, Pane::Schematic | Pane::Workspace)
     }
 }
 
@@ -144,6 +155,7 @@ pub fn open(dock: &mut DockState<Pane>, pane: Pane) {
                 dock.push_to_first_leaf(pane);
             }
         }
+        Pane::Workspace => dock.push_to_first_leaf(pane),
         Pane::Retired => {}
     }
 }
@@ -174,6 +186,49 @@ fn join(dock: &mut DockState<Pane>, group: &[Pane], pane: Pane) -> bool {
     true
 }
 
+/// Put `new` in front, in the tab group `old` is in, and take `old` out. If
+/// `old` was alone there, the group (and so the layout around it) stays.
+fn swap(dock: &mut DockState<Pane>, old: Pane, new: Pane) -> bool {
+    let Some((surface, node, tab)) = dock.find_tab(&old) else {
+        return false;
+    };
+    dock.set_focused_node_and_surface((surface, node));
+    dock.push_to_focused_leaf(new);
+    dock.remove_tab((surface, node, tab));
+    bring_to_front(dock, new);
+    true
+}
+
+/// Keep the central area alive. The schematic is in the layout while a
+/// circuit is open, and the Code panel goes with the circuit. When neither is
+/// open, the empty [`Pane::Workspace`] holds the area, so the panels around it
+/// stay where they are instead of spreading into the space.
+pub fn sync_documents(dock: &mut DockState<Pane>, circuit_open: bool) {
+    if !circuit_open {
+        close(dock, Pane::Code);
+    }
+    match (circuit_open, is_open(dock, Pane::Schematic)) {
+        (true, false) => {
+            if !swap(dock, Pane::Workspace, Pane::Schematic) {
+                open(dock, Pane::Schematic);
+            }
+        }
+        (false, true) if is_open(dock, Pane::Workspace) => close(dock, Pane::Schematic),
+        // The swap puts the empty area in the schematic's place; if it could
+        // not, the schematic just goes.
+        (false, true) if !swap(dock, Pane::Schematic, Pane::Workspace) => {
+            close(dock, Pane::Schematic)
+        }
+        _ => {}
+    }
+    let documents = is_open(dock, Pane::Schematic) || is_open(dock, Pane::Code);
+    match (documents, is_open(dock, Pane::Workspace)) {
+        (true, true) => close(dock, Pane::Workspace),
+        (false, false) => open(dock, Pane::Workspace),
+        _ => {}
+    }
+}
+
 /// Make a restored layout safe to use: tabs from panels that no longer dock
 /// are dropped (along with any floating window they leave empty, which the
 /// dock cannot draw); a panel appearing twice keeps its first tab; and a
@@ -201,7 +256,7 @@ pub fn sanitize(mut state: DockState<Pane>) -> DockState<Pane> {
     for surface in emptied.into_iter().rev() {
         state.remove_surface(surface);
     }
-    if seen.contains(&Pane::Schematic) {
+    if seen.contains(&Pane::Schematic) || seen.contains(&Pane::Workspace) {
         state
     } else {
         default_layout()
@@ -277,6 +332,85 @@ mod tests {
             leaf_of(&dock, Pane::Schematic),
             leaf_of(&dock, Pane::Properties)
         );
+    }
+
+    #[test]
+    fn the_central_area_stays_when_the_circuit_closes() {
+        let near = |a: f32, b: f32| (a - b).abs() < 1e-4;
+        let mut dock = default_layout();
+        let centre = leaf_of(&dock, Pane::Schematic);
+        sync_documents(&mut dock, false);
+        assert!(!is_open(&dock, Pane::Schematic));
+        assert_eq!(leaf_of(&dock, Pane::Workspace), centre, "the same area");
+        // Nothing around it moved or spread.
+        assert!(near(share_of(&dock, Pane::Palette), PALETTE_SHARE));
+        assert!(near(
+            share_of(&dock, Pane::Properties),
+            1.0 - SCHEMATIC_SHARE
+        ));
+        // Opening a circuit puts the schematic in the area.
+        sync_documents(&mut dock, true);
+        assert!(is_open(&dock, Pane::Schematic) && !is_open(&dock, Pane::Workspace));
+        assert_eq!(leaf_of(&dock, Pane::Schematic), centre);
+        assert!(near(share_of(&dock, Pane::Schematic), SCHEMATIC_SHARE));
+        // Syncing again changes nothing.
+        sync_documents(&mut dock, true);
+        assert_eq!(
+            panes(&dock)
+                .iter()
+                .filter(|p| **p == Pane::Schematic)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn code_goes_with_the_circuit_and_the_area_is_kept() {
+        let mut dock = default_layout();
+        let centre = leaf_of(&dock, Pane::Schematic);
+        open(&mut dock, Pane::Code);
+        sync_documents(&mut dock, true);
+        assert_eq!(leaf_of(&dock, Pane::Code), centre);
+        sync_documents(&mut dock, false);
+        assert!(!is_open(&dock, Pane::Code) && !is_open(&dock, Pane::Schematic));
+        assert_eq!(leaf_of(&dock, Pane::Workspace), centre);
+        assert_eq!(
+            panes(&dock)
+                .iter()
+                .filter(|p| **p == Pane::Workspace)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_layout_without_a_central_area_gets_one() {
+        // Even with everything else closed, or a layout saved before the
+        // central area existed.
+        let mut dock = default_layout();
+        for p in Pane::SIDE_PANELS {
+            close(&mut dock, p);
+        }
+        sync_documents(&mut dock, false);
+        assert_eq!(panes(&dock), vec![Pane::Workspace]);
+        sync_documents(&mut dock, true);
+        assert_eq!(panes(&dock), vec![Pane::Schematic]);
+        // A layout kept with only the empty area is a good layout.
+        let mut kept = default_layout();
+        sync_documents(&mut kept, false);
+        let text = ron::to_string(&kept).unwrap();
+        let loaded: DockState<Pane> = ron::from_str(&text).unwrap();
+        assert!(is_open(&sanitize(loaded), Pane::Workspace));
+    }
+
+    #[test]
+    fn the_schematic_closes_but_stays_in_the_central_area() {
+        assert!(Pane::Schematic.closeable() && Pane::Code.closeable());
+        assert!(!Pane::Workspace.closeable());
+        // What sits in the central area is never dragged out of it, or the
+        // layout around it would collapse.
+        assert!(!Pane::Schematic.floats() && !Pane::Workspace.floats());
+        assert!(Pane::Palette.floats() && Pane::Code.floats());
     }
 
     /// Which tab of `pane`'s group is in front.

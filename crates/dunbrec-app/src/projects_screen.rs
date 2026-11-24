@@ -377,7 +377,9 @@ impl ProjectsScreen {
                     ui.add_enabled_ui(exists, |ui| {
                         if ui
                             .small_button("Rename…")
-                            .on_hover_text("Rename the project (its circuit files keep their names)")
+                            .on_hover_text(
+                                "Rename the project (its circuit files keep their names)",
+                            )
                             .clicked()
                         {
                             self.rename = Some(Rename {
@@ -462,7 +464,10 @@ pub fn show_in_folder(path: &Path) -> Result<(), String> {
         .arg(format!("/select,{}", path.display()))
         .spawn();
     #[cfg(target_os = "macos")]
-    let result = std::process::Command::new("open").arg("-R").arg(path).spawn();
+    let result = std::process::Command::new("open")
+        .arg("-R")
+        .arg(path)
+        .spawn();
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     let result = std::process::Command::new("xdg-open")
         .arg(path.parent().unwrap_or(path))
@@ -499,7 +504,11 @@ mod tests {
 
     #[test]
     fn the_list_is_sorted_by_name_or_folder_or_left_as_opened() {
-        let all = paths(&["C:/B/zeta.dbrproj", "C:/A/Mid.dbrproj", "C:/C/alpha.dbrproj"]);
+        let all = paths(&[
+            "C:/B/zeta.dbrproj",
+            "C:/A/Mid.dbrproj",
+            "C:/C/alpha.dbrproj",
+        ]);
         let sorted = |s| stems(&arrange(&all, "", s, Filter::All, |_| true));
         assert_eq!(sorted(Sort::Recent), ["zeta", "Mid", "alpha"]);
         assert_eq!(sorted(Sort::NameAz), ["alpha", "Mid", "zeta"]);
