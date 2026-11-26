@@ -56,3 +56,5 @@ python tools/make_icon.py   # regenerate assets/dunbrec.png and .ico
 13. Dockable, draggable panels (egui_dock) with a remembered layout ✅
 14. 0.4.0: Settings, the assistant (Ollama or Claude) with approved edits, pop-out instruments,
     text size, message boxes for every question, Code panel tabs, tidier project behaviour ✅
+15. 0.5.0: a Projects screen, several circuits open at once with their source files, build and
+    run that save first, easier schematic editing, larger menus and toolbar, coloured sketches ✅

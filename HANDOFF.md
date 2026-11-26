@@ -8,7 +8,7 @@ high level, one line on what it is written in, no steps and no other technical d
 **no user guide**, by the user's decision: the project is too young and changes too much to keep
 one up to date.
 
-*Last updated: 2026-11-26, version 0.5.0 in progress (0.4.0 released: assistant, settings, message boxes, project behaviour). The multi-document editor, designed in [docs/multi-document-editor.md](docs/multi-document-editor.md), is built (all stages).*
+*Last updated: 2026-11-26, version 0.5.0 released (several circuits open at once, designed in [docs/multi-document-editor.md](docs/multi-document-editor.md) and built in all its stages; easier schematic editing; larger menus and toolbar; coloured sketches).*
 
 ## Status
 
@@ -16,8 +16,9 @@ All eleven planned phases are done and committed on `main` (one commit per phase
 plus Phase 12 (integrated circuits) and a fix for probes failing after opening a document.
 Version 0.3.0 was released on 2026-11-21 (tag `v0.3.0`, merged to `main`; 0.1.0 and 0.2.0 were
 released the same day). Version 0.4.0 was merged to `main` and pushed to `release` on 2026-11-22;
-the workflow drafts the GitHub release `v0.4.0`, which is published by hand. Work branches are
-named after the application version and merged into `main`; this one is `0.5.0`. A release is cut by merging the branch into `main` and pushing `main:release`, which
+the workflow drafts the GitHub release `v0.4.0`, which is published by hand. Version 0.5.0 was
+merged to `main` and pushed to `release` the same way on 2026-11-26. Work branches are named after
+the application version and merged into `main`. A release is cut by merging the branch into `main` and pushing `main:release`, which
 drafts the GitHub release (see `.github/workflows/release.yml`).
 
 | Phase | Content |
@@ -33,7 +34,7 @@ drafts the GitHub release (see `.github/workflows/release.yml`).
 | 13 | Dockable panels: every panel is an `egui_dock` tab; layout saved between sessions |
 | 0.2.0 | Switches group: SPST, SPDT, DPST, DPDT (`ComponentKind::MultiSwitch`, `SwitchContacts` device) and hold-to-press push buttons (`Switch { momentary }`, `Canvas::push_buttons`) |
 | 0.3.0 | Projects (a `.dbrproj` file listing circuits and firmware files), Junction and hops, J key, CD4066, Linear group |
-| 0.5.0 (in progress) | Projects screen (nothing else shown without a project); assistant draws new circuits with real wires and can add sine sources; no circuit open until one is opened; a central area that never collapses; closable schematic tab. See "0.5.0" below |
+| 0.5.0 | Projects screen (nothing else shown without a project); assistant draws new circuits with real wires and can add sine sources; no circuit open until one is opened; a central area that never collapses; closable schematic tab. See "0.5.0" below |
 | 0.4.0 | Settings dialog; Assistant (Ollama or Claude); pop-out instruments; text size; every confirmation a message box; Code panel tabs; project behaviour changes. See "0.4.0" below |
 
 Health at handoff: `cargo test --workspace` 509 passed, 0 failed (2 ignored: a real Recycle Bin check and an
@@ -280,9 +281,9 @@ Other 0.4.0 behaviour:
 - **There is always a document.** *Superseded in 0.5.0: see "0.5.0". A `Document` still always
   exists in memory, but `circuit_open` says whether it is shown.*
 
-## 0.5.0 (in progress)
+## 0.5.0
 
-The branch is `0.5.0`. What it adds, and the decisions behind it (all agreed with the user):
+Built on the `0.5.0` branch. What it adds, and the decisions behind it (all agreed with the user):
 
 **Assistant builds circuits properly.**
 
