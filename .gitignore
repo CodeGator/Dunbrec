@@ -2,6 +2,9 @@
 **/*.rs.bk
 .claude/settings.local.json
 
+# Settings of JetBrains IDEs
+.idea/
+
 # Test projects made with the app while developing
 /projects/
 /Projects/
