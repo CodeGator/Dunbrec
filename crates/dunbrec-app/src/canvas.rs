@@ -953,6 +953,9 @@ pub fn value_text(kind: &ComponentKind) -> String {
         ComponentKind::Clock { frequency, .. } => format_value(*frequency, "Hz"),
         ComponentKind::LogicSwitch { high } => (if *high { "high" } else { "low" }).into(),
         ComponentKind::Led { colour } | ComponentKind::LedBar { colour } => colour.name().into(),
+        ComponentKind::SevenSegment { colour, common } => {
+            format!("{}, {}", colour.name(), common.name())
+        }
         ComponentKind::Mcu { firmware, .. } => firmware_label(firmware),
         ComponentKind::OpAmp { part } => part.clone(),
         ComponentKind::Timer555 => "NE555".into(),
@@ -989,18 +992,19 @@ impl Painter<'_> {
         (self.camera.scale * 0.12).clamp(1.0, 3.0)
     }
 
-    /// A bar display's colours, drawn behind its symbol: each bar pale when
+    /// The outline of a display's LED `segment` on screen.
+    fn segment_outline(&self, c: &dunbrec_core::Component, segment: usize, grow: f32) -> Vec<Pos2> {
+        symbols::segment_area(&c.kind, segment, grow, c.mirrored)
+            .into_iter()
+            .map(|p| self.screen(symbols::to_schematic(c, p)))
+            .collect()
+    }
+
+    /// A display's colours, drawn behind its symbol: each segment pale when
     /// off, and filled with a glow around it as bright as its current.
-    fn bar_light(&self, c: &dunbrec_core::Component, light: Color32, currents: &[f64]) {
-        let at = |x: f32, y: f32| self.screen(symbols::to_schematic(c, pos2(x, y)));
-        let block = |area: Rect, colour: Color32| {
-            let corners = [
-                area.left_top(),
-                area.right_top(),
-                area.right_bottom(),
-                area.left_bottom(),
-            ];
-            let corners = corners.iter().map(|p| at(p.x, p.y)).collect();
+    fn display_light(&self, c: &dunbrec_core::Component, light: Color32, currents: &[f64]) {
+        let block = |segment: usize, grow: f32, colour: Color32| {
+            let corners = self.segment_outline(c, segment, grow);
             self.painter
                 .add(Shape::convex_polygon(corners, colour, Stroke::NONE));
         };
@@ -1008,16 +1012,14 @@ impl Painter<'_> {
         let brightness: Vec<f32> = (0..segments)
             .map(|k| leds::brightness(currents.get(k).copied().unwrap_or(0.0)))
             .collect();
-        // Every glow first, so that none lies over a neighbouring bar.
+        // Every glow first, so that none lies over a neighbouring segment.
         for (k, &b) in brightness.iter().enumerate() {
             if b > 0.0 {
-                let glow = symbols::bar_segment(k).expand(0.35);
-                block(glow, light.gamma_multiply(0.35 * b));
+                block(k, 0.35, light.gamma_multiply(0.35 * b));
             }
         }
         for (k, &b) in brightness.iter().enumerate() {
-            let fill = light.gamma_multiply(0.22 + 0.78 * b);
-            block(symbols::bar_segment(k), fill);
+            block(k, 0.0, light.gamma_multiply(0.22 + 0.78 * b));
         }
     }
 
@@ -1089,6 +1091,14 @@ impl Painter<'_> {
                 }
             }
         }
+        // A digit's segments are outlined here, not in its symbol, so that
+        // mirroring the part does not mirror the digit.
+        if let ComponentKind::SevenSegment { .. } = c.kind {
+            for segment in 0..c.kind.led_segments().map_or(0, |s| s.1.len()) {
+                let outline = self.segment_outline(c, segment, 0.0);
+                self.painter.add(Shape::closed_line(outline, stroke));
+            }
+        }
         if let Some(text_color) = text_color
             && self.camera.scale >= 6.0
         {
@@ -1154,9 +1164,8 @@ fn label_cursor(painter: &egui::Painter, at: Pos2, fill: Color32, ink: Color32) 
 }
 
 /// The warning over an LED carrying more than it should, ending above `at`.
-/// `segment` says which LED of a display it is.
-fn too_much_current(painter: &egui::Painter, at: Pos2, segment: Option<usize>, current: f64) {
-    let which = segment.map_or(String::new(), |k| format!("LED {}: ", k + 1));
+/// `which` says which LED of a display it is.
+fn too_much_current(painter: &egui::Painter, at: Pos2, which: &str, current: f64) {
     let text = format!("⚠ {which}{} - too much", format_value(current, "A"));
     let text = painter.layout_no_wrap(text, FontId::proportional(14.0), Color32::WHITE);
     let corner = at - vec2(text.size().x / 2.0, text.size().y + 3.0);
@@ -1582,7 +1591,7 @@ impl Canvas {
                 p.led_light(c, leds::light(colour), leds::brightness(current));
             }
             if let Some((colour, _)) = c.kind.led_segments() {
-                p.bar_light(c, leds::light(colour), currents);
+                p.display_light(c, leds::light(colour), currents);
             }
             p.component(
                 c,
@@ -1682,7 +1691,13 @@ impl Canvas {
                     2.6
                 };
                 let above = centre - vec2(0.0, self.camera.scale * rise);
-                too_much_current(&painter, above, display.then_some(segment), current);
+                let name = c.kind.segment_name(segment);
+                let which = match c.kind {
+                    ComponentKind::SevenSegment { .. } => format!("segment {name}: "),
+                    _ if display => format!("LED {name}: "),
+                    _ => String::new(),
+                };
+                too_much_current(&painter, above, &which, current);
             }
         }
 
@@ -2976,6 +2991,55 @@ mod tests {
         (currents[2], currents[8]) = (0.035, 0.050);
         let (.., warning) = seen(&mut rig, currents);
         assert_eq!(warning.as_deref(), Some("⚠ LED 9: 50 mA - too much"));
+    }
+
+    #[test]
+    fn a_digit_lights_by_segment_and_reads_the_same_when_mirrored() {
+        use dunbrec_core::{CommonPin, LedColour};
+        let mut s = Schematic::new();
+        let (colour, common) = (LedColour::Green, CommonPin::Cathode);
+        let kind = ComponentKind::SevenSegment { colour, common };
+        let id = s.add_component(kind, Point::new(10, 10));
+        let mut rig = Rig::new(s);
+        let green = leds::light(colour);
+        // Where the brightly lit shapes are, and the warning if there is one.
+        let seen = |rig: &mut Rig, currents: Vec<f64>| {
+            rig.lights.leds = [(id, currents)].into_iter().collect();
+            rig.hold(NO_KEY);
+            let mut lit = Vec::new();
+            let mut warning = None;
+            for shape in &rig.drawn {
+                match &shape.shape {
+                    egui::Shape::Path(p) if p.fill == green => {
+                        lit.push(p.visual_bounding_rect().center());
+                    }
+                    egui::Shape::Text(t) if t.galley.text().contains("too much") => {
+                        warning = Some(t.galley.text().to_string());
+                    }
+                    _ => {}
+                }
+            }
+            (lit, warning)
+        };
+        assert_eq!(seen(&mut rig, Vec::new()), (Vec::new(), None));
+        // Segment b, upper right, and the decimal point, low and further right.
+        let mut currents = vec![0.0; 8];
+        (currents[1], currents[7]) = (0.020, 0.020);
+        let (lit, warning) = seen(&mut rig, currents.clone());
+        assert_eq!(warning, None);
+        let [b, dp] = lit[..] else {
+            panic!("{lit:?}");
+        };
+        assert!(b.x < dp.x && b.y < dp.y, "{b} {dp}");
+
+        rig.doc
+            .edit(|s| s.component_mut(id).unwrap().mirrored = true);
+        let (mirrored, _) = seen(&mut rig, currents.clone());
+        assert!((mirrored[0] - b).length() < 0.5 && (mirrored[1] - dp).length() < 0.5);
+
+        currents[6] = 0.045;
+        let (_, warning) = seen(&mut rig, currents);
+        assert_eq!(warning.as_deref(), Some("⚠ segment g: 45 mA - too much"));
     }
 
     #[test]

@@ -244,14 +244,17 @@ fn write_netlist(
                 colour.model().name
             ),
             // A display is written as its LEDs, one diode each.
-            K::LedBar { colour } => {
+            K::LedBar { colour } | K::SevenSegment { colour, .. } => {
                 let name = element_name('D', d);
                 let model = colour.model().name;
                 let segments = e.kind.led_segments().map_or(&[][..], |s| s.1);
                 let lines: Vec<String> = segments
                     .iter()
                     .enumerate()
-                    .map(|(i, &(a, k))| format!("{name}_{} {} {} {model}", i + 1, n[a], n[k]))
+                    .map(|(i, &(a, k))| {
+                        let segment = e.kind.segment_name(i);
+                        format!("{name}_{segment} {} {} {model}", n[a], n[k])
+                    })
                     .collect();
                 lines.join("\n")
             }
@@ -473,6 +476,23 @@ mod tests {
         assert!(text.contains("DS1_10 a10 k10 DUNBREC_LED_YELLOW"), "{text}");
         assert_eq!(text.matches(".model DUNBREC_LED_YELLOW D(").count(), 1);
         assert_eq!(import(&text).unwrap().parts.len(), 10);
+    }
+
+    #[test]
+    fn a_digit_is_written_with_its_common_pin_on_the_right_side_of_each_led() {
+        use dunbrec_core::CommonPin;
+        let names = ["a", "b", "c", "d", "e", "f", "g", "dp", "com"];
+        let colour = LedColour::Red;
+        let written = |common| {
+            let kind = K::SevenSegment { colour, common };
+            export(&lone_part(kind, &names), "digit", &[]).unwrap()
+        };
+        let text = written(CommonPin::Cathode);
+        assert!(text.contains("DS1_b b com DUNBREC_LED_RED"), "{text}");
+        assert!(text.contains("DS1_dp dp com DUNBREC_LED_RED"), "{text}");
+        assert_eq!(import(&text).unwrap().parts.len(), 8);
+        let text = written(CommonPin::Anode);
+        assert!(text.contains("DS1_b com b DUNBREC_LED_RED"), "{text}");
     }
 
     /// A part with every pin on its own labelled net, plus a ground.

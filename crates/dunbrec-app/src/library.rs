@@ -273,6 +273,22 @@ pub fn palette() -> &'static [PaletteEntry] {
             },
         },
         PaletteEntry {
+            name: "7-segment, common cathode",
+            group: "Displays",
+            make: || ComponentKind::SevenSegment {
+                colour: dunbrec_core::LedColour::Red,
+                common: dunbrec_core::CommonPin::Cathode,
+            },
+        },
+        PaletteEntry {
+            name: "7-segment, common anode",
+            group: "Displays",
+            make: || ComponentKind::SevenSegment {
+                colour: dunbrec_core::LedColour::Red,
+                common: dunbrec_core::CommonPin::Anode,
+            },
+        },
+        PaletteEntry {
             name: "741 op-amp",
             group: "Linear",
             make: || ComponentKind::OpAmp {
@@ -560,7 +576,12 @@ mod tests {
         assert!(names(&found).contains(&"Logic LED"));
         assert_eq!(
             names(&palette_groups("displays")),
-            vec!["LED", "10-segment LED bar"]
+            vec![
+                "LED",
+                "10-segment LED bar",
+                "7-segment, common cathode",
+                "7-segment, common anode"
+            ]
         );
     }
 

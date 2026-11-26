@@ -116,8 +116,10 @@ impl Netlist {
     }
 
     /// Nets nothing was meant to be joined to, so not worth showing voltages
-    /// for or remarking on: an unused microcontroller I/O pin, and both pins
-    /// of an unused LED of a display (no other pin, no label).
+    /// for or remarking on (no other pin, no label): an unused
+    /// microcontroller I/O pin, and the pins that only unused LEDs of a
+    /// display are on. An LED is unused if neither of its pins is joined, or
+    /// if one that is often left open (a decimal point) is not.
     pub fn unused_nets(&self) -> HashSet<NodeId> {
         let mut pins: HashMap<NodeId, usize> = HashMap::new();
         for &n in self.elements.iter().flat_map(|e| &e.nodes) {
@@ -132,10 +134,17 @@ impl Netlist {
                 }
             }
             let segments = e.kind.led_segments().map_or(&[][..], |s| s.1);
-            for &(a, k) in segments {
-                let (a, k) = (e.nodes[a], e.nodes[k]);
-                if alone(a) && alone(k) {
-                    unused.extend([a, k]);
+            let optional = e.kind.optional_pins();
+            let spare = |&(a, k): &(usize, usize)| {
+                let open = |p: usize| alone(e.nodes[p]);
+                (open(a) && open(k)) || [a, k].iter().any(|&p| optional.contains(&p) && open(p))
+            };
+            // A pin shared with a used LED is expected to be joined.
+            let (idle, used): (Vec<_>, Vec<_>) = segments.iter().copied().partition(|s| spare(s));
+            for pin in idle.into_iter().flat_map(|(a, k)| [a, k]) {
+                let node = e.nodes[pin];
+                if alone(node) && !used.iter().any(|&(a, k)| a == pin || k == pin) {
+                    unused.insert(node);
                 }
             }
         }
@@ -548,6 +557,42 @@ mod tests {
         let n = build_netlist(&s);
         assert_eq!(unconnected(&n), ["A1"]);
         assert_eq!(n.unused_nets().len(), 18);
+    }
+
+    #[test]
+    fn a_digits_decimal_point_may_be_left_open_but_not_its_other_pins() {
+        use crate::schematic::{CommonPin, LedColour};
+        for common in CommonPin::ALL {
+            let mut s = Schematic::new();
+            let colour = LedColour::Red;
+            let kind = ComponentKind::SevenSegment { colour, common };
+            let id = s.add_component(kind.clone(), Point::new(0, 0));
+            let open = |s: &Schematic| -> Vec<String> {
+                build_netlist(s)
+                    .diagnostics
+                    .into_iter()
+                    .filter_map(|d| match d {
+                        Diagnostic::UnconnectedPin { component, pin } if component == id => {
+                            Some(pin)
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            };
+            // On its own, nothing to say.
+            assert!(open(&s).is_empty(), "{:?}", open(&s));
+            // Segments a to g labelled: only the common pin is missing.
+            for (pin, at) in kind.pins().iter().zip(0..).take(7) {
+                s.add_label(format!("S{at}"), pin.offset);
+            }
+            assert_eq!(open(&s), ["COM"]);
+            s.add_component(ComponentKind::Ground, Point::new(6, 0));
+            assert!(open(&s).is_empty(), "{:?}", open(&s));
+            // The decimal point alone needs the common pin too, and a missing
+            // letter segment is remarked on.
+            s.labels.pop();
+            assert_eq!(open(&s), ["g"]);
+        }
     }
 
     #[test]

@@ -3,8 +3,8 @@
 use std::collections::HashMap;
 
 use dunbrec_core::{
-    ComponentId, ComponentKind, LedColour, ModelKind, Polarity, Schematic, SourceLanguage,
-    SwitchForm, Waveform,
+    CommonPin, ComponentId, ComponentKind, LedColour, ModelKind, Polarity, Schematic,
+    SourceLanguage, SwitchForm, Waveform,
     units::{format_value, parse_eng, parse_spice},
 };
 use egui::{Color32, RichText, Ui};
@@ -256,28 +256,34 @@ impl Properties {
                     }
                     ComponentKind::LogicLed => false,
                     ComponentKind::Led { colour } | ComponentKind::LedBar { colour } => {
-                        ui.label("Colour");
-                        let before = *colour;
-                        egui::ComboBox::from_id_salt(("led", id))
-                            .selected_text(colour.name())
+                        led_colour(ui, id, colour)
+                    }
+                    ComponentKind::SevenSegment { colour, common } => {
+                        let recoloured = led_colour(ui, id, colour);
+                        ui.label("Common pin");
+                        let before = *common;
+                        egui::ComboBox::from_id_salt(("common", id))
+                            .selected_text(common.name())
                             .show_ui(ui, |ui| {
-                                for c in LedColour::ALL {
-                                    ui.selectable_value(colour, c, c.name());
+                                for c in CommonPin::ALL {
+                                    ui.selectable_value(common, c, c.name());
                                 }
                             });
                         ui.end_row();
                         ui.label("");
                         ui.label(
-                            egui::RichText::new(format!(
-                                "About {} V across it when lit, and it needs a resistor in \
-                                 series: from 5 V, about {} Ω.",
-                                colour.forward_voltage(),
-                                colour.resistor_from_5v()
-                            ))
+                            egui::RichText::new(match common {
+                                CommonPin::Cathode => {
+                                    "Join COM to ground. A segment lights when its pin is                                      driven high through its resistor."
+                                }
+                                CommonPin::Anode => {
+                                    "Join COM to the supply. A segment lights when its pin is                                      pulled low through its resistor."
+                                }
+                            })
                             .weak(),
                         );
                         ui.end_row();
-                        *colour != before
+                        recoloured || *common != before
                     }
                     ComponentKind::OpAmp { part } => {
                         ui.label("Part");
@@ -888,11 +894,38 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
         ComponentKind::LogicLed => "Logic LED",
         ComponentKind::Led { .. } => "LED",
         ComponentKind::LedBar { .. } => "LED bar display",
+        ComponentKind::SevenSegment { .. } => "7-segment display",
         ComponentKind::Mcu { .. } => "Microcontroller (ATmega328P)",
         ComponentKind::OpAmp { .. } => "Operational amplifier",
         ComponentKind::Timer555 => "555 timer",
         ComponentKind::Cd4066 { .. } => "CD4066 analog switch",
     }
+}
+
+/// The colour of an LED part, and what that means for wiring it. True if it
+/// was changed.
+fn led_colour(ui: &mut Ui, id: ComponentId, colour: &mut LedColour) -> bool {
+    ui.label("Colour");
+    let before = *colour;
+    egui::ComboBox::from_id_salt(("led", id))
+        .selected_text(colour.name())
+        .show_ui(ui, |ui| {
+            for c in LedColour::ALL {
+                ui.selectable_value(colour, c, c.name());
+            }
+        });
+    ui.end_row();
+    ui.label("");
+    ui.label(
+        egui::RichText::new(format!(
+            "About {} V across it when lit, and it needs a resistor in series: from 5 V,              about {} Ω.",
+            colour.forward_voltage(),
+            colour.resistor_from_5v()
+        ))
+        .weak(),
+    );
+    ui.end_row();
+    *colour != before
 }
 
 #[cfg(test)]

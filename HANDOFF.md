@@ -8,9 +8,9 @@ high level, one line on what it is written in, no steps and no other technical d
 **no user guide**, by the user's decision: the project is too young and changes too much to keep
 one up to date.
 
-*Last updated: 2026-11-26, version 0.6.0 in progress: a single LED and a 10-segment LED bar (the
-first two LED displays), and every chip's program is now a visible source file. Version 0.5.0 is
-released and published. Start at "0.6.0" below.*
+*Last updated: 2026-11-26, version 0.6.0 in progress: the first three LED displays (single LED,
+10-segment bar, one-digit 7-segment), and every chip's program is now a visible source file.
+Version 0.5.0 is released and published. Start at "0.6.0" below.*
 
 ## Status
 
@@ -40,11 +40,11 @@ the draft is a separate step, done when the user asks (`gh release edit v<versio
 | 13 | Dockable panels: every panel is an `egui_dock` tab; layout saved between sessions |
 | 0.2.0 | Switches group: SPST, SPDT, DPST, DPDT (`ComponentKind::MultiSwitch`, `SwitchContacts` device) and hold-to-press push buttons (`Switch { momentary }`, `Canvas::push_buttons`) |
 | 0.3.0 | Projects (a `.dbrproj` file listing circuits and firmware files), Junction and hops, J key, CD4066, Linear group |
-| 0.6.0 (in progress) | LED and LED bar parts; a chip's program is always a source file; new circuits join the project when saved. See "0.6.0" below |
+| 0.6.0 (in progress) | LED, LED bar and 7-segment parts; a chip's program is always a source file; new circuits join the project when saved. See "0.6.0" below |
 | 0.5.0 | Projects screen (nothing else shown without a project); assistant draws new circuits with real wires and can add sine sources; no circuit open until one is opened; a central area that never collapses; closable schematic tab. See "0.5.0" below |
 | 0.4.0 | Settings dialog; Assistant (Ollama or Claude); pop-out instruments; text size; every confirmation a message box; Code panel tabs; project behaviour changes. See "0.4.0" below |
 
-Health at handoff: `cargo test --workspace` 527 passed, 0 failed (2 ignored: a real Recycle Bin check and an
+Health at handoff: `cargo test --workspace` 531 passed, 0 failed (2 ignored: a real Recycle Bin check and an
 emulator speed
 benchmark); `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --check`
 clean. Toolchain: Rust 1.99 (edition 2024, MSRV 1.90), Windows 11.
@@ -429,11 +429,10 @@ the demos look dead: blink changed every 12 s). `sync_speed` tells a running sim
 
 ## 0.6.0 (in progress)
 
-**Where things stand.** The single LED is committed (`eaae1d2`). The source-file changes below
-were built next, and the user has tried them and is happy. The bar display was built after that
-and the user has not yet tried it. Neither of the last two was committed when this was written
-(check `git status`); both touch `app.rs`, `library.rs` and this file. Next in the agreed plan is
-the one-digit 7-segment display, once the user is happy with the bar.
+**Where things stand.** Four pieces are committed, each tried by the user, who is happy with
+them: the single LED, the source-file changes below, the bar display and the one-digit 7-segment
+display. The branch is still only on this computer. Next in the agreed plan is the four-digit
+7-segment.
 
 **What a chip runs is always a file the user can see** (the user found it confusing that a demo
 ran with no source file; the table of changes was agreed).
@@ -455,8 +454,9 @@ ran with no source file; the table of changes was agreed).
 
 **LED displays** (asked for by the user; plan agreed 2026-11-26). Build in this order, letting the
 user try each: (1) single LED, *done*; (2) 10-segment bar display, each LED with its own two
-pins, *done, to be tried*; (3) one-digit 7-segment with decimal point, common cathode or common anode; (4) four-digit
-7-segment sharing its segment pins; (5) 14 or 16 segment.
+pins, *done*; (3) one-digit 7-segment with decimal point,
+common cathode or common anode, *done*; (4) four-digit 7-segment sharing its segment pins;
+(5) 14 or 16 segment.
 
 - *Electrically real* (the user's choice over a logic indicator): needs a series resistor, shines by
   current. The Logic LED stays for quick checks.
@@ -473,15 +473,22 @@ pins, *done, to be tried*; (3) one-digit 7-segment with decimal point, common ca
   - `ComponentKind::led_segments` gives the colour and each LED's anode and cathode pin. Netlist
     checks, the SPICE export (one diode per segment, `DS1_3`), drawing and `LedMeter` go by it.
   - It is simulated as a `Composite` of real LEDs (`macromodel::led_display`); `lamps` says how
-    many elements report through `Device::lamp_currents`. `led_display` still names the bar's
-    ports (`LED_BAR_PORTS`) itself, so another display needs its own port list chosen there.
-  - Currents are listed by segment as `DS1.3` (`lamp_name`): in a DC `OperatingPoint` in place
+    many elements report through `Device::lamp_currents`. Each display's port names are a static
+    list chosen in `led_display`.
+  - Currents are listed by segment as `DS1.3` or `DS1.dp` (`ComponentKind::segment_name`,
+    `lamp_name`): in a DC `OperatingPoint` in place
     of the part's own entry, and in a running circuit from `Sample::lamps` (`live_currents`).
     The multimeter refuses a display as a current probe and says to look under Values.
-  - An LED of a display with neither pin joined is unused (`Netlist::unused_nets`): no
-    unconnected-pin or floating-node warning and no voltages. One pin joined still warns.
-  - Drawing: `Painter::bar_light` and `symbols::bar_segment`. The 30 mA warning appears once per
-    display and names the worst LED.
+  - An LED of a display is unused if neither of its pins is joined, or if a pin often left open
+    (`optional_pins`: a digit's `dp`) is not (`Netlist::unused_nets`): no unconnected-pin or
+    floating-node warning and no voltages. A pin shared with a used LED still warns.
+  - Drawing: `Painter::display_light`, with each segment's shape from `symbols::segment_area`.
+    The 30 mA warning appears once per display and names the worst LED.
+- *7-segment:* `ComponentKind::SevenSegment { colour, common }`, pins `a`–`g` and `dp` on the
+  left and one `COM` on the right (a real part usually has two). A palette entry for each
+  `CommonPin`, also switchable in the properties. Mirroring moves the pins to the other sides but
+  leaves the digit the right way round (so its outlines are drawn by the canvas, not held in the
+  symbol); rotating turns the digit, as it would a real part.
 - `pins()` returns static lists, so each variant (common cathode or anode, digit count) needs its
   own.
 

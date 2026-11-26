@@ -2122,7 +2122,7 @@ impl DunbrecApp {
                     } else {
                         let (_, segments) = e.kind.led_segments()?;
                         (0..segments.len())
-                            .map(|k| find(&lamp_name(&e.designator, k)))
+                            .map(|k| find(&lamp_name(&e.designator, e.kind.segment_name(k))))
                             .collect::<Option<_>>()?
                     };
                     Some((e.component, currents))
@@ -3584,7 +3584,7 @@ fn live_currents(netlist: &Netlist, sample: &Sample) -> Vec<(String, f64)> {
                 lamps
                     .iter()
                     .enumerate()
-                    .map(|(k, &i)| (lamp_name(&e.designator, k), i)),
+                    .map(|(k, &i)| (lamp_name(&e.designator, e.kind.segment_name(k)), i)),
             ),
             None => named.push((e.designator.clone(), i)),
         }

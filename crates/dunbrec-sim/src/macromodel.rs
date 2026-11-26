@@ -291,32 +291,33 @@ pub fn cd4066() -> MacroModel {
     }
 }
 
-/// Names of a display's LEDs within it, by segment.
-const LAMP_NAMES: [&str; 16] = [
-    "S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8", "S9", "S10", "S11", "S12", "S13", "S14", "S15",
-    "S16",
-];
-
 /// A display of several LEDs: one for each of the part's segments, between
 /// its two pins.
 pub fn led_display(kind: &ComponentKind) -> Option<MacroModel> {
     let (colour, segments) = kind.led_segments()?;
     let pins = kind.pins();
+    let ports = match kind {
+        ComponentKind::SevenSegment { .. } => SEVEN_SEGMENT_PORTS,
+        _ => LED_BAR_PORTS,
+    };
     let mut e = Elements(Vec::new());
-    for (&(a, k), name) in segments.iter().zip(LAMP_NAMES) {
+    for (segment, &(a, k)) in segments.iter().enumerate() {
         e.add(
-            name,
+            kind.segment_name(segment),
             ComponentKind::Led { colour },
             &[pins[a].name, pins[k].name],
         );
     }
     Some(MacroModel {
-        ports: LED_BAR_PORTS,
+        ports,
         elements: e.0,
         models: ModelLibrary::new(),
         lamps: segments.len(),
     })
 }
+
+/// Pin names of the 7-segment display, in pin order.
+const SEVEN_SEGMENT_PORTS: &[&str] = &["a", "b", "c", "d", "e", "f", "g", "dp", "COM"];
 
 /// Pin names of the LED bar display, in pin order.
 const LED_BAR_PORTS: &[&str] = &[

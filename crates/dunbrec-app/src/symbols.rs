@@ -3,7 +3,9 @@
 //! Pin positions come from `dunbrec_core` (`ComponentKind::pins`); every
 //! symbol has a lead ending exactly on each pin.
 
-use dunbrec_core::{Component, ComponentKind, GateOp, Polarity, Rotation, SwitchForm, Waveform};
+use dunbrec_core::{
+    CommonPin, Component, ComponentKind, GateOp, Polarity, Rotation, SwitchForm, Waveform,
+};
 use egui::{Pos2, Rect, pos2};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -128,6 +130,73 @@ pub const LED_BODY: [(f32, f32); 4] = [(-0.8, -0.8), (-0.8, 0.8), (0.8, 0.0), (-
 pub fn bar_segment(segment: usize) -> Rect {
     let row = -9.0 + 2.0 * segment as f32;
     Rect::from_min_max(pos2(-1.6, row - 0.6), pos2(1.6, row + 0.6))
+}
+
+/// The lit area of LED `segment` (from 0) of a display, as a convex outline,
+/// widened all round by `grow`. A digit keeps the right way round when its
+/// part is `mirrored`: only its pins change sides.
+pub fn segment_area(kind: &ComponentKind, segment: usize, grow: f32, mirrored: bool) -> Vec<Pos2> {
+    if !matches!(kind, ComponentKind::SevenSegment { .. }) {
+        let r = bar_segment(segment).expand(grow);
+        return vec![
+            r.left_top(),
+            r.right_top(),
+            r.right_bottom(),
+            r.left_bottom(),
+        ];
+    }
+    // The digit's middle, half width and half height, a segment's half
+    // thickness, and the gap left where two meet.
+    const MIDDLE: f32 = -0.4;
+    const WIDE: f32 = 1.7;
+    const HIGH: f32 = 4.6;
+    const THICK: f32 = 0.42;
+    const GAP: f32 = 0.12;
+    let (left, right) = (MIDDLE - WIDE, MIDDLE + WIDE);
+    // A level segment from one point to another, or an upright one.
+    let (from, to) = match segment {
+        0 => ((left, -HIGH), (right, -HIGH)),
+        1 => ((right, -HIGH), (right, 0.0)),
+        2 => ((right, 0.0), (right, HIGH)),
+        3 => ((left, HIGH), (right, HIGH)),
+        4 => ((left, 0.0), (left, HIGH)),
+        5 => ((left, -HIGH), (left, 0.0)),
+        6 => ((left, 0.0), (right, 0.0)),
+        // The decimal point.
+        _ => ((right + 1.5, HIGH), (right + 1.5, HIGH)),
+    };
+    let mut points: Vec<Pos2> = if from == to {
+        dot_points(from.0, from.1, 0.5 + grow)
+            .into_iter()
+            .map(|(x, y)| pos2(x, y))
+            .collect()
+    } else {
+        let level = from.1 == to.1;
+        let length = if level { to.0 - from.0 } else { to.1 - from.1 };
+        let (thick, start, end) = (THICK + grow, GAP - grow, length - GAP + grow);
+        // Along the segment and across it: a long hexagon.
+        [
+            (start, 0.0),
+            (start + thick, -thick),
+            (end - thick, -thick),
+            (end, 0.0),
+            (end - thick, thick),
+            (start + thick, thick),
+        ]
+        .into_iter()
+        .map(|(along, across)| {
+            if level {
+                pos2(from.0 + along, from.1 + across)
+            } else {
+                pos2(from.0 - across, from.1 + along)
+            }
+        })
+        .collect()
+    };
+    if mirrored {
+        points.iter_mut().for_each(|p| p.x = -p.x);
+    }
+    points
 }
 
 fn source_circle(prims: &mut Vec<Prim>) {
@@ -359,6 +428,22 @@ pub fn symbol_styled(kind: &ComponentKind, zener: bool) -> Symbol {
             p.push(text(-2.3, -10.2, "A", 0.7));
             p.push(text(2.3, -10.2, "K", 0.7));
             label = pos2(0.0, 10.5);
+        }
+        // The digit itself is drawn from `segment_area`.
+        ComponentKind::SevenSegment { common, .. } => {
+            p.push(rect(-5.0, -8.5, 5.0, 8.5));
+            for pin in kind.pins() {
+                let (x, y) = (pin.offset.x as f32, pin.offset.y as f32);
+                let side = x.signum();
+                p.push(line(&[(x, y), (side * 5.0, y)]));
+                p.push(text(side * 4.15, y, pin.name, 0.6));
+            }
+            let marked = match common {
+                CommonPin::Cathode => "common −",
+                CommonPin::Anode => "common +",
+            };
+            p.push(text(0.0, 7.0, marked, 0.8));
+            label = pos2(0.0, 9.0);
         }
         ComponentKind::Bjt { polarity, .. } => {
             p.push(Prim::Circle {

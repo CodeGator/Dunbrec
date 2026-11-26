@@ -8,10 +8,10 @@ use crate::error::{SimError, SimWarning};
 use crate::newton::Workspace;
 use crate::stamp::{SolutionView, node_rows};
 
-/// What LED `segment` (from 0) of the display `designator` is called where
-/// currents are listed.
-pub fn lamp_name(designator: &str, segment: usize) -> String {
-    format!("{designator}.{}", segment + 1)
+/// What an LED of the display `designator` is called where currents are
+/// listed, from its segment's name: "DS1.3", "DS2.dp".
+pub fn lamp_name(designator: &str, segment: &str) -> String {
+    format!("{designator}.{segment}")
 }
 
 /// Result of a DC operating point analysis.
@@ -77,13 +77,16 @@ impl OperatingPoint {
         // A display has no current of its own: each of its LEDs is listed
         // instead, as "DS1.1", "DS1.2" and so on.
         let mut currents = Vec::with_capacity(circuit.devices.len());
-        for d in &circuit.devices {
+        for (index, d) in circuit.devices.iter().enumerate() {
             let lamps = d.lamp_currents(&sol);
             if lamps.is_empty() {
                 currents.push((d.designator().to_string(), d.current(&sol)));
             } else {
+                let kind = &circuit.displays[&index];
                 let named = lamps.into_iter().enumerate();
-                currents.extend(named.map(|(k, i)| (lamp_name(d.designator(), k), i)));
+                currents.extend(
+                    named.map(|(k, i)| (lamp_name(d.designator(), kind.segment_name(k)), i)),
+                );
             }
         }
         OperatingPoint {

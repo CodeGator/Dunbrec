@@ -166,7 +166,7 @@ pub trait Device: Send + std::fmt::Debug {
     fn current(&self, sol: &SolutionView) -> f64;
 
     /// For a display made of several LEDs: the current through each, in
-    /// segment order. Empty for every other device.
+    /// segment order ([`ComponentKind::segment_name`](dunbrec_core::ComponentKind::segment_name)). Empty for every other device.
     fn lamp_currents(&self, _sol: &SolutionView) -> Vec<f64> {
         Vec::new()
     }

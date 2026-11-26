@@ -34,6 +34,8 @@ pub struct Circuit {
     /// Per device: first branch and first internal node it was given, so
     /// a replacement device can take over the same unknowns.
     slots: Vec<(Option<BranchId>, Option<NodeId>)>,
+    /// What each display is, by device index, to name its LEDs.
+    pub(crate) displays: std::collections::HashMap<usize, ComponentKind>,
     /// Digital parts and how they are wired (their drivers follow the
     /// netlist elements in `devices`).
     pub(crate) digital: Vec<PartSpec>,
@@ -178,7 +180,15 @@ impl Circuit {
             });
         }
 
+        let displays = netlist
+            .elements
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.kind.led_segments().is_some())
+            .map(|(index, e)| (index, e.kind.clone()))
+            .collect();
         let mut circuit = Circuit {
+            displays,
             devices,
             node_names,
             branch_owners,
@@ -716,7 +726,7 @@ pub(crate) fn make_device(e: &Element, models: &ModelLibrary) -> Result<Box<dyn 
             let p = DiodeParams::from_model(&colour.model());
             Box::new(Diode::new(name, node(0), node(1), p))
         }
-        kind @ ComponentKind::LedBar { .. } => {
+        kind @ (ComponentKind::LedBar { .. } | ComponentKind::SevenSegment { .. }) => {
             let model = led_display(kind).expect("a display has LEDs");
             Box::new(Composite::new(name, model, &e.nodes)?)
         }

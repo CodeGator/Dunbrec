@@ -237,6 +237,44 @@ const LED_BAR: &[PinDef] = &[
     pin("K10", 4, 9),
 ];
 
+/// 7-segment pins: a pin for each segment down the left side and the common
+/// pin on the right.
+const SEVEN_SEGMENT: &[PinDef] = &[
+    pin("a", -6, -7),
+    pin("b", -6, -5),
+    pin("c", -6, -3),
+    pin("d", -6, -1),
+    pin("e", -6, 1),
+    pin("f", -6, 3),
+    pin("g", -6, 5),
+    pin("dp", -6, 7),
+    pin("COM", 6, 0),
+];
+
+/// The anode and cathode pin of each LED of a 7-segment display with a
+/// common cathode (pin 8)...
+const SEVEN_SEGMENT_CATHODE: &[(usize, usize)] = &[
+    (0, 8),
+    (1, 8),
+    (2, 8),
+    (3, 8),
+    (4, 8),
+    (5, 8),
+    (6, 8),
+    (7, 8),
+];
+/// ...and with a common anode.
+const SEVEN_SEGMENT_ANODE: &[(usize, usize)] = &[
+    (8, 0),
+    (8, 1),
+    (8, 2),
+    (8, 3),
+    (8, 4),
+    (8, 5),
+    (8, 6),
+    (8, 7),
+];
+
 /// The anode and cathode pin of each LED of a bar display.
 const LED_BAR_SEGMENTS: &[(usize, usize)] = &[
     (0, 10),
@@ -538,6 +576,28 @@ impl LedColour {
     }
 }
 
+/// Which end of its LEDs a display joins together on its common pin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CommonPin {
+    /// The cathodes: the common pin goes to ground, and a segment lights
+    /// when its pin is driven high.
+    Cathode,
+    /// The anodes: the common pin goes to the supply, and a segment lights
+    /// when its pin is pulled low.
+    Anode,
+}
+
+impl CommonPin {
+    pub const ALL: [CommonPin; 2] = [CommonPin::Cathode, CommonPin::Anode];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            CommonPin::Cathode => "common cathode",
+            CommonPin::Anode => "common anode",
+        }
+    }
+}
+
 /// What a component is, plus its electrical parameters.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ComponentKind {
@@ -684,6 +744,12 @@ pub enum ComponentKind {
     LedBar {
         colour: LedColour,
     },
+    /// A one-digit display of seven bar-shaped LEDs, `a` to `g`, and a
+    /// decimal point, `dp`, all one colour and sharing one common pin.
+    SevenSegment {
+        colour: LedColour,
+        common: CommonPin,
+    },
 
     // ---- Microcontrollers ----
     /// ATmega328P (Arduino Uno/Nano) running firmware from `firmware`: the
@@ -822,6 +888,7 @@ impl ComponentKind {
             ComponentKind::Clock { .. } | ComponentKind::LogicSwitch { .. } => LOGIC_SOURCE,
             ComponentKind::LogicLed => LOGIC_LED,
             ComponentKind::LedBar { .. } => LED_BAR,
+            ComponentKind::SevenSegment { .. } => SEVEN_SEGMENT,
             ComponentKind::Mcu { .. } => MCU,
             ComponentKind::OpAmp { .. } => OPAMP,
             ComponentKind::Timer555 => TIMER555,
@@ -858,7 +925,7 @@ impl ComponentKind {
             ComponentKind::Clock { .. } => "CLK",
             ComponentKind::LogicSwitch { .. } => "SW",
             ComponentKind::LogicLed | ComponentKind::Led { .. } => "LED",
-            ComponentKind::LedBar { .. } => "DS",
+            ComponentKind::LedBar { .. } | ComponentKind::SevenSegment { .. } => "DS",
         }
     }
 
@@ -868,7 +935,35 @@ impl ComponentKind {
     pub fn led_segments(&self) -> Option<(LedColour, &'static [(usize, usize)])> {
         match self {
             ComponentKind::LedBar { colour } => Some((*colour, LED_BAR_SEGMENTS)),
+            ComponentKind::SevenSegment { colour, common } => Some((
+                *colour,
+                match common {
+                    CommonPin::Cathode => SEVEN_SEGMENT_CATHODE,
+                    CommonPin::Anode => SEVEN_SEGMENT_ANODE,
+                },
+            )),
             _ => None,
+        }
+    }
+
+    /// What LED `segment` (from 0) of a display is called: "1" to "10" on a
+    /// bar, "a" to "g" and "dp" on a digit.
+    pub fn segment_name(&self, segment: usize) -> &'static str {
+        const NUMBERS: [&str; 10] = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"];
+        const LETTERS: [&str; 8] = ["a", "b", "c", "d", "e", "f", "g", "dp"];
+        let names: &[&str] = match self {
+            ComponentKind::SevenSegment { .. } => &LETTERS,
+            _ => &NUMBERS,
+        };
+        names.get(segment).copied().unwrap_or("?")
+    }
+
+    /// Pins of a display that are commonly left unconnected, so that nothing
+    /// is said when they are: a digit's decimal point.
+    pub fn optional_pins(&self) -> &'static [usize] {
+        match self {
+            ComponentKind::SevenSegment { .. } => &[7],
+            _ => &[],
         }
     }
 

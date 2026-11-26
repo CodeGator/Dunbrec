@@ -390,6 +390,50 @@ fn each_led_of_a_bar_display_carries_its_own_current() {
 }
 
 #[test]
+fn a_digit_lights_the_segments_its_common_pin_allows() {
+    use dunbrec_core::{CommonPin, LedColour};
+    for common in CommonPin::ALL {
+        // Segments b and c, and the point, each through 220 ohms to the far
+        // side of the supply from the common pin; segment a to the same side.
+        let (own, shared) = match common {
+            CommonPin::Cathode => ("s", "0"),
+            CommonPin::Anode => ("0", "s"),
+        };
+        let mut b = NetlistBuilder::new()
+            .element("V1", K::VoltageSource { waveform: dc(5.0) }, &["s", "0"])
+            .element("Ra", K::Resistor { resistance: 220.0 }, &[shared, "a"])
+            .element("Rb", K::Resistor { resistance: 220.0 }, &[own, "b"])
+            .element("Rc", K::Resistor { resistance: 220.0 }, &[own, "c"])
+            .element("Rp", K::Resistor { resistance: 1e3 }, &[own, "p"]);
+        let colour = LedColour::Red;
+        b.push(
+            "DS1",
+            K::SevenSegment { colour, common },
+            &["a", "b", "c", "d", "e", "f", "g", "p", shared],
+        );
+        let netlist = b.build();
+        let circuit = Circuit::from_netlist(&netlist, &ModelLibrary::new()).unwrap();
+        let op = operating_point(&circuit).unwrap();
+        let lit = |name: &str| op.current(&format!("DS1.{name}")).unwrap();
+        for name in ["b", "c"] {
+            assert!(
+                (0.012..0.016).contains(&lit(name)),
+                "{common:?} {name}: {}",
+                lit(name)
+            );
+        }
+        assert!(
+            (0.0025..0.0035).contains(&lit("dp")),
+            "{common:?}: {}",
+            lit("dp")
+        );
+        for name in ["a", "d", "e", "f", "g"] {
+            assert!(lit(name).abs() < 1e-6, "{common:?} {name}: {}", lit(name));
+        }
+    }
+}
+
+#[test]
 fn each_colour_of_led_drops_its_own_voltage() {
     use dunbrec_core::LedColour;
     for colour in LedColour::ALL {
