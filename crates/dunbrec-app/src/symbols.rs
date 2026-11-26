@@ -136,7 +136,7 @@ pub fn bar_segment(segment: usize) -> Rect {
 /// widened all round by `grow`. A digit keeps the right way round when its
 /// part is `mirrored`: only its pins change sides.
 pub fn segment_area(kind: &ComponentKind, segment: usize, grow: f32, mirrored: bool) -> Vec<Pos2> {
-    if !matches!(kind, ComponentKind::SevenSegment { .. }) {
+    if kind.digit_count() == 0 {
         let r = bar_segment(segment).expand(grow);
         return vec![
             r.left_top(),
@@ -147,12 +147,16 @@ pub fn segment_area(kind: &ComponentKind, segment: usize, grow: f32, mirrored: b
     }
     // The digit's middle, half width and half height, a segment's half
     // thickness, and the gap left where two meet.
-    const MIDDLE: f32 = -0.4;
+    let (digit, segment) = (segment / 8, segment % 8);
+    let middle = match kind.digit_count() {
+        1 => -0.4,
+        _ => -11.3 + 7.0 * digit as f32,
+    };
     const WIDE: f32 = 1.7;
     const HIGH: f32 = 4.6;
     const THICK: f32 = 0.42;
     const GAP: f32 = 0.12;
-    let (left, right) = (MIDDLE - WIDE, MIDDLE + WIDE);
+    let (left, right) = (middle - WIDE, middle + WIDE);
     // A level segment from one point to another, or an upright one.
     let (from, to) = match segment {
         0 => ((left, -HIGH), (right, -HIGH)),
@@ -197,6 +201,14 @@ pub fn segment_area(kind: &ComponentKind, segment: usize, grow: f32, mirrored: b
         points.iter_mut().for_each(|p| p.x = -p.x);
     }
     points
+}
+
+/// What a display says of the side of the supply its common pins go to.
+fn common_mark(common: CommonPin) -> &'static str {
+    match common {
+        CommonPin::Cathode => "common −",
+        CommonPin::Anode => "common +",
+    }
 }
 
 fn source_circle(prims: &mut Vec<Prim>) {
@@ -438,12 +450,24 @@ pub fn symbol_styled(kind: &ComponentKind, zener: bool) -> Symbol {
                 p.push(line(&[(x, y), (side * 5.0, y)]));
                 p.push(text(side * 4.15, y, pin.name, 0.6));
             }
-            let marked = match common {
-                CommonPin::Cathode => "common −",
-                CommonPin::Anode => "common +",
-            };
-            p.push(text(0.0, 7.0, marked, 0.8));
+            p.push(text(0.0, 7.0, common_mark(*common), 0.8));
             label = pos2(0.0, 9.0);
+        }
+        ComponentKind::FourDigit { common, .. } => {
+            p.push(rect(-16.0, -8.5, 16.0, 8.5));
+            for pin in kind.pins() {
+                let (x, y) = (pin.offset.x as f32, pin.offset.y as f32);
+                if x < -16.0 {
+                    p.push(line(&[(x, y), (-16.0, y)]));
+                    p.push(text(-15.15, y, pin.name, 0.6));
+                } else {
+                    // A digit's common pin, under it.
+                    p.push(line(&[(x, y), (x, 8.5)]));
+                    p.push(text(x, 7.7, pin.name, 0.6));
+                }
+            }
+            p.push(text(0.0, -7.0, common_mark(*common), 0.8));
+            label = pos2(16.5, 0.0);
         }
         ComponentKind::Bjt { polarity, .. } => {
             p.push(Prim::Circle {

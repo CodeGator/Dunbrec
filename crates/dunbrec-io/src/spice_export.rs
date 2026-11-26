@@ -244,7 +244,7 @@ fn write_netlist(
                 colour.model().name
             ),
             // A display is written as its LEDs, one diode each.
-            K::LedBar { colour } | K::SevenSegment { colour, .. } => {
+            K::LedBar { colour } | K::SevenSegment { colour, .. } | K::FourDigit { colour, .. } => {
                 let name = element_name('D', d);
                 let model = colour.model().name;
                 let segments = e.kind.led_segments().map_or(&[][..], |s| s.1);

@@ -298,6 +298,7 @@ pub fn led_display(kind: &ComponentKind) -> Option<MacroModel> {
     let pins = kind.pins();
     let ports = match kind {
         ComponentKind::SevenSegment { .. } => SEVEN_SEGMENT_PORTS,
+        ComponentKind::FourDigit { .. } => FOUR_DIGIT_PORTS,
         _ => LED_BAR_PORTS,
     };
     let mut e = Elements(Vec::new());
@@ -318,6 +319,11 @@ pub fn led_display(kind: &ComponentKind) -> Option<MacroModel> {
 
 /// Pin names of the 7-segment display, in pin order.
 const SEVEN_SEGMENT_PORTS: &[&str] = &["a", "b", "c", "d", "e", "f", "g", "dp", "COM"];
+
+/// Pin names of the four-digit display, in pin order.
+const FOUR_DIGIT_PORTS: &[&str] = &[
+    "a", "b", "c", "d", "e", "f", "g", "dp", "D1", "D2", "D3", "D4",
+];
 
 /// Pin names of the LED bar display, in pin order.
 const LED_BAR_PORTS: &[&str] = &[

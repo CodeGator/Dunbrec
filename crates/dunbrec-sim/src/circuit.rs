@@ -726,7 +726,9 @@ pub(crate) fn make_device(e: &Element, models: &ModelLibrary) -> Result<Box<dyn 
             let p = DiodeParams::from_model(&colour.model());
             Box::new(Diode::new(name, node(0), node(1), p))
         }
-        kind @ (ComponentKind::LedBar { .. } | ComponentKind::SevenSegment { .. }) => {
+        kind @ (ComponentKind::LedBar { .. }
+        | ComponentKind::SevenSegment { .. }
+        | ComponentKind::FourDigit { .. }) => {
             let model = led_display(kind).expect("a display has LEDs");
             Box::new(Composite::new(name, model, &e.nodes)?)
         }

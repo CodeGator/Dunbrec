@@ -289,6 +289,22 @@ pub fn palette() -> &'static [PaletteEntry] {
             },
         },
         PaletteEntry {
+            name: "4-digit, common cathode",
+            group: "Displays",
+            make: || ComponentKind::FourDigit {
+                colour: dunbrec_core::LedColour::Red,
+                common: dunbrec_core::CommonPin::Cathode,
+            },
+        },
+        PaletteEntry {
+            name: "4-digit, common anode",
+            group: "Displays",
+            make: || ComponentKind::FourDigit {
+                colour: dunbrec_core::LedColour::Red,
+                common: dunbrec_core::CommonPin::Anode,
+            },
+        },
+        PaletteEntry {
             name: "741 op-amp",
             group: "Linear",
             make: || ComponentKind::OpAmp {
@@ -580,7 +596,9 @@ mod tests {
                 "LED",
                 "10-segment LED bar",
                 "7-segment, common cathode",
-                "7-segment, common anode"
+                "7-segment, common anode",
+                "4-digit, common cathode",
+                "4-digit, common anode"
             ]
         );
     }

@@ -434,6 +434,43 @@ fn a_digit_lights_the_segments_its_common_pin_allows() {
 }
 
 #[test]
+fn only_the_digit_whose_common_pin_is_selected_lights() {
+    use dunbrec_core::{CommonPin, LedColour};
+    for common in CommonPin::ALL {
+        // Segment b driven, digit 3 selected and the other digits held off.
+        let (own, shared) = match common {
+            CommonPin::Cathode => ("s", "0"),
+            CommonPin::Anode => ("0", "s"),
+        };
+        let mut b = NetlistBuilder::new()
+            .element("V1", K::VoltageSource { waveform: dc(5.0) }, &["s", "0"])
+            .element("Rb", K::Resistor { resistance: 220.0 }, &[own, "b"]);
+        let colour = LedColour::Red;
+        b.push(
+            "DS1",
+            K::FourDigit { colour, common },
+            &[
+                "a", "b", "c", "d", "e", "f", "g", "p", own, own, shared, own,
+            ],
+        );
+        let netlist = b.build();
+        let circuit = Circuit::from_netlist(&netlist, &ModelLibrary::new()).unwrap();
+        let op = operating_point(&circuit).unwrap();
+        assert_eq!(
+            op.currents().filter(|(n, _)| n.starts_with("DS1.")).count(),
+            32
+        );
+        for (name, i) in op.currents().filter(|(n, _)| n.starts_with("DS1.")) {
+            if name == "DS1.3b" {
+                assert!((0.012..0.016).contains(&i), "{common:?} {name}: {i}");
+            } else {
+                assert!(i.abs() < 1e-6, "{common:?} {name}: {i}");
+            }
+        }
+    }
+}
+
+#[test]
 fn each_colour_of_led_drops_its_own_voltage() {
     use dunbrec_core::LedColour;
     for colour in LedColour::ALL {

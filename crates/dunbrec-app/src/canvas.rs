@@ -953,7 +953,8 @@ pub fn value_text(kind: &ComponentKind) -> String {
         ComponentKind::Clock { frequency, .. } => format_value(*frequency, "Hz"),
         ComponentKind::LogicSwitch { high } => (if *high { "high" } else { "low" }).into(),
         ComponentKind::Led { colour } | ComponentKind::LedBar { colour } => colour.name().into(),
-        ComponentKind::SevenSegment { colour, common } => {
+        ComponentKind::SevenSegment { colour, common }
+        | ComponentKind::FourDigit { colour, common } => {
             format!("{}, {}", colour.name(), common.name())
         }
         ComponentKind::Mcu { firmware, .. } => firmware_label(firmware),
@@ -1093,7 +1094,7 @@ impl Painter<'_> {
         }
         // A digit's segments are outlined here, not in its symbol, so that
         // mirroring the part does not mirror the digit.
-        if let ComponentKind::SevenSegment { .. } = c.kind {
+        if c.kind.digit_count() > 0 {
             for segment in 0..c.kind.led_segments().map_or(0, |s| s.1.len()) {
                 let outline = self.segment_outline(c, segment, 0.0);
                 self.painter.add(Shape::closed_line(outline, stroke));
@@ -1692,8 +1693,10 @@ impl Canvas {
                 };
                 let above = centre - vec2(0.0, self.camera.scale * rise);
                 let name = c.kind.segment_name(segment);
-                let which = match c.kind {
-                    ComponentKind::SevenSegment { .. } => format!("segment {name}: "),
+                let which = match c.kind.digit_count() {
+                    1 => format!("segment {name}: "),
+                    // The name starts with the digit's number.
+                    4 => format!("digit {}, segment {}: ", &name[..1], &name[1..]),
                     _ if display => format!("LED {name}: "),
                     _ => String::new(),
                 };
@@ -3040,6 +3043,46 @@ mod tests {
         currents[6] = 0.045;
         let (_, warning) = seen(&mut rig, currents);
         assert_eq!(warning.as_deref(), Some("⚠ segment g: 45 mA - too much"));
+    }
+
+    #[test]
+    fn four_digits_stand_in_a_row_and_the_warning_says_which() {
+        use dunbrec_core::{CommonPin, LedColour};
+        let mut s = Schematic::new();
+        let (colour, common) = (LedColour::Green, CommonPin::Anode);
+        let kind = ComponentKind::FourDigit { colour, common };
+        let id = s.add_component(kind, Point::new(20, 12));
+        let mut rig = Rig::new(s);
+        let green = leds::light(colour);
+        // Segment a of each digit, fully lit, and too much through one.
+        let mut currents = vec![0.0; 32];
+        for digit in 0..4 {
+            currents[digit * 8] = 0.020;
+        }
+        currents[2 * 8 + 6] = 0.045;
+        rig.lights.leds = [(id, currents)].into_iter().collect();
+        rig.hold(NO_KEY);
+        let (mut lit, mut warning) = (Vec::new(), None);
+        for shape in &rig.drawn {
+            match &shape.shape {
+                egui::Shape::Path(p) if p.fill == green => {
+                    lit.push(p.visual_bounding_rect().center());
+                }
+                egui::Shape::Text(t) if t.galley.text().contains("too much") => {
+                    warning = Some(t.galley.text().to_string());
+                }
+                _ => {}
+            }
+        }
+        // Four top segments from left to right, then digit 3's middle one.
+        assert_eq!(lit.len(), 5, "{lit:?}");
+        let tops = [lit[0], lit[1], lit[2], lit[4]];
+        assert!(tops.windows(2).all(|w| w[0].x < w[1].x && w[0].y == w[1].y));
+        assert!(lit[3].y > tops[2].y && (lit[3].x - tops[2].x).abs() < 0.5);
+        assert_eq!(
+            warning.as_deref(),
+            Some("⚠ digit 3, segment g: 45 mA - too much")
+        );
     }
 
     #[test]

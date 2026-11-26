@@ -275,6 +275,50 @@ const SEVEN_SEGMENT_ANODE: &[(usize, usize)] = &[
     (8, 7),
 ];
 
+/// Four-digit display pins: the shared segment pins down the left side and
+/// each digit's common pin below it.
+const FOUR_DIGIT: &[PinDef] = &[
+    pin("a", -17, -7),
+    pin("b", -17, -5),
+    pin("c", -17, -3),
+    pin("d", -17, -1),
+    pin("e", -17, 1),
+    pin("f", -17, 3),
+    pin("g", -17, 5),
+    pin("dp", -17, 7),
+    pin("D1", -11, 10),
+    pin("D2", -4, 10),
+    pin("D3", 3, 10),
+    pin("D4", 10, 10),
+];
+
+/// The anode and cathode pin of each LED of a four-digit display with common
+/// cathodes (pins 8 to 11), the first digit's eight first...
+#[rustfmt::skip]
+const FOUR_DIGIT_CATHODE: &[(usize, usize)] = &[
+    (0, 8), (1, 8), (2, 8), (3, 8), (4, 8), (5, 8), (6, 8), (7, 8),
+    (0, 9), (1, 9), (2, 9), (3, 9), (4, 9), (5, 9), (6, 9), (7, 9),
+    (0, 10), (1, 10), (2, 10), (3, 10), (4, 10), (5, 10), (6, 10), (7, 10),
+    (0, 11), (1, 11), (2, 11), (3, 11), (4, 11), (5, 11), (6, 11), (7, 11),
+];
+/// ...and with common anodes.
+#[rustfmt::skip]
+const FOUR_DIGIT_ANODE: &[(usize, usize)] = &[
+    (8, 0), (8, 1), (8, 2), (8, 3), (8, 4), (8, 5), (8, 6), (8, 7),
+    (9, 0), (9, 1), (9, 2), (9, 3), (9, 4), (9, 5), (9, 6), (9, 7),
+    (10, 0), (10, 1), (10, 2), (10, 3), (10, 4), (10, 5), (10, 6), (10, 7),
+    (11, 0), (11, 1), (11, 2), (11, 3), (11, 4), (11, 5), (11, 6), (11, 7),
+];
+
+/// What each LED of a four-digit display is called: its digit and segment.
+#[rustfmt::skip]
+const FOUR_DIGIT_NAMES: &[&str] = &[
+    "1a", "1b", "1c", "1d", "1e", "1f", "1g", "1dp",
+    "2a", "2b", "2c", "2d", "2e", "2f", "2g", "2dp",
+    "3a", "3b", "3c", "3d", "3e", "3f", "3g", "3dp",
+    "4a", "4b", "4c", "4d", "4e", "4f", "4g", "4dp",
+];
+
 /// The anode and cathode pin of each LED of a bar display.
 const LED_BAR_SEGMENTS: &[(usize, usize)] = &[
     (0, 10),
@@ -744,6 +788,14 @@ pub enum ComponentKind {
     LedBar {
         colour: LedColour,
     },
+    /// Four digits like [`SevenSegment`](Self::SevenSegment) in one package.
+    /// Each segment pin serves all four, and each digit has its own common
+    /// pin, so a circuit lights one digit at a time, quickly enough that all
+    /// of them seem lit.
+    FourDigit {
+        colour: LedColour,
+        common: CommonPin,
+    },
     /// A one-digit display of seven bar-shaped LEDs, `a` to `g`, and a
     /// decimal point, `dp`, all one colour and sharing one common pin.
     SevenSegment {
@@ -889,6 +941,7 @@ impl ComponentKind {
             ComponentKind::LogicLed => LOGIC_LED,
             ComponentKind::LedBar { .. } => LED_BAR,
             ComponentKind::SevenSegment { .. } => SEVEN_SEGMENT,
+            ComponentKind::FourDigit { .. } => FOUR_DIGIT,
             ComponentKind::Mcu { .. } => MCU,
             ComponentKind::OpAmp { .. } => OPAMP,
             ComponentKind::Timer555 => TIMER555,
@@ -925,7 +978,9 @@ impl ComponentKind {
             ComponentKind::Clock { .. } => "CLK",
             ComponentKind::LogicSwitch { .. } => "SW",
             ComponentKind::LogicLed | ComponentKind::Led { .. } => "LED",
-            ComponentKind::LedBar { .. } | ComponentKind::SevenSegment { .. } => "DS",
+            ComponentKind::LedBar { .. }
+            | ComponentKind::SevenSegment { .. }
+            | ComponentKind::FourDigit { .. } => "DS",
         }
     }
 
@@ -942,17 +997,36 @@ impl ComponentKind {
                     CommonPin::Anode => SEVEN_SEGMENT_ANODE,
                 },
             )),
+            ComponentKind::FourDigit { colour, common } => Some((
+                *colour,
+                match common {
+                    CommonPin::Cathode => FOUR_DIGIT_CATHODE,
+                    CommonPin::Anode => FOUR_DIGIT_ANODE,
+                },
+            )),
             _ => None,
         }
     }
 
+    /// How many digits of seven segments and a point a display has: none for
+    /// anything else. Its LEDs are numbered eight to a digit, `a` first.
+    pub fn digit_count(&self) -> usize {
+        match self {
+            ComponentKind::SevenSegment { .. } => 1,
+            ComponentKind::FourDigit { .. } => 4,
+            _ => 0,
+        }
+    }
+
     /// What LED `segment` (from 0) of a display is called: "1" to "10" on a
-    /// bar, "a" to "g" and "dp" on a digit.
+    /// bar, "a" to "g" and "dp" on a digit, and the digit before that ("2a")
+    /// where there are four.
     pub fn segment_name(&self, segment: usize) -> &'static str {
         const NUMBERS: [&str; 10] = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"];
         const LETTERS: [&str; 8] = ["a", "b", "c", "d", "e", "f", "g", "dp"];
         let names: &[&str] = match self {
             ComponentKind::SevenSegment { .. } => &LETTERS,
+            ComponentKind::FourDigit { .. } => FOUR_DIGIT_NAMES,
             _ => &NUMBERS,
         };
         names.get(segment).copied().unwrap_or("?")
@@ -962,7 +1036,7 @@ impl ComponentKind {
     /// is said when they are: a digit's decimal point.
     pub fn optional_pins(&self) -> &'static [usize] {
         match self {
-            ComponentKind::SevenSegment { .. } => &[7],
+            ComponentKind::SevenSegment { .. } | ComponentKind::FourDigit { .. } => &[7],
             _ => &[],
         }
     }

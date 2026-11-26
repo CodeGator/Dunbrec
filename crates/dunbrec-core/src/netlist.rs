@@ -596,6 +596,33 @@ mod tests {
     }
 
     #[test]
+    fn a_four_digit_display_wants_every_digit_pin_but_not_the_point() {
+        use crate::schematic::{CommonPin, LedColour};
+        for common in CommonPin::ALL {
+            let mut s = Schematic::new();
+            let colour = LedColour::Red;
+            let kind = ComponentKind::FourDigit { colour, common };
+            s.add_component(kind.clone(), Point::new(0, 0));
+            assert!(build_netlist(&s).diagnostics.len() <= 1);
+            // Segments a to g and the first two digits are joined.
+            for (n, pin) in kind.pins().iter().enumerate() {
+                if n < 7 || n == 8 || n == 9 {
+                    s.add_label(format!("N{n}"), pin.offset);
+                }
+            }
+            let open: Vec<String> = build_netlist(&s)
+                .diagnostics
+                .into_iter()
+                .filter_map(|d| match d {
+                    Diagnostic::UnconnectedPin { pin, .. } => Some(pin),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(open, ["D3", "D4"], "{common:?}");
+        }
+    }
+
+    #[test]
     fn voltage_divider_connectivity() {
         let n = build_netlist(&divider());
         assert!(n.diagnostics.is_empty(), "{:?}", n.diagnostics);

@@ -258,9 +258,20 @@ impl Properties {
                     ComponentKind::Led { colour } | ComponentKind::LedBar { colour } => {
                         led_colour(ui, id, colour)
                     }
-                    ComponentKind::SevenSegment { colour, common } => {
+                    kind @ (ComponentKind::SevenSegment { .. }
+                    | ComponentKind::FourDigit { .. }) => {
+                        let digits = kind.digit_count();
+                        let (ComponentKind::SevenSegment { colour, common }
+                        | ComponentKind::FourDigit { colour, common }) = kind
+                        else {
+                            unreachable!("a digit display")
+                        };
                         let recoloured = led_colour(ui, id, colour);
-                        ui.label("Common pin");
+                        ui.label(if digits == 1 {
+                            "Common pin"
+                        } else {
+                            "Common pins"
+                        });
                         let before = *common;
                         egui::ComboBox::from_id_salt(("common", id))
                             .selected_text(common.name())
@@ -272,12 +283,26 @@ impl Properties {
                         ui.end_row();
                         ui.label("");
                         ui.label(
-                            egui::RichText::new(match common {
-                                CommonPin::Cathode => {
-                                    "Join COM to ground. A segment lights when its pin is                                      driven high through its resistor."
+                            egui::RichText::new(match (digits, *common) {
+                                (1, CommonPin::Cathode) => {
+                                    "Join COM to ground. A segment lights when its pin is \
+                                     driven high through its resistor."
                                 }
-                                CommonPin::Anode => {
-                                    "Join COM to the supply. A segment lights when its pin is                                      pulled low through its resistor."
+                                (1, CommonPin::Anode) => {
+                                    "Join COM to the supply. A segment lights when its pin is \
+                                     pulled low through its resistor."
+                                }
+                                (_, CommonPin::Cathode) => {
+                                    "A digit lights while its pin, D1 to D4, is pulled to \
+                                     ground. Drive segments high through resistors and take \
+                                     the digits in turn. A digit's pin carries the current of \
+                                     all its segments, so switch it with a transistor."
+                                }
+                                (_, CommonPin::Anode) => {
+                                    "A digit lights while its pin, D1 to D4, is joined to the \
+                                     supply. Pull segments low through resistors and take the \
+                                     digits in turn. A digit's pin carries the current of all \
+                                     its segments, so switch it with a transistor."
                                 }
                             })
                             .weak(),
@@ -895,6 +920,7 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
         ComponentKind::Led { .. } => "LED",
         ComponentKind::LedBar { .. } => "LED bar display",
         ComponentKind::SevenSegment { .. } => "7-segment display",
+        ComponentKind::FourDigit { .. } => "4-digit 7-segment display",
         ComponentKind::Mcu { .. } => "Microcontroller (ATmega328P)",
         ComponentKind::OpAmp { .. } => "Operational amplifier",
         ComponentKind::Timer555 => "555 timer",
@@ -918,7 +944,8 @@ fn led_colour(ui: &mut Ui, id: ComponentId, colour: &mut LedColour) -> bool {
     ui.label("");
     ui.label(
         egui::RichText::new(format!(
-            "About {} V across it when lit, and it needs a resistor in series: from 5 V,              about {} Ω.",
+            "About {} V across it when lit, and it needs a resistor in series: from 5 V, \
+             about {} Ω.",
             colour.forward_voltage(),
             colour.resistor_from_5v()
         ))
