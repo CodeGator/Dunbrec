@@ -3,8 +3,8 @@
 use std::collections::HashMap;
 
 use dunbrec_core::{
-    ComponentId, ComponentKind, ModelKind, Polarity, Schematic, SourceLanguage, SwitchForm,
-    Waveform,
+    ComponentId, ComponentKind, LedColour, ModelKind, Polarity, Schematic, SourceLanguage,
+    SwitchForm, Waveform,
     units::{format_value, parse_eng, parse_spice},
 };
 use egui::{Color32, RichText, Ui};
@@ -255,6 +255,30 @@ impl Properties {
                         r
                     }
                     ComponentKind::LogicLed => false,
+                    ComponentKind::Led { colour } => {
+                        ui.label("Colour");
+                        let before = *colour;
+                        egui::ComboBox::from_id_salt(("led", id))
+                            .selected_text(colour.name())
+                            .show_ui(ui, |ui| {
+                                for c in LedColour::ALL {
+                                    ui.selectable_value(colour, c, c.name());
+                                }
+                            });
+                        ui.end_row();
+                        ui.label("");
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "About {} V across it when lit, and it needs a resistor in \
+                                 series: from 5 V, about {} Ω.",
+                                colour.forward_voltage(),
+                                colour.resistor_from_5v()
+                            ))
+                            .weak(),
+                        );
+                        ui.end_row();
+                        *colour != before
+                    }
                     ComponentKind::OpAmp { part } => {
                         ui.label("Part");
                         let before = part.clone();
@@ -862,6 +886,7 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
         ComponentKind::Clock { .. } => "Clock",
         ComponentKind::LogicSwitch { .. } => "Logic switch",
         ComponentKind::LogicLed => "Logic LED",
+        ComponentKind::Led { .. } => "LED",
         ComponentKind::Mcu { .. } => "Microcontroller (ATmega328P)",
         ComponentKind::OpAmp { .. } => "Operational amplifier",
         ComponentKind::Timer555 => "555 timer",

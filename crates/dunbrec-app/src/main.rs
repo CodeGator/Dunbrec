@@ -23,6 +23,7 @@ mod edits;
 mod examples;
 mod float;
 mod instruments_ui;
+mod leds;
 mod library;
 mod live;
 mod logic_ui;

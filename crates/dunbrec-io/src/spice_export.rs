@@ -12,7 +12,8 @@
 use std::fmt::Write;
 
 use dunbrec_core::{
-    ComponentKind as K, ModelKind, Netlist, NodeId, Schematic, Severity, Waveform, build_netlist,
+    ComponentKind as K, LedColour, ModelKind, Netlist, NodeId, Schematic, Severity, Waveform,
+    build_netlist,
 };
 use thiserror::Error;
 
@@ -235,6 +236,13 @@ fn write_netlist(
                 n[1],
                 sanitize(model)
             ),
+            K::Led { colour } => format!(
+                "{} {} {} {}",
+                element_name('D', d),
+                n[0],
+                n[1],
+                colour.model().name
+            ),
             K::Bjt { model, .. } => {
                 format!(
                     "{} {} {} {} {}",
@@ -371,7 +379,18 @@ fn write_netlist(
         out.push_str(text);
     }
 
-    for m in schematic.models.iter() {
+    // LEDs carry their own models: each colour in use is written once.
+    let leds = LedColour::ALL
+        .into_iter()
+        .filter(|&c| {
+            netlist
+                .elements
+                .iter()
+                .any(|e| e.kind == K::Led { colour: c })
+        })
+        .map(LedColour::model);
+    let leds: Vec<_> = leds.collect();
+    for m in schematic.models.iter().chain(&leds) {
         let params: Vec<String> = m
             .params
             .iter()
@@ -400,6 +419,35 @@ mod tests {
     use super::*;
     use crate::spice::import;
     use dunbrec_core::Point;
+
+    #[test]
+    fn leds_are_diodes_with_a_model_for_each_colour_used() {
+        let mut s = lone_part(
+            K::Led {
+                colour: LedColour::Red,
+            },
+            &["a", "k"],
+        );
+        for (x, colour) in [(10, LedColour::Red), (30, LedColour::Blue)] {
+            let at = Point::new(x, 0);
+            s.add_component(K::Led { colour }, at);
+            s.add_label("a", at + Point::new(-2, 0));
+            s.add_label("k", at + Point::new(2, 0));
+        }
+        let text = export(&s, "leds", &[]).unwrap();
+        assert!(text.contains("DLED1 0 k DUNBREC_LED_RED"), "{text}");
+        assert_eq!(text.matches(".model DUNBREC_LED_RED D(").count(), 1);
+        assert_eq!(text.matches(".model DUNBREC_LED_BLUE D(").count(), 1);
+        assert!(!text.contains("DUNBREC_LED_GREEN"));
+        // What is written can be read back, as diodes.
+        let back = import(&text).unwrap();
+        let diodes = back
+            .parts
+            .iter()
+            .filter(|part| matches!(part.kind, K::Diode { .. }))
+            .count();
+        assert_eq!(diodes, 3);
+    }
 
     /// A part with every pin on its own labelled net, plus a ground.
     fn lone_part(kind: K, names: &[&str]) -> Schematic {

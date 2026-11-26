@@ -333,3 +333,49 @@ fn reverse_recovery_time(model: &str) -> f64 {
         .expect("the reverse current never recovered");
     back.0 - edge
 }
+
+#[test]
+fn each_colour_of_led_drops_its_own_voltage() {
+    use dunbrec_core::LedColour;
+    for colour in LedColour::ALL {
+        let led = K::Led { colour };
+        // Driven with 10 mA: the voltage the colour is described by.
+        let fed = NetlistBuilder::new()
+            .element(
+                "I1",
+                K::CurrentSource {
+                    waveform: dc(0.010),
+                },
+                &["0", "a"],
+            )
+            .element("LED1", led.clone(), &["a", "0"])
+            .build();
+        let mut sweep = DcSweeper::new(&fed, &ModelLibrary::new()).unwrap();
+        let v = sweep.solve().unwrap().voltage_by_name("a").unwrap();
+        assert!(
+            (v - colour.forward_voltage()).abs() < 0.02,
+            "{colour:?}: {v}"
+        );
+
+        // From 5 V through its usual resistor, a comfortable current; with
+        // the supply reversed, none.
+        let driven = NetlistBuilder::new()
+            .element("V1", K::VoltageSource { waveform: dc(0.0) }, &["s", "0"])
+            .element(
+                "R1",
+                K::Resistor {
+                    resistance: colour.resistor_from_5v(),
+                },
+                &["s", "a"],
+            )
+            .element("LED1", led, &["a", "0"])
+            .build();
+        let mut sweep = DcSweeper::new(&driven, &ModelLibrary::new()).unwrap();
+        sweep.set_source("V1", 5.0).unwrap();
+        let on = sweep.solve().unwrap().current("LED1").unwrap();
+        assert!((0.010..0.018).contains(&on), "{colour:?}: {on}");
+        sweep.set_source("V1", -5.0).unwrap();
+        let off = sweep.solve().unwrap().current("LED1").unwrap();
+        assert!(off.abs() < 1e-6, "{colour:?}: {off}");
+    }
+}

@@ -37,7 +37,7 @@ drafts the GitHub release (see `.github/workflows/release.yml`).
 | 0.5.0 | Projects screen (nothing else shown without a project); assistant draws new circuits with real wires and can add sine sources; no circuit open until one is opened; a central area that never collapses; closable schematic tab. See "0.5.0" below |
 | 0.4.0 | Settings dialog; Assistant (Ollama or Claude); pop-out instruments; text size; every confirmation a message box; Code panel tabs; project behaviour changes. See "0.4.0" below |
 
-Health at handoff: `cargo test --workspace` 509 passed, 0 failed (2 ignored: a real Recycle Bin check and an
+Health at handoff: `cargo test --workspace` 518 passed, 0 failed (2 ignored: a real Recycle Bin check and an
 emulator speed
 benchmark); `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --check`
 clean. Toolchain: Rust 1.99 (edition 2024, MSRV 1.90), Windows 11.
@@ -417,6 +417,21 @@ the demos look dead: blink changed every 12 s). `sync_speed` tells a running sim
 - *Not wanted* (the user, 2026-11-26): reopening the last project or its circuits.
 - *Not done:* the assistant's new-file suggestions can still write over a file of the same
   name.
+
+## 0.6.0 (in progress)
+
+**LED displays** (asked for by the user; plan agreed 2026-11-26). Build in this order, letting the
+user try each: (1) single LED, *done*; (2) 10-segment bar display, each LED with its own two
+pins; (3) one-digit 7-segment with decimal point, common cathode or common anode; (4) four-digit
+7-segment sharing its segment pins; (5) 14 or 16 segment.
+
+- *Electrically real* (the user's choice over a logic indicator): needs a series resistor, shines by
+  current. The Logic LED stays for quick checks.
+- *Warning* on the schematic above 30 mA average (`leds::MOST_CURRENT`); nothing burns out.
+- *Persistence of vision* (needed by multiplexed digits): `LedMeter` averages each current over
+  20 ms of simulated time at real speed, less in slow motion.
+- `ComponentKind::Led { colour }`; `LedColour::model` is the diode model (no library entry), also
+  written by the SPICE export. The assistant cannot add LEDs yet.
 
 ## Gotchas
 

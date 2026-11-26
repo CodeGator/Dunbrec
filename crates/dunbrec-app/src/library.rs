@@ -259,6 +259,13 @@ pub fn palette() -> &'static [PaletteEntry] {
             },
         },
         PaletteEntry {
+            name: "LED",
+            group: "Displays",
+            make: || ComponentKind::Led {
+                colour: dunbrec_core::LedColour::Red,
+            },
+        },
+        PaletteEntry {
             name: "741 op-amp",
             group: "Linear",
             make: || ComponentKind::OpAmp {
@@ -536,6 +543,14 @@ mod tests {
         assert_eq!(group_of("CD4066 analog switch"), Some("Linear"));
         assert_eq!(group_of("AND gate"), Some("Digital"));
         assert!(all.iter().all(|(g, _)| *g != "Integrated circuits"));
+    }
+
+    #[test]
+    fn leds_are_under_displays_and_found_by_searching() {
+        let found = palette_groups("led");
+        assert!(names(&found).contains(&"LED"));
+        assert!(names(&found).contains(&"Logic LED"));
+        assert_eq!(names(&palette_groups("displays")), vec!["LED"]);
     }
 
     #[test]

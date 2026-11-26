@@ -694,6 +694,10 @@ pub(crate) fn make_device(e: &Element, models: &ModelLibrary) -> Result<Box<dyn 
             }
             Box::new(Diode::new(name, node(0), node(1), p))
         }
+        ComponentKind::Led { colour } => {
+            let p = DiodeParams::from_model(&colour.model());
+            Box::new(Diode::new(name, node(0), node(1), p))
+        }
         ComponentKind::Bjt { polarity, model } => {
             let p = BjtParams::from_model(lookup(e, models, model)?);
             let positive = [p.is, p.bf, p.br, p.nf, p.nr, p.ne, p.nc];

@@ -121,6 +121,9 @@ fn resistor_body(prims: &mut Vec<Prim>) {
     prims.push(Prim::Line(zig));
 }
 
+/// The corners of an LED's triangle, closed.
+pub const LED_BODY: [(f32, f32); 4] = [(-0.8, -0.8), (-0.8, 0.8), (0.8, 0.0), (-0.8, -0.8)];
+
 fn source_circle(prims: &mut Vec<Prim>) {
     prims.push(Prim::Circle {
         center: pos2(0.0, 0.0),
@@ -322,6 +325,18 @@ pub fn symbol_styled(kind: &ComponentKind, zener: bool) -> Symbol {
                 p.push(line(&[(0.6, -0.6), (0.6, 0.6)]));
             }
             label = pos2(0.0, -1.1);
+        }
+        ComponentKind::Led { .. } => {
+            p.push(line(&[(-2.0, 0.0), (-0.8, 0.0)]));
+            p.push(line(&[(0.8, 0.0), (2.0, 0.0)]));
+            // An open triangle: the canvas fills it with the LED's colour.
+            p.push(line(&LED_BODY));
+            p.push(line(&[(0.8, -0.8), (0.8, 0.8)]));
+            for (from, to) in [((0.0, -1.1), (0.7, -1.8)), ((0.8, -0.9), (1.5, -1.6))] {
+                p.push(line(&[from, to]));
+                p.push(arrow_head(from, to, 0.45));
+            }
+            label = pos2(0.0, 1.5);
         }
         ComponentKind::Bjt { polarity, .. } => {
             p.push(Prim::Circle {

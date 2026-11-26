@@ -19,6 +19,7 @@ use crate::dock::{self, LAYOUT_KEY, Pane};
 use crate::document::Document;
 use crate::examples::examples;
 use crate::instruments_ui::{Bench, MeterSignal, Signals, Speed};
+use crate::leds::{LedMeter, Lights};
 use crate::library::{PaletteEntry, palette_groups};
 use crate::live::{Command, Event, LiveSim};
 use crate::open_circuit::{DcResults, DocTab, NewFile, OpenCircuit, source_title};
@@ -231,6 +232,8 @@ pub struct DunbrecApp {
     /// Short hint after a probe click that did not connect.
     probe_hint: Option<String>,
     latest: Option<Sample>,
+    /// How much current each LED of the running circuit looks to carry.
+    led_meter: LedMeter,
     /// Probe signals, keyed by (document generation, probe revision).
     signals: ((u64, u64), Signals),
     /// Bode plotter, curve tracer, DC transfer, function generator.
@@ -395,6 +398,7 @@ impl DunbrecApp {
             live_error: None,
             probe_hint: None,
             latest: None,
+            led_meter: LedMeter::default(),
             circuits: vec![OpenCircuit::new(doc)],
             active: 0,
             next_id: 1,
@@ -2054,6 +2058,34 @@ impl DunbrecApp {
             .collect()
     }
 
+    /// The current through each LED: from the running simulation, or from
+    /// the DC operating point when stopped.
+    fn led_currents(&self) -> std::collections::HashMap<dunbrec_core::ComponentId, f64> {
+        let current = self.active().doc.generation();
+        match (&self.live, &self.active().dc) {
+            (Some(_), _) if self.live_generation == current => self.led_meter.currents(),
+            (
+                None,
+                Some(DcResults {
+                    outcome: Ok(t),
+                    generation,
+                }),
+            ) if *generation == current => self
+                .active()
+                .netlist
+                .1
+                .elements
+                .iter()
+                .filter(|e| matches!(e.kind, dunbrec_core::ComponentKind::Led { .. }))
+                .filter_map(|e| {
+                    let found = t.currents.iter().find(|(d, _)| *d == e.designator)?;
+                    Some((e.component, found.1))
+                })
+                .collect(),
+            _ => Default::default(),
+        }
+    }
+
     // ------------------------------------------------ live simulation ---
 
     /// Relative firmware paths are relative to the schematic's folder.
@@ -2134,6 +2166,7 @@ impl DunbrecApp {
         ) {
             Ok(live) => {
                 self.debugger.sim_started();
+                self.led_meter = LedMeter::new(&live.netlist);
                 self.live = Some(live);
                 self.live_generation = self.active().doc.generation();
                 self.live_error = None;
@@ -2241,6 +2274,7 @@ impl DunbrecApp {
             match event {
                 Event::Samples(samples) => {
                     for s in samples {
+                        self.led_meter.add(s.time, &s.currents, self.live_speed);
                         feed(&mut self.bench, &self.signals.1, &s);
                         self.latest = Some(s);
                     }
@@ -2628,7 +2662,10 @@ impl DunbrecApp {
             .collect();
         let active_id = self.active().id;
         let running = self.live.is_some();
-        let lit = self.lit_leds();
+        let lights = Lights {
+            logic: self.lit_leds(),
+            leds: self.led_currents(),
+        };
         let markers = self.bench.markers(self.active().doc.schematic());
         let title = self.active().name();
         let generation = self.active().doc.generation();
@@ -2719,7 +2756,7 @@ impl DunbrecApp {
             running,
             annotations,
             markers: &markers,
-            lit: &lit,
+            lights: &lights,
             project: self.project.as_ref(),
             recent_projects: &self.settings.recent_projects,
             project_panel: &mut self.project_panel,
@@ -3805,7 +3842,7 @@ struct PaneViewer<'a> {
     running: bool,
     annotations: &'a [Annotation],
     markers: &'a [Marker],
-    lit: &'a std::collections::HashSet<dunbrec_core::ComponentId>,
+    lights: &'a Lights,
     project: Option<&'a Project>,
     recent_projects: &'a [PathBuf],
     project_panel: &'a mut ProjectPanel,
@@ -3858,7 +3895,7 @@ impl TabViewer for PaneViewer<'_> {
                     netlist: self.netlist,
                     annotations: self.annotations,
                     markers: self.markers,
-                    lit: self.lit,
+                    lights: self.lights,
                     #[cfg(test)]
                     tab_rects: &mut *self.file_tab_rects,
                 };
@@ -4028,7 +4065,7 @@ struct DocViewer<'a> {
     netlist: &'a Netlist,
     annotations: &'a [Annotation],
     markers: &'a [Marker],
-    lit: &'a std::collections::HashSet<dunbrec_core::ComponentId>,
+    lights: &'a Lights,
     #[cfg(test)]
     tab_rects: &'a mut Vec<(DocTab, egui::Rect)>,
 }
@@ -4056,7 +4093,7 @@ impl TabViewer for DocViewer<'_> {
                 self.netlist,
                 self.annotations,
                 self.markers,
-                self.lit,
+                self.lights,
             ),
             DocTab::Source(name) => {
                 self.code
@@ -5761,6 +5798,66 @@ mod tests {
         f.rig.click("Medium");
         f.rig.click("Large");
         assert_eq!(f.rig.app.settings.bar_size, BarSize::Large);
+    }
+
+    #[test]
+    fn an_led_is_lit_by_its_current_stopped_and_running() {
+        use dunbrec_core::{ComponentKind as K, Point};
+        let mut f = fixture("led");
+        f.rig.app.request(Pending::Example(0));
+        f.rig.settle();
+        // 5 V, a resistor and a red LED, joined by labels.
+        let (mut led, mut resistor) = (None, None);
+        f.rig.app.active_mut().doc.edit(|s| {
+            *s = Default::default();
+            let supply = K::VoltageSource {
+                waveform: dunbrec_core::Waveform::Dc(5.0),
+            };
+            s.add_component(supply, Point::new(0, 0));
+            s.add_component(K::Ground, Point::new(0, 2));
+            s.add_label("A", Point::new(0, -2));
+            let r = K::Resistor { resistance: 220.0 };
+            resistor = Some(s.add_component(r, Point::new(10, 0)));
+            s.add_label("A", Point::new(8, 0));
+            s.add_label("B", Point::new(12, 0));
+            let colour = dunbrec_core::LedColour::Red;
+            led = Some(s.add_component(K::Led { colour }, Point::new(20, 0)));
+            s.add_label("B", Point::new(18, 0));
+            s.add_component(K::Ground, Point::new(22, 0));
+        });
+        f.rig.settle();
+        let led = led.unwrap();
+        let near = |i: Option<&f64>| i.is_some_and(|i| (0.012..0.016).contains(i));
+        let stopped = f.rig.app.led_currents();
+        assert!(near(stopped.get(&led)), "{stopped:?}");
+
+        f.rig.app.run_pressed(false);
+        let started = std::time::Instant::now();
+        while f.rig.app.led_meter.currents().is_empty() {
+            assert!(started.elapsed().as_secs() < 30, "no current arrived");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            f.rig.frame(vec![]);
+        }
+        let running = f.rig.app.led_currents();
+        assert!(near(running.get(&led)), "{running:?}");
+
+        // A much smaller resistor, while it runs: too much current.
+        f.rig.app.active_mut().doc.edit(|s| {
+            s.component_mut(resistor.unwrap()).unwrap().kind = K::Resistor { resistance: 10.0 };
+        });
+        let started = std::time::Instant::now();
+        while f
+            .rig
+            .app
+            .led_currents()
+            .get(&led)
+            .is_none_or(|i| *i <= crate::leds::MOST_CURRENT)
+        {
+            assert!(started.elapsed().as_secs() < 30, "the change never showed");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            f.rig.frame(vec![]);
+        }
+        f.rig.app.stop_sim();
     }
 
     #[test]

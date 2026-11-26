@@ -12,6 +12,7 @@ use egui::{
 };
 
 use crate::document::Document;
+use crate::leds::{self, Lights};
 use crate::library::ensure_model;
 use crate::symbols::{self, Prim};
 
@@ -951,6 +952,7 @@ pub fn value_text(kind: &ComponentKind) -> String {
         | ComponentKind::LogicLed => String::new(),
         ComponentKind::Clock { frequency, .. } => format_value(*frequency, "Hz"),
         ComponentKind::LogicSwitch { high } => (if *high { "high" } else { "low" }).into(),
+        ComponentKind::Led { colour } => colour.name().into(),
         ComponentKind::Mcu { firmware, .. } => firmware_label(firmware),
         ComponentKind::OpAmp { part } => part.clone(),
         ComponentKind::Timer555 => "NE555".into(),
@@ -985,6 +987,29 @@ impl Painter<'_> {
 
     fn stroke_width(&self) -> f32 {
         (self.camera.scale * 0.12).clamp(1.0, 3.0)
+    }
+
+    /// An LED's colour, drawn behind its symbol: a pale filling when it is
+    /// off, and a filling with a glow around it as bright as `brightness`.
+    fn led_light(&self, c: &dunbrec_core::Component, light: Color32, brightness: f32) {
+        let at = |x: f32, y: f32| self.screen(symbols::to_schematic(c, pos2(x, y)));
+        if brightness > 0.0 {
+            let centre = at(0.0, 0.0);
+            for (radius, strength) in [(2.1, 0.25), (1.5, 0.45)] {
+                self.painter.circle_filled(
+                    centre,
+                    self.camera.scale * radius,
+                    light.gamma_multiply(strength * brightness),
+                );
+            }
+        }
+        let body: Vec<Pos2> = symbols::LED_BODY[..3]
+            .iter()
+            .map(|&(x, y)| at(x, y))
+            .collect();
+        let fill = light.gamma_multiply(0.22 + 0.78 * brightness);
+        self.painter
+            .add(Shape::convex_polygon(body, fill, Stroke::NONE));
     }
 
     fn component(
@@ -1094,6 +1119,16 @@ fn label_cursor(painter: &egui::Painter, at: Pos2, fill: Color32, ink: Color32) 
     painter.circle_filled(tip + vec2(half * 0.65, 0.0), 2.5, ink);
     let corner = pos2(left + 3.0, tip.y - text.size().y / 2.0);
     painter.galley(corner, text, ink);
+}
+
+/// The warning over an LED carrying more than it should, ending above `at`.
+fn too_much_current(painter: &egui::Painter, at: Pos2, current: f64) {
+    let text = format!("⚠ {} - too much", format_value(current, "A"));
+    let text = painter.layout_no_wrap(text, FontId::proportional(14.0), Color32::WHITE);
+    let corner = at - vec2(text.size().x / 2.0, text.size().y + 3.0);
+    let behind = Rect::from_min_size(corner, text.size()).expand(3.0);
+    painter.rect_filled(behind, 3.0, Color32::from_rgb(190, 20, 20));
+    painter.galley(corner, text, Color32::WHITE);
 }
 
 // ------------------------------------------------------- interaction ---
@@ -1288,7 +1323,7 @@ impl Canvas {
         netlist: &Netlist,
         annotations: &[Annotation],
         markers: &[Marker],
-        lit: &std::collections::HashSet<ComponentId>,
+        lights: &Lights,
     ) {
         // The drawing, with a scroll bar to its right and one below.
         let (area, _) = ui.allocate_exact_size(ui.available_size(), Sense::hover());
@@ -1507,6 +1542,10 @@ impl Canvas {
             } else {
                 colors.symbol
             };
+            if let ComponentKind::Led { colour } = c.kind {
+                let current = lights.leds.get(&c.id).copied().unwrap_or(0.0);
+                p.led_light(c, leds::light(colour), leds::brightness(current));
+            }
             p.component(
                 c,
                 &s.models,
@@ -1517,7 +1556,7 @@ impl Canvas {
                     colors.text
                 }),
             );
-            if matches!(c.kind, ComponentKind::LogicLed) && lit.contains(&c.id) {
+            if matches!(c.kind, ComponentKind::LogicLed) && lights.logic.contains(&c.id) {
                 let centre = p.screen(symbols::to_schematic(c, pos2(0.0, 0.0)));
                 painter.circle_filled(
                     centre,
@@ -1586,6 +1625,17 @@ impl Canvas {
             let box_rect = Rect::from_min_size(at, galley.size()).expand(3.0);
             painter.rect_filled(box_rect, 3.0, colors.annotation_bg);
             painter.galley(at, galley, colors.annotation_fg);
+        }
+
+        // Over everything else drawn: the LEDs with too much current.
+        for c in &s.components {
+            if let Some(&current) = lights.leds.get(&c.id)
+                && current > leds::MOST_CURRENT
+            {
+                let centre = p.screen(symbols::to_schematic(c, pos2(0.0, 0.0)));
+                let above = centre - vec2(0.0, self.camera.scale * 2.6);
+                too_much_current(&painter, above, current);
+            }
         }
 
         // ---- tool previews ----
@@ -2076,6 +2126,7 @@ mod tests {
         time: f64,
         /// What the last frame drew.
         drawn: Vec<egui::epaint::ClippedShape>,
+        lights: Lights,
     }
 
     impl Rig {
@@ -2090,6 +2141,7 @@ mod tests {
                 netlist,
                 time: 0.0,
                 drawn: Vec::new(),
+                lights: Lights::default(),
             };
             rig.settle();
             rig
@@ -2105,11 +2157,12 @@ mod tests {
                 ..Default::default()
             };
             let (canvas, doc, netlist) = (&mut self.canvas, &mut self.doc, &self.netlist);
+            let lights = &self.lights;
             let out = self.ctx.run(input, |ctx| {
                 egui::CentralPanel::default()
                     .frame(egui::Frame::NONE)
                     .show(ctx, |ui| {
-                        canvas.show(ui, doc, netlist, &[], &[], &Default::default());
+                        canvas.show(ui, doc, netlist, &[], &[], lights);
                     });
             });
             self.drawn = out.shapes;
@@ -2783,6 +2836,53 @@ mod tests {
         );
         rig.settle();
         assert_eq!(rig.canvas.camera.offset, start);
+    }
+
+    #[test]
+    fn an_led_glows_with_its_current_and_warns_of_too_much() {
+        let mut s = Schematic::new();
+        let id = s.add_component(
+            ComponentKind::Led {
+                colour: dunbrec_core::LedColour::Green,
+            },
+            Point::new(10, 10),
+        );
+        let mut rig = Rig::new(s);
+        let green = leds::light(dunbrec_core::LedColour::Green);
+        // How solidly its triangle is filled, how many glows surround it, and
+        // the warning if there is one.
+        let seen = |rig: &mut Rig, current: Option<f64>| {
+            rig.lights.leds = current.into_iter().map(|i| (id, i)).collect();
+            rig.hold(NO_KEY);
+            let greenish = |c: Color32| c.a() > 0 && c.g() > c.r() && c.g() > c.b();
+            let mut fill = None;
+            let mut glows = 0;
+            let mut warning = None;
+            for shape in &rig.drawn {
+                match &shape.shape {
+                    egui::Shape::Path(p) if p.points.len() == 3 && greenish(p.fill) => {
+                        fill = Some(p.fill.a());
+                    }
+                    egui::Shape::Circle(c) if greenish(c.fill) && c.fill.a() < green.a() => {
+                        glows += usize::from(c.radius > rig.canvas.camera.scale);
+                    }
+                    egui::Shape::Text(t) if t.galley.text().contains("too much") => {
+                        warning = Some(t.galley.text().to_string());
+                    }
+                    _ => {}
+                }
+            }
+            (fill.expect("the triangle is filled"), glows, warning)
+        };
+        let (off, glows, warning) = seen(&mut rig, None);
+        assert_eq!((glows, warning), (0, None));
+        let (faint, glows, _) = seen(&mut rig, Some(0.001));
+        assert_eq!(glows, 2);
+        let (full, glows, warning) = seen(&mut rig, Some(0.020));
+        assert_eq!((glows, warning), (2, None));
+        assert!(off < faint && faint < full, "{off} {faint} {full}");
+        let (.., warning) = seen(&mut rig, Some(0.045));
+        assert_eq!(warning.as_deref(), Some("⚠ 45 mA - too much"));
     }
 
     #[test]

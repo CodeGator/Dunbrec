@@ -9,7 +9,7 @@ use std::ops::{Add, Sub};
 
 use serde::{Deserialize, Serialize};
 
-use crate::models::ModelLibrary;
+use crate::models::{DeviceModel, ModelKind, ModelLibrary};
 
 /// A point on the schematic grid.
 #[derive(
@@ -430,6 +430,75 @@ impl Waveform {
     }
 }
 
+/// The colour of an LED, which also decides how much voltage it needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum LedColour {
+    Red,
+    Yellow,
+    Green,
+    Blue,
+    White,
+}
+
+impl LedColour {
+    pub const ALL: [LedColour; 5] = [
+        LedColour::Red,
+        LedColour::Yellow,
+        LedColour::Green,
+        LedColour::Blue,
+        LedColour::White,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            LedColour::Red => "red",
+            LedColour::Yellow => "yellow",
+            LedColour::Green => "green",
+            LedColour::Blue => "blue",
+            LedColour::White => "white",
+        }
+    }
+
+    /// The voltage across a typical LED of this colour at 10 mA.
+    pub fn forward_voltage(self) -> f64 {
+        match self {
+            LedColour::Red => 1.9,
+            LedColour::Yellow => 2.0,
+            LedColour::Green => 2.1,
+            LedColour::Blue => 3.0,
+            LedColour::White => 3.1,
+        }
+    }
+
+    /// A usual series resistor from 5 V, for about 15 mA.
+    pub fn resistor_from_5v(self) -> f64 {
+        match self {
+            LedColour::Red | LedColour::Yellow | LedColour::Green => 220.0,
+            LedColour::Blue | LedColour::White => 150.0,
+        }
+    }
+
+    /// The diode model that behaves like this LED.
+    pub fn model(self) -> DeviceModel {
+        // Ideality and series resistance; the saturation current follows from
+        // the voltage wanted at 10 mA (at 27 °C).
+        let (n, rs) = match self {
+            LedColour::Red | LedColour::Yellow => (2.0, 5.0),
+            LedColour::Green => (2.0, 8.0),
+            LedColour::Blue | LedColour::White => (3.5, 10.0),
+        };
+        const CURRENT: f64 = 0.010;
+        const THERMAL: f64 = 0.025_865;
+        let junction = self.forward_voltage() - CURRENT * rs;
+        let is = CURRENT / ((junction / (n * THERMAL)).exp() - 1.0);
+        let name = format!("DUNBREC_LED_{}", self.name().to_ascii_uppercase());
+        DeviceModel::new(name, ModelKind::Diode)
+            .with("IS", is)
+            .with("N", n)
+            .with("RS", rs)
+    }
+}
+
 /// What a component is, plus its electrical parameters.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ComponentKind {
@@ -565,6 +634,13 @@ pub enum ComponentKind {
     /// Lights up when its input is high.
     LogicLed,
 
+    // ---- Lights ----
+    /// A light-emitting diode: a real one, which needs a resistor in series
+    /// and shines according to its current.
+    Led {
+        colour: LedColour,
+    },
+
     // ---- Microcontrollers ----
     /// ATmega328P (Arduino Uno/Nano) running firmware from `firmware`: the
     /// path of an Intel HEX file (relative to the schematic's folder, or
@@ -682,7 +758,7 @@ impl ComponentKind {
             | ComponentKind::Switch { .. } => TWO_TERMINAL,
             ComponentKind::VoltageSource { .. } => VOLTAGE_SOURCE,
             ComponentKind::CurrentSource { .. } => CURRENT_SOURCE,
-            ComponentKind::Diode { .. } => DIODE,
+            ComponentKind::Diode { .. } | ComponentKind::Led { .. } => DIODE,
             ComponentKind::Bjt { .. } => BJT,
             ComponentKind::Mosfet { .. } => MOSFET,
             ComponentKind::MultiSwitch { form, .. } => match form {
@@ -736,7 +812,7 @@ impl ComponentKind {
             | ComponentKind::Cd4066 { .. } => "U",
             ComponentKind::Clock { .. } => "CLK",
             ComponentKind::LogicSwitch { .. } => "SW",
-            ComponentKind::LogicLed => "LED",
+            ComponentKind::LogicLed | ComponentKind::Led { .. } => "LED",
         }
     }
 
