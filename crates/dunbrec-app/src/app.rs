@@ -22,7 +22,7 @@ use crate::instruments_ui::{Bench, MeterSignal, Signals, Speed};
 use crate::library::{PaletteEntry, palette_groups};
 use crate::live::{Command, Event, LiveSim};
 use crate::open_circuit::{DcResults, DocTab, NewFile, OpenCircuit, source_title};
-use crate::project::{self, Project};
+use crate::project::{self, CircuitCode, Project};
 use crate::project_ui::{self, ProjectPanel};
 use crate::properties::{DemoRequest, Properties};
 use crate::serial_ui::SerialMonitor;
@@ -101,6 +101,8 @@ struct DeleteAsk {
     /// Open circuits inside it have unsaved changes: the user is asked about
     /// losing those first.
     discard_first: bool,
+    /// It is only to leave the project: nothing is deleted from the disk.
+    remove_only: bool,
 }
 
 /// A circuit waiting to be opened because it names source files that an open
@@ -111,8 +113,27 @@ struct SharedAsk {
     schematic: Schematic,
     /// Source files that could not be read.
     problems: Vec<String>,
-    /// Each shared file, and the name of the open circuit that has it.
+    /// Each shared file, and the name of another circuit that uses it.
     shared: Vec<(String, String)>,
+    /// None of those circuits is open, so it can also be opened as it is.
+    may_share: bool,
+}
+
+/// A chip of an open circuit was just given a file another circuit uses.
+struct SharedEdit {
+    /// The circuit that was changed, by its id.
+    circuit: u32,
+    /// Each shared file, and the name of another circuit that uses it.
+    shared: Vec<(String, String)>,
+}
+
+/// A source file waiting for the user to say which chip should run it.
+struct AssignAsk {
+    file: PathBuf,
+    /// The project's microcontrollers: circuit file, chip, and how to
+    /// describe it.
+    chips: Vec<(PathBuf, dunbrec_core::ComponentId, String)>,
+    chosen: usize,
 }
 
 /// Which instrument windows are on screen, and the speed chosen: these stay
@@ -140,6 +161,8 @@ pub struct DunbrecApp {
     file_tab_rects: Vec<(DocTab, egui::Rect)>,
     /// A circuit that shares a source file, waiting for the user's answer.
     shared_ask: Option<SharedAsk>,
+    shared_edit: Option<SharedEdit>,
+    assign_ask: Option<AssignAsk>,
     live_dc: bool,
     show_voltages: bool,
     pending: Option<Pending>,
@@ -338,6 +361,8 @@ impl DunbrecApp {
             #[cfg(test)]
             file_tab_rects: Vec::new(),
             shared_ask: None,
+            shared_edit: None,
+            assign_ask: None,
             live_dc: true,
             show_voltages: true,
             pending: None,
@@ -580,10 +605,21 @@ impl DunbrecApp {
                     .parent()
                     .map(|dir| project::hydrate(&mut schematic, dir))
                     .unwrap_or_default();
-                let shared = path
-                    .parent()
-                    .map(|dir| self.shared_sources(&schematic, dir, None))
-                    .unwrap_or_default();
+                let dir = path.parent().unwrap_or(std::path::Path::new(""));
+                // Files an open circuit has cannot be shared; those that only
+                // a closed one uses can be, though a copy is better.
+                let mut shared = self.shared_sources(&schematic, dir, None);
+                let may_share = shared.is_empty();
+                if may_share {
+                    shared = project::code_of(&schematic, &path)
+                        .uses
+                        .iter()
+                        .filter_map(|u| {
+                            let other = self.other_user(&u.path, &path)?;
+                            Some((u.name.clone(), other))
+                        })
+                        .collect();
+                }
                 if shared.is_empty() {
                     let mut doc = Document::new(schematic, None);
                     doc.mark_saved(path);
@@ -594,6 +630,7 @@ impl DunbrecApp {
                         schematic,
                         problems,
                         shared,
+                        may_share,
                     });
                 }
             }
@@ -655,36 +692,19 @@ impl DunbrecApp {
             schematic: mut own,
             problems,
             shared,
+            ..
         } = ask;
         let Some(dir) = path.parent().map(|d| d.to_path_buf()) else {
             return;
         };
-        let mut made = Vec::new();
-        for (name, _) in &shared {
-            let (Some(file), Some((base, extension))) =
-                (own.sources.get(name).cloned(), name.rsplit_once('.'))
-            else {
-                continue;
-            };
-            let taken = |n: &str| own.sources.keys().any(|k| k.eq_ignore_ascii_case(n));
-            let copy = match project::new_source_copy(&dir, base, extension, &file.text, taken) {
-                Ok(copy) => copy,
-                Err(e) => {
-                    self.message = Some(Message::error("Could not copy the source file", e));
-                    return;
-                }
-            };
-            for c in &mut own.components {
-                if let dunbrec_core::ComponentKind::Mcu { firmware, .. } = &mut c.kind
-                    && firmware.trim() == name
-                {
-                    firmware.clone_from(&copy);
-                }
+        let names: Vec<String> = shared.into_iter().map(|(name, _)| name).collect();
+        let made = match project::copy_sources(&mut own, &dir, &names) {
+            Ok(made) => made,
+            Err(e) => {
+                self.message = Some(Message::error("Could not copy the source file", e));
+                return;
             }
-            own.sources.remove(name);
-            own.sources.insert(copy.clone(), file);
-            made.push(dir.join(copy));
-        }
+        };
         self.list_in_project(&path, &made);
         let mut doc = Document::new(own, None);
         doc.mark_saved(path);
@@ -692,6 +712,199 @@ impl DunbrecApp {
         // circuit file does not have the new names yet.
         doc.mark_unsaved();
         self.add_opened(doc, &problems);
+    }
+
+    // ------------------------------------------ circuits and their code ---
+
+    /// What each of the project's circuits runs: the open ones as they are
+    /// now, saved or not, the others as their files say.
+    fn project_code(&self) -> Vec<CircuitCode> {
+        let Some(project) = &self.project else {
+            return Vec::new();
+        };
+        project
+            .code
+            .iter()
+            .map(|saved| {
+                self.circuit_with_file(&saved.circuit)
+                    .and_then(|i| self.circuits[i].code())
+                    .unwrap_or_else(|| saved.clone())
+            })
+            .collect()
+    }
+
+    /// The name of a circuit other than the one in `circuit` that runs the
+    /// source file at `path`.
+    fn other_user(&self, path: &std::path::Path, circuit: &std::path::Path) -> Option<String> {
+        let elsewhere = |other: &std::path::Path| {
+            !project::path_eq(&project::normalize(other), &project::normalize(circuit))
+        };
+        // Open circuits, listed in the project or not, and then the rest.
+        let open = (0..self.open_ids().len())
+            .filter_map(|i| self.circuits[i].code())
+            .collect::<Vec<_>>();
+        open.into_iter()
+            .chain(self.project_code())
+            .find(|c| elsewhere(&c.circuit) && c.use_of(path).is_some())
+            .map(|c| c.name())
+    }
+
+    /// List in the project the files its circuits have come to use, so that
+    /// its list stays in step with them.
+    fn list_used_files(&mut self) {
+        let code = self.project_code();
+        let Some(project) = self.project.as_mut() else {
+            return;
+        };
+        let new: Vec<PathBuf> = code
+            .iter()
+            .filter(|c| project.contains(&c.circuit))
+            .flat_map(|c| &c.uses)
+            .map(|u| u.path.clone())
+            .filter(|path| !project.contains(path) && path.is_file())
+            .collect();
+        if !new.is_empty()
+            && let Err(e) = project.add_files(&new)
+        {
+            self.message = Some(Message::error("Could not update the project file", e));
+        }
+    }
+
+    /// Look at what the active circuit's chips have come to run: open it, and
+    /// ask about any file another circuit uses.
+    fn check_new_code(&mut self) {
+        if !self.circuit_open {
+            return;
+        }
+        let new = self.active_mut().newly_used();
+        if new.is_empty() {
+            return;
+        }
+        let Some(circuit) = self.active().doc.path().map(|p| p.to_path_buf()) else {
+            return;
+        };
+        let shared: Vec<(String, String)> = new
+            .iter()
+            .filter_map(|u| Some((u.name.clone(), self.other_user(&u.path, &circuit)?)))
+            .collect();
+        if !shared.is_empty() {
+            self.shared_edit = Some(SharedEdit {
+                circuit: self.active().id,
+                shared,
+            });
+        }
+    }
+
+    /// Give the circuit `edit` is about copies of its own of the shared files.
+    fn copy_for_edit(&mut self, edit: SharedEdit) {
+        let Some(index) = self.index_of(edit.circuit) else {
+            return;
+        };
+        let circuit = &mut self.circuits[index];
+        let (Some(dir), Some(path)) = (
+            circuit.firmware_dir(),
+            circuit.doc.path().map(|p| p.to_path_buf()),
+        ) else {
+            return;
+        };
+        let names: Vec<String> = edit.shared.into_iter().map(|(name, _)| name).collect();
+        let mut own = circuit.doc.schematic().clone();
+        match project::copy_sources(&mut own, &dir, &names) {
+            Ok(made) => {
+                circuit.doc.edit(|s| *s = own);
+                self.list_in_project(&path, &made);
+            }
+            Err(e) => self.message = Some(Message::error("Could not copy the source file", e)),
+        }
+    }
+
+    /// Ask which of the project's microcontrollers should run `file`.
+    fn ask_assign(&mut self, file: PathBuf) {
+        let active = self
+            .circuit_open
+            .then(|| self.active().doc.path().map(|p| p.to_path_buf()))
+            .flatten();
+        let mut chips = Vec::new();
+        for code in self.project_code() {
+            for chip in &code.chips {
+                let runs = if chip.firmware.is_empty() {
+                    "nothing".to_string()
+                } else {
+                    chip.firmware.clone()
+                };
+                let label = format!("{}: {}  (runs {runs})", code.name(), chip.designator);
+                chips.push((code.circuit.clone(), chip.id, label));
+            }
+        }
+        if chips.is_empty() {
+            self.message = Some(Message::info(
+                "No microcontroller to run it",
+                "None of the project's circuits has a microcontroller. Add one from the \
+                 palette, then choose this file again under Not used.",
+            ));
+            return;
+        }
+        // Start on a chip of the circuit being looked at.
+        let chosen = active
+            .and_then(|a| chips.iter().position(|c| project::path_eq(&c.0, &a)))
+            .unwrap_or(0);
+        self.assign_ask = Some(AssignAsk {
+            file,
+            chips,
+            chosen,
+        });
+    }
+
+    /// Set the chip `chip` of the circuit in `circuit` to run `file`.
+    fn assign(
+        &mut self,
+        file: &std::path::Path,
+        circuit: PathBuf,
+        chip: dunbrec_core::ComponentId,
+    ) {
+        self.request(Pending::OpenPath(circuit.clone()));
+        let Some(index) = self.circuit_with_file(&circuit) else {
+            return;
+        };
+        self.switch_to(index);
+        let Some(dir) = self.firmware_dir() else {
+            return;
+        };
+        let name = project::relative_to(&dir, file);
+        // A circuit that no longer uses the file may still have it open, with
+        // text not yet saved: the file moves from there.
+        let mut held = None;
+        for (i, other) in self.circuits.iter_mut().enumerate() {
+            if i != index
+                && let Some(known) = other.source_at(file)
+            {
+                held = other.doc.schematic_mut().sources.remove(&known);
+            }
+        }
+        let circuit_now = &mut self.circuits[index];
+        let result = match held {
+            Some(text) => {
+                circuit_now
+                    .doc
+                    .schematic_mut()
+                    .sources
+                    .insert(name.clone(), text);
+                Ok(())
+            }
+            None => project::attach(circuit_now.doc.schematic_mut(), &dir, &name),
+        };
+        if let Err(e) = result {
+            self.message = Some(Message::error("Could not open the source file", e));
+            return;
+        }
+        circuit_now.doc.edit(|s| {
+            if let Some(c) = s.component_mut(chip)
+                && let dunbrec_core::ComponentKind::Mcu { firmware, .. } = &mut c.kind
+            {
+                firmware.clone_from(&name);
+            }
+        });
+        circuit_now.show_source(&name);
     }
 
     /// List `files` in the project, if it lists the circuit they belong to.
@@ -964,6 +1177,8 @@ impl DunbrecApp {
         self.project = None;
         self.name_prompt = None;
         self.shared_ask = None;
+        self.shared_edit = None;
+        self.assign_ask = None;
         self.close_all_circuits();
     }
 
@@ -1001,12 +1216,12 @@ impl DunbrecApp {
         self.switch_project(ProjectTarget::Create(file));
     }
 
-    /// Make something new in the open project (a circuit, a source file or
-    /// a folder): ask for its name, then list it in the project and open it.
-    fn new_in_project(&mut self, what: project_ui::Create) {
+    /// Make a circuit in the open project: ask for its name, then list it and
+    /// open it.
+    fn new_circuit(&mut self) {
         if let Some(project) = &self.project {
             let dir = project.root.clone();
-            self.run_project_command(project_ui::Command::AskCreate { dir, what });
+            self.run_project_command(project_ui::Command::AskCircuit(dir));
         }
     }
 
@@ -1108,7 +1323,7 @@ impl DunbrecApp {
 
     /// Carry out what the Project panel asked for.
     fn run_project_command(&mut self, command: project_ui::Command) {
-        use project_ui::{Command as C, Create};
+        use project_ui::Command as C;
         match command {
             C::NewProject => self.new_project(),
             C::OpenProject => self.pick_and_open_project(),
@@ -1117,49 +1332,40 @@ impl DunbrecApp {
             // unsaved changes.
             C::CloseProject => self.request(Pending::CloseProject),
             C::OpenSchematic(path) => self.request(Pending::OpenPath(path)),
-            C::OpenSource(path) => self.open_source(&path),
-            C::Create { dir, name, what } => {
-                let made = match what {
-                    Create::Schematic => project::new_schematic(&dir, &name),
-                    Create::Assembly => {
-                        project::new_source(&dir, &name, project::NewSource::Assembly)
-                    }
-                    Create::Sketch => project::new_source(&dir, &name, project::NewSource::Sketch),
-                    Create::Folder => project::new_folder(&dir, &name),
-                };
-                match made {
-                    Ok(path) => {
-                        // What is made here belongs to the project.
-                        if let Some(p) = &mut self.project {
-                            let listed = match what {
-                                Create::Folder => p.add_folder(&path),
-                                _ => p.add_file(&path).map(|_| ()),
-                            };
-                            if let Err(e) = listed {
-                                self.message =
-                                    Some(Message::error("Could not update the project file", e));
-                            }
-                        }
-                        match what {
-                            Create::Schematic => self.request(Pending::OpenPath(path)),
-                            Create::Assembly | Create::Sketch => self.open_source(&path),
-                            Create::Folder => {}
-                        }
-                    }
-                    Err(e) => self.message = Some(Message::error("Could not create it", e)),
-                }
+            C::OpenCircuitSource { circuit, name } => self.open_circuit_source(circuit, &name),
+            C::AskAssign(file) => self.ask_assign(file),
+            C::OpenChip { circuit, chip } => self.open_chip(circuit, chip),
+            C::AskNewSource {
+                circuit,
+                chip,
+                who,
+                what,
+            } => {
+                self.name_prompt = Some(project_ui::NamePrompt::source(&circuit, chip, &who, what));
             }
+            C::CreateForChip {
+                circuit,
+                chip,
+                name,
+                what,
+            } => self.create_for_chip(circuit, chip, &name, what),
+            C::CreateCircuit { dir, name } => match project::new_schematic(&dir, &name) {
+                Ok(path) => {
+                    // What is made here belongs to the project.
+                    if let Some(p) = &mut self.project
+                        && let Err(e) = p.add_file(&path)
+                    {
+                        self.message = Some(Message::error("Could not update the project file", e));
+                    }
+                    self.request(Pending::OpenPath(path));
+                }
+                Err(e) => self.message = Some(Message::error("Could not create it", e)),
+            },
             C::AddExisting => self.add_existing_files(),
-            C::RemoveFromProject(path) => {
-                if let Some(p) = &mut self.project
-                    && let Err(e) = p.remove(&path)
-                {
-                    self.message = Some(Message::error("Could not update the project file", e));
-                }
-            }
+            C::RemoveFromProject(path) => self.ask_remove(path),
             C::Rename { from, to } => self.rename_in_project(&from, &to),
-            C::AskCreate { dir, what } => {
-                self.name_prompt = Some(project_ui::NamePrompt::create(&dir, what));
+            C::AskCircuit(dir) => {
+                self.name_prompt = Some(project_ui::NamePrompt::circuit(&dir));
             }
             C::AskRename(path) => self.name_prompt = Some(project_ui::NamePrompt::rename(&path)),
             C::AskDelete(path) => {
@@ -1170,6 +1376,7 @@ impl DunbrecApp {
                 self.confirm_delete = Some(DeleteAsk {
                     path,
                     discard_first,
+                    remove_only: false,
                 });
             }
             C::Refresh => self.refresh_project(),
@@ -1196,39 +1403,119 @@ impl DunbrecApp {
         }
     }
 
-    /// Show the source file at `path`: in the circuit that has it, or else
-    /// in the active circuit.
-    fn open_source(&mut self, path: &std::path::Path) {
-        let owner = (0..self.open_ids().len())
-            .find_map(|i| self.circuits[i].source_at(path).map(|name| (i, name)));
-        if let Some((index, name)) = owner {
+    /// Open the circuit in `circuit` with its microcontroller `chip` selected.
+    fn open_chip(&mut self, circuit: PathBuf, chip: dunbrec_core::ComponentId) {
+        self.request(Pending::OpenPath(circuit.clone()));
+        if let Some(index) = self.circuit_with_file(&circuit) {
             self.switch_to(index);
-            self.active_mut().show_source(&name);
-            return;
+            let open = self.active_mut();
+            open.canvas.selection = [Item::Component(chip)].into_iter().collect();
+            if let Some(at) = open.tabs.find_tab(&DocTab::Schematic) {
+                open.tabs.set_active_tab(at);
+            }
         }
-        if !self.circuit_open {
-            self.message = Some(Message::info(
-                "Open a circuit first",
-                "A source file belongs to a circuit. Open the circuit it is for, then open \
-                 the file again.",
-            ));
-            return;
+    }
+
+    /// Make a new source file beside `circuit` and have its chip run it.
+    fn create_for_chip(
+        &mut self,
+        circuit: PathBuf,
+        chip: dunbrec_core::ComponentId,
+        name: &str,
+        what: project_ui::Create,
+    ) {
+        let kind = match what {
+            project_ui::Create::Sketch => project::NewSource::Sketch,
+            _ => project::NewSource::Assembly,
+        };
+        let dir = circuit.parent().unwrap_or(std::path::Path::new(""));
+        match project::new_source(dir, name, kind) {
+            Ok(file) => {
+                self.list_in_project(&circuit, std::slice::from_ref(&file));
+                self.assign(&file, circuit, chip);
+            }
+            Err(e) => self.message = Some(Message::error("Could not create it", e)),
         }
-        let Some(dir) = self.firmware_dir() else {
-            self.message = Some(Message::info(
-                "Save the circuit first",
-                "A source file is found by its place relative to its circuit. Save this \
-                 circuit (Ctrl+S), preferably in the project folder, and then open the file \
-                 again.",
-            ));
+    }
+
+    /// What every circuit runs: those of the project, and any open one that is
+    /// not in it.
+    fn all_code(&self) -> Vec<CircuitCode> {
+        let mut code = self.project_code();
+        for index in 0..self.open_ids().len() {
+            if let Some(open) = self.circuits[index].code()
+                && !code
+                    .iter()
+                    .any(|c| project::path_eq(&c.circuit, &open.circuit))
+            {
+                code.push(open);
+            }
+        }
+        code
+    }
+
+    /// The chips outside `going` that would be left without their program if
+    /// the files `gone` went.
+    fn left_without(
+        code: &[CircuitCode],
+        gone: &[PathBuf],
+        going: &std::path::Path,
+    ) -> Vec<String> {
+        let going = project::normalize(going);
+        let lost = |path: &std::path::Path| {
+            gone.iter()
+                .any(|g| project::starts_with_ci(path, &project::normalize(g)))
+        };
+        code.iter()
+            .filter(|c| !project::starts_with_ci(&c.circuit, &going))
+            .flat_map(|c| {
+                c.uses
+                    .iter()
+                    .filter(|u| lost(&u.path))
+                    .map(|u| format!("{} in {} uses {}.", u.chips.join(", "), c.name(), u.name))
+            })
+            .collect()
+    }
+
+    /// Take a file, circuit or folder out of the project, asking first if a
+    /// chip would be left without its program.
+    fn ask_remove(&mut self, path: PathBuf) {
+        let code = self.all_code();
+        if Self::left_without(&code, std::slice::from_ref(&path), &path).is_empty() {
+            self.remove_from_project(&path);
+        } else {
+            self.confirm_delete = Some(DeleteAsk {
+                path,
+                discard_first: false,
+                remove_only: true,
+            });
+        }
+    }
+
+    /// Take `path` out of the project, and with a circuit the source files
+    /// only it uses. Nothing is deleted from the disk.
+    fn remove_from_project(&mut self, path: &std::path::Path) {
+        let removal = project::removal(&self.all_code(), path);
+        self.forget_in_circuits(path);
+        let Some(project) = self.project.as_mut() else {
             return;
         };
-        let name = project::relative_to(&dir, path);
-        if let Err(e) = project::attach(self.active_mut().doc.schematic_mut(), &dir, &name) {
-            self.message = Some(Message::error("Could not open the source file", e));
-            return;
+        let result = std::iter::once(path)
+            .chain(removal.extra.iter().map(PathBuf::as_path))
+            .try_for_each(|gone| project.remove(gone).map(|_| ()));
+        if let Err(e) = result {
+            self.message = Some(Message::error("Could not update the project file", e));
         }
-        self.active_mut().show_source(&name);
+        self.refresh_project();
+    }
+
+    /// Open the circuit in `circuit` and show the tab of its source `name`.
+    fn open_circuit_source(&mut self, circuit: PathBuf, name: &str) {
+        self.request(Pending::OpenPath(circuit.clone()));
+        if let Some(index) = self.circuit_with_file(&circuit) {
+            self.switch_to(index);
+            self.active_mut().show_source(name);
+        }
     }
 
     fn rename_in_project(&mut self, from: &std::path::Path, to: &std::path::Path) {
@@ -1289,11 +1576,17 @@ impl DunbrecApp {
     /// if open circuits in it have unsaved changes, whether to lose those;
     /// then whether to delete.
     fn confirm_delete_dialog(&mut self, ctx: &egui::Context, ask: DeleteAsk) {
-        let name = ask
+        let circuit = ask
             .path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("dbr"));
+        let name = if circuit {
+            ask.path.file_stem()
+        } else {
+            ask.path.file_name()
+        }
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
         if ask.discard_first {
             let names: Vec<String> = self
                 .circuits_in(&ask.path)
@@ -1318,36 +1611,114 @@ impl DunbrecApp {
             }
             return;
         }
-        let what = if ask.path.is_dir() {
+        let code = self.all_code();
+        let removal = project::removal(&code, &ask.path);
+        let root = self.project.as_ref().map(|p| p.root.clone());
+        let short = |path: &std::path::Path| match &root {
+            Some(root) => project::relative_to(root, path),
+            None => path.display().to_string(),
+        };
+        // The source files that go with a circuit, and those that stay.
+        let (mut going, mut kept) = (Vec::new(), Vec::new());
+        let mut gone = vec![ask.path.clone()];
+        if !ask.remove_only {
+            gone.extend(removal.extra.iter().cloned());
+            going = removal
+                .extra
+                .iter()
+                .filter(|p| p.exists())
+                .map(|p| short(p))
+                .collect();
+            kept = removal
+                .kept
+                .iter()
+                .map(|(p, others)| format!("{}  ({})", short(p), others.join(", ")))
+                .collect();
+        }
+        let users = Self::left_without(&code, &gone, &ask.path);
+        let folder = ask.path.is_dir();
+        let what = if ask.remove_only {
+            format!("Remove “{name}” from the project?")
+        } else if folder {
             format!("Delete the folder “{name}” and everything in it?")
+        } else if circuit && !going.is_empty() {
+            format!("Delete the circuit “{name}” and its source files?")
+        } else if circuit {
+            format!("Delete the circuit “{name}”?")
         } else {
             format!("Delete “{name}”?")
         };
-        // Cancel is the highlighted button: Enter must not delete a file.
+        let fate = if ask.remove_only {
+            "Nothing is deleted from the disk."
+        } else if folder || !going.is_empty() {
+            "They go to the Recycle Bin, so you can get them back."
+        } else {
+            "It goes to the Recycle Bin, so you can get it back."
+        };
+        let buttons: &[&str] = if ask.remove_only {
+            &["Remove", "Cancel"]
+        } else {
+            &["Delete", "Cancel"]
+        };
+        // Cancel is the highlighted button: Enter must not delete anything.
         let answer = Dialog {
             id: "confirm_delete",
             kind: dialog::Kind::Warning,
-            title: "Delete from disk",
-            buttons: &["Delete", "Cancel"],
+            title: if ask.remove_only {
+                "Remove from project"
+            } else {
+                "Delete"
+            },
+            buttons,
             default: 1,
             cancel: Some(1),
         }
         .show(ctx, |ui| {
             dialog::paragraph(ui, &what);
+            egui::ScrollArea::vertical()
+                .max_height(240.0)
+                .show(ui, |ui| {
+                    for file in &going {
+                        dialog::paragraph(ui, &format!("•  {file}"));
+                    }
+                    if !kept.is_empty() {
+                        ui.add_space(6.0);
+                        dialog::paragraph(ui, "Kept, because another circuit also uses it:");
+                        for file in &kept {
+                            dialog::paragraph(ui, &format!("•  {file}"));
+                        }
+                    }
+                    for user in &users {
+                        ui.add_space(4.0);
+                        dialog::paragraph(ui, user);
+                    }
+                });
+            if !users.is_empty() {
+                ui.add_space(4.0);
+                dialog::paragraph(ui, "A chip that uses it is left with no program.");
+            }
             ui.add_space(4.0);
-            dialog::paragraph(ui, "This removes it from the disk and cannot be undone.");
+            dialog::paragraph(ui, fate);
         });
         match answer {
             Some(0) => {
                 self.confirm_delete = None;
-                self.delete_in_project(&ask.path);
+                if ask.remove_only {
+                    self.remove_from_project(&ask.path);
+                } else {
+                    self.delete_in_project(&ask.path);
+                }
             }
             Some(_) => self.confirm_delete = None,
             None => {}
         }
     }
 
+    /// Delete `path` (to the Recycle Bin), and with a circuit the source
+    /// files only it uses.
     fn delete_in_project(&mut self, path: &std::path::Path) {
+        // Worked out while the circuits can still be read.
+        let removal = project::removal(&self.all_code(), path);
         let Some(project) = self.project.as_mut() else {
             return;
         };
@@ -1367,20 +1738,64 @@ impl DunbrecApp {
                 self.close_circuit_at(index);
             }
         }
-        // Drop open source files that were deleted.
-        let gone = project::normalize(path);
-        for circuit in &mut self.circuits {
-            let dead: Vec<String> = circuit
-                .source_paths()
-                .into_iter()
-                .filter(|(_, full)| project::starts_with_ci(full, &gone))
-                .map(|(name, _)| name)
-                .collect();
-            for name in dead {
-                circuit.doc.schematic_mut().sources.remove(&name);
+        self.forget_in_circuits(path);
+        for file in &removal.extra {
+            let Some(project) = self.project.as_mut() else {
+                break;
+            };
+            match project::delete(project, file) {
+                Ok(()) => self.forget_in_circuits(file),
+                Err(e) => self.message = Some(Message::error("Could not delete it", e)),
             }
         }
         self.refresh_project();
+    }
+
+    /// Take the deleted source file (or folder of them) `gone` away from the
+    /// circuits: in an open one as an edit, to be saved or undone, and in the
+    /// others in their files, so that none is left asking for it.
+    fn forget_in_circuits(&mut self, gone: &std::path::Path) {
+        let going = self.circuits_in(gone);
+        for index in (0..self.open_ids().len()).filter(|i| !going.contains(i)) {
+            let Some(dir) = self.circuits[index].firmware_dir() else {
+                continue;
+            };
+            let doc = &mut self.circuits[index].doc;
+            let mut changed = doc.schematic().clone();
+            let chips = project::forget_sources(&mut changed, &dir, gone);
+            if chips > 0 {
+                doc.edit(|s| *s = changed);
+            } else if changed.sources.len() != doc.schematic().sources.len() {
+                // Only a tab to close: nothing of the circuit changes.
+                *doc.schematic_mut() = changed;
+            }
+        }
+        let closed: Vec<PathBuf> = self
+            .project_code()
+            .into_iter()
+            .filter(|c| self.circuit_with_file(&c.circuit).is_none())
+            .filter(|c| !project::starts_with_ci(&c.circuit, &project::normalize(gone)))
+            .filter(|c| {
+                c.uses
+                    .iter()
+                    .any(|u| project::starts_with_ci(&u.path, &project::normalize(gone)))
+            })
+            .map(|c| c.circuit)
+            .collect();
+        for path in closed {
+            let dir = path.parent().unwrap_or(std::path::Path::new(""));
+            let result = dunbrec_io::dbr::load(&path).and_then(|mut s| {
+                project::forget_sources(&mut s, dir, gone);
+                dunbrec_io::dbr::save(&s, &path)
+            });
+            if let Err(e) = result {
+                self.message = Some(Message::file_error(
+                    "Could not change the circuit",
+                    &path,
+                    e,
+                ));
+            }
+        }
     }
 
     /// Rescan the project folder, and take up edits made to the open
@@ -1467,7 +1882,7 @@ impl DunbrecApp {
                 self.request(Pending::Open);
             }
             if pressed(cmd(Key::N)) {
-                self.new_in_project(project_ui::Create::Schematic);
+                self.new_circuit();
             }
             return;
         }
@@ -1491,7 +1906,7 @@ impl DunbrecApp {
             self.request(Pending::Open);
         }
         if pressed(cmd(Key::N)) {
-            self.new_in_project(project_ui::Create::Schematic);
+            self.new_circuit();
         }
         if pressed(cmd(Key::C)) {
             self.active_mut().copy();
@@ -2091,6 +2506,11 @@ impl DunbrecApp {
         if self.circuit_open {
             self.active_mut().sync_tabs();
         }
+        let project_code = self.project_code();
+        let open_files: Vec<PathBuf> = (0..self.open_ids().len())
+            .filter_map(|i| self.circuits[i].doc.path().map(|p| p.to_path_buf()))
+            .collect();
+        let circuit_open = self.circuit_open;
         let names: Vec<(u32, String, bool)> = self
             .circuits
             .iter()
@@ -2164,6 +2584,9 @@ impl DunbrecApp {
             )
         };
         let mut viewer = PaneViewer {
+            project_code: &project_code,
+            open_files: &open_files,
+            circuit_open,
             circuits: &names,
             active_id,
             tabs,
@@ -2294,21 +2717,14 @@ impl DunbrecApp {
         egui::TopBottomPanel::top("menu").show(ctx, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("File", |ui| {
-                    ui.menu_button("New", |ui| {
-                        for what in project_ui::Create::ALL {
-                            let label = if what == project_ui::Create::Schematic {
-                                format!("{}   Ctrl+N", what.menu_label())
-                            } else {
-                                what.menu_label().to_string()
-                            };
-                            if ui.button(label).clicked() {
-                                self.new_in_project(what);
-                                ui.close();
-                            }
-                        }
-                    })
-                    .response
-                    .on_hover_text("Make something new in the project");
+                    if ui
+                        .button("New circuit…   Ctrl+N")
+                        .on_hover_text("Make a circuit in the project")
+                        .clicked()
+                    {
+                        self.new_circuit();
+                        ui.close();
+                    }
                     if ui.button("Open…      Ctrl+O").clicked() {
                         self.request(Pending::Open);
                         ui.close();
@@ -2603,35 +3019,110 @@ impl DunbrecApp {
                 .file_stem()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_default();
+            let buttons: &[&str] = if ask.may_share {
+                &["Make a copy", "Open as it is", "Cancel"]
+            } else {
+                &["Make a copy", "Cancel"]
+            };
             let answer = Dialog {
                 id: "shared_source",
                 kind: dialog::Kind::Question,
                 title: "Shared source file",
-                buttons: &["Make a copy", "Cancel"],
+                buttons,
                 default: 0,
-                cancel: Some(1),
+                cancel: Some(buttons.len() - 1),
             }
             .show(ctx, |ui| {
                 for (file, owner) in &ask.shared {
-                    dialog::paragraph(
-                        ui,
-                        &format!("“{file}” is already used by {owner}, which is open."),
-                    );
+                    dialog::paragraph(ui, &format!("“{file}” is also used by {owner}."));
                 }
                 ui.add_space(6.0);
                 dialog::paragraph(
                     ui,
                     &format!(
-                        "Circuits cannot share a source file. Open {name} with a copy of its \
-                         own?"
+                        "Circuits should not share a source file. Open {name} with a copy \
+                         of its own?"
                     ),
                 );
             });
             if let Some(choice) = answer
                 && let Some(ask) = self.shared_ask.take()
-                && choice == 0
             {
-                self.open_with_copies(ask);
+                match buttons[choice] {
+                    "Make a copy" => self.open_with_copies(ask),
+                    "Open as it is" => {
+                        let mut doc = Document::new(ask.schematic, None);
+                        doc.mark_saved(ask.path);
+                        self.add_opened(doc, &ask.problems);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        if let Some(edit) = &self.shared_edit {
+            let answer = Dialog {
+                id: "shared_edit",
+                kind: dialog::Kind::Question,
+                title: "Shared source file",
+                buttons: &["Make a copy", "Undo the change"],
+                default: 0,
+                cancel: Some(1),
+            }
+            .show(ctx, |ui| {
+                for (file, owner) in &edit.shared {
+                    dialog::paragraph(ui, &format!("“{file}” is already used by {owner}."));
+                }
+                ui.add_space(6.0);
+                dialog::paragraph(
+                    ui,
+                    "Circuits cannot share a source file. Use a copy of it here instead?",
+                );
+            });
+            if let Some(choice) = answer
+                && let Some(edit) = self.shared_edit.take()
+            {
+                if choice == 0 {
+                    self.copy_for_edit(edit);
+                } else if let Some(index) = self.index_of(edit.circuit) {
+                    self.circuits[index].doc.undo();
+                }
+            }
+        }
+
+        if let Some(ask) = &mut self.assign_ask {
+            let name = ask
+                .file
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let (chips, chosen) = (&ask.chips, &mut ask.chosen);
+            let answer = Dialog {
+                id: "assign_source",
+                kind: dialog::Kind::Question,
+                title: "Use a source file",
+                buttons: &["Use it", "Cancel"],
+                default: 0,
+                cancel: Some(1),
+            }
+            .show(ctx, |ui| {
+                dialog::paragraph(ui, &format!("Which microcontroller should run “{name}”?"));
+                ui.add_space(6.0);
+                egui::ScrollArea::vertical()
+                    .max_height(240.0)
+                    .show(ui, |ui| {
+                        for (i, (_, _, label)) in chips.iter().enumerate() {
+                            ui.radio_value(chosen, i, RichText::new(label).size(14.5));
+                        }
+                    });
+            });
+            if let Some(choice) = answer
+                && let Some(mut ask) = self.assign_ask.take()
+                && choice == 0
+                && ask.chosen < ask.chips.len()
+            {
+                let (circuit, chip, _) = ask.chips.swap_remove(ask.chosen);
+                self.assign(&ask.file, circuit, chip);
             }
         }
 
@@ -3005,6 +3496,12 @@ fn values_ui(
             None => {
                 ui.label(RichText::new("Simulate → Recalculate DC now").weak());
             }
+            // A circuit with nothing in it yet has nothing wrong with it.
+            Some(DcResults {
+                outcome: Err(e), ..
+            }) if netlist.elements.is_empty() => {
+                ui.label(RichText::new(e).weak());
+            }
             Some(DcResults {
                 outcome: Err(e), ..
             }) => {
@@ -3034,8 +3531,10 @@ fn values_ui(
 fn source_problems(problems: &[String]) -> Message {
     let mut message = Message::info(
         "Some source files could not be opened",
-        "The schematic refers to firmware source files that are missing or unreadable. \
-         The rest of it opened normally.",
+        "A chip is set to run a source file that is missing or cannot be read. The rest \
+         of the circuit opened normally. To put it right, right-click the red file in the \
+         Project panel and choose Remove from project, or choose another program in the chip's \
+         properties.",
     )
     .with_detail(problems.join("\n"));
     message.kind = dialog::Kind::Warning;
@@ -3045,6 +3544,11 @@ fn source_problems(problems: &[String]) -> Message {
 /// What the dock needs to draw each panel: the parts of the app they show
 /// or edit, borrowed for one frame.
 struct PaneViewer<'a> {
+    /// What each of the project's circuits runs.
+    project_code: &'a [CircuitCode],
+    open_files: &'a [PathBuf],
+    /// With no circuit open, the panels about one say nothing of it.
+    circuit_open: bool,
     /// Every open circuit's id, name and whether it has unsaved changes.
     circuits: &'a [(u32, String, bool)],
     /// The active circuit, whose parts follow.
@@ -3136,6 +3640,9 @@ impl TabViewer for PaneViewer<'_> {
                     .show_inside(ui, &mut documents);
             }
             Pane::Palette => palette_ui(ui, self.canvas, self.palette_search),
+            Pane::Properties | Pane::Checks | Pane::Values if !self.circuit_open => {
+                ui.label(RichText::new("No circuit open").weak());
+            }
             Pane::Properties => {
                 let selection: Vec<Item> = self.canvas.selection.iter().copied().collect();
                 egui::ScrollArea::vertical().show(ui, |ui| {
@@ -3151,6 +3658,8 @@ impl TabViewer for PaneViewer<'_> {
                     0
                 };
                 let view = project_ui::View {
+                    code: self.project_code,
+                    open: self.open_files,
                     project: self.project,
                     recent: self.recent_projects,
                     current: self.doc.path(),
@@ -3397,6 +3906,10 @@ impl eframe::App for DunbrecApp {
             circuit.code.poll_build(ctx);
         }
         self.shortcuts(ctx);
+        // A chip given a new source file gets its tab, the file is listed in
+        // the project, and one another circuit uses is asked about.
+        self.check_new_code();
+        self.list_used_files();
         let live_dc = self.live_dc;
         self.active_mut().refresh_netlist(live_dc);
         self.continue_run(ctx);
@@ -3666,12 +4179,15 @@ mod tests {
         );
 
         // On "Auto" it runs as a board would: the light changes every half
-        // second of real time.
+        // second of real time (later, on a busy machine).
         rig.click(" Run");
         assert!(rig.app.live.is_some(), "{:?}", rig.app.live_error);
         assert_eq!(rig.app.live_speed, 1.0);
         let mut states = Vec::new();
-        for _ in 0..60 {
+        let started = std::time::Instant::now();
+        // Far sooner than the 12 s a change would take at four scope screens
+        // a second, unless the machine is very busy.
+        while states.len() < 3 && started.elapsed().as_secs() < 60 {
             std::thread::sleep(std::time::Duration::from_millis(30));
             rig.frame(vec![]);
             let lit = rig.app.lit_leds().len();
@@ -4005,7 +4521,12 @@ mod tests {
         // goes to the circuit that has it.
         f.rig.click_circuit("Divider");
         assert!(f.rig.app.file_tab_rects.iter().all(|(t, _)| *t != file));
-        f.rig.app.open_source(&f.root.join("blink.asm"));
+        f.rig
+            .app
+            .run_project_command(project_ui::Command::OpenCircuitSource {
+                circuit: f.blink.clone(),
+                name: "blink.asm".into(),
+            });
         f.rig.settle();
         assert_eq!(f.rig.active_name(), "Blink");
         assert!(f.rig.app.active().is_in_front(&file));
@@ -4131,6 +4652,480 @@ mod tests {
         f.rig.click(" Run");
         wait_for_the_build(&mut f.rig);
         assert!(f.rig.app.live.is_some(), "{:?}", f.rig.app.live_error);
+    }
+
+    /// Whether some label on screen is exactly `label`.
+    fn shows(f: &Fixture, label: &str) -> bool {
+        f.rig.seen.iter().any(|(text, _)| text == label)
+    }
+
+    fn double_click(rig: &mut Rig, label: &str) {
+        let at = rig
+            .seen
+            .iter()
+            .find(|(text, _)| text == label)
+            .unwrap_or_else(|| panic!("nothing labelled {label:?} is shown"))
+            .1
+            .center();
+        let primary = egui::PointerButton::Primary;
+        rig.frame(vec![egui::Event::PointerMoved(at)]);
+        for pressed in [true, false, true, false] {
+            rig.frame(vec![Rig::button(at, primary, pressed)]);
+        }
+        rig.settle();
+    }
+
+    fn firmware_of(f: &Fixture) -> String {
+        let code = f.rig.app.active().code().expect("a circuit file");
+        code.chips[0].firmware.clone()
+    }
+
+    fn set_firmware(f: &mut Fixture, to: &str) {
+        let chip = f.chip();
+        f.rig.app.active_mut().doc.edit(|s| {
+            if let dunbrec_core::ComponentKind::Mcu { firmware, .. } =
+                &mut s.component_mut(chip).unwrap().kind
+            {
+                *firmware = to.into();
+            }
+        });
+        f.rig.settle();
+    }
+
+    #[test]
+    fn the_project_panel_follows_what_the_chips_run() {
+        let mut f = fixture("panel");
+        f.open(&f.blink.clone());
+        f.give_the_chip_a_file();
+        // Under its circuit at once, before anything is saved.
+        assert!(shows(&f, "📝 U1: blink.asm"));
+        assert!(!shows(&f, "Not used"));
+        // Without its chip, the file is no circuit's.
+        let chip = f.chip();
+        f.rig.app.active_mut().canvas.selection = [Item::Component(chip)].into_iter().collect();
+        f.rig.app.active_mut().delete_selection();
+        f.rig.settle();
+        assert!(shows(&f, "Not used") && shows(&f, "📝 blink.asm"));
+        assert!(!shows(&f, "📝 U1: blink.asm"));
+        f.rig.app.active_mut().doc.undo();
+        f.rig.settle();
+        assert!(shows(&f, "📝 U1: blink.asm") && !shows(&f, "Not used"));
+        // A chip pointed at a file nothing lists: listed, and given a tab.
+        std::fs::write(f.root.join("typed.asm"), "nop\n").unwrap();
+        set_firmware(&mut f, "typed.asm");
+        let project = f.rig.app.project.as_ref().unwrap();
+        assert!(project.contains(&f.root.join("typed.asm")));
+        assert!(
+            f.rig
+                .app
+                .active()
+                .doc
+                .schematic()
+                .sources
+                .contains_key("typed.asm")
+        );
+        assert!(shows(&f, "📝 U1: typed.asm"));
+        assert!(shows(&f, "📝 blink.asm"), "now under Not used");
+        assert!(f.rig.app.shared_edit.is_none());
+        // Double-clicking a file shows its tab, from another circuit too.
+        f.open(&f.divider.clone());
+        double_click(&mut f.rig, "📝 U1: typed.asm");
+        assert_eq!(f.rig.active_name(), "Blink");
+        assert!(
+            f.rig
+                .app
+                .active()
+                .is_in_front(&DocTab::Source("typed.asm".into()))
+        );
+        // A file the disk has lost shows as such.
+        std::fs::remove_file(f.root.join("typed.asm")).unwrap();
+        f.rig.settle();
+        assert!(shows(&f, "⚠ U1: typed.asm"));
+    }
+
+    #[test]
+    fn an_unused_file_is_given_to_the_chip_the_user_picks() {
+        let mut f = fixture("assign");
+        std::fs::write(f.root.join("spare.asm"), "nop\n").unwrap();
+        let spare = f.root.join("spare.asm");
+        f.rig
+            .app
+            .project
+            .as_mut()
+            .unwrap()
+            .add_file(&spare)
+            .unwrap();
+        f.rig.settle();
+        // No circuit is open: choosing one opens it.
+        double_click(&mut f.rig, "📝 spare.asm");
+        assert!(f.rig.app.assign_ask.is_some());
+        f.rig.click("Cancel");
+        assert!(f.rig.app.assign_ask.is_none() && !f.rig.app.circuit_open);
+        double_click(&mut f.rig, "📝 spare.asm");
+        f.rig.click("Use it");
+        assert_eq!(f.rig.open_names(), ["Blink"]);
+        assert_eq!(firmware_of(&f), "spare.asm");
+        assert!(f.rig.app.active().doc.is_dirty());
+        assert!(
+            f.rig
+                .app
+                .active()
+                .is_in_front(&DocTab::Source("spare.asm".into()))
+        );
+        assert!(shows(&f, "📝 U1: spare.asm") && !shows(&f, "Not used"));
+        assert!(f.rig.app.shared_edit.is_none());
+    }
+
+    #[test]
+    fn unsaved_text_moves_with_a_file_to_another_circuit() {
+        let mut f = fixture("move");
+        f.open(&f.blink.clone());
+        f.give_the_chip_a_file();
+        assert!(f.rig.app.save(false));
+        // Edit it, then stop using it, without saving.
+        f.rig
+            .app
+            .active_mut()
+            .doc
+            .edit(|s| s.sources.get_mut("blink.asm").unwrap().text = "; edited\nnop\n".into());
+        set_firmware(&mut f, "builtin:blink");
+        let other = f.root.join("Other.dbr");
+        dunbrec_io::dbr::save(&example("Arduino blink"), &other).unwrap();
+        f.rig
+            .app
+            .project
+            .as_mut()
+            .unwrap()
+            .add_file(&other)
+            .unwrap();
+        let chip = f.chip();
+        f.rig.app.assign(&f.root.join("blink.asm"), other, chip);
+        f.rig.settle();
+        assert_eq!(f.rig.active_name(), "Other");
+        assert_eq!(
+            f.rig.app.active().doc.schematic().sources["blink.asm"].text,
+            "; edited\nnop\n"
+        );
+        let first = &f.rig.app.circuits[0];
+        assert!(!first.doc.schematic().sources.contains_key("blink.asm"));
+    }
+
+    #[test]
+    fn a_chip_given_another_circuits_file_is_asked_about() {
+        let mut f = fixture("steal");
+        f.open(&f.blink.clone());
+        f.give_the_chip_a_file();
+        assert!(f.rig.app.save(false));
+        let id = f.rig.app.active().id;
+        f.rig.app.request(Pending::CloseCircuit(id));
+        // The owner is closed: its file says it uses blink.asm.
+        let other = f.root.join("Other.dbr");
+        dunbrec_io::dbr::save(&example("Arduino blink"), &other).unwrap();
+        f.rig
+            .app
+            .project
+            .as_mut()
+            .unwrap()
+            .add_file(&other)
+            .unwrap();
+        f.open(&other);
+        set_firmware(&mut f, "blink.asm");
+        assert!(f.rig.app.shared_edit.is_some());
+        f.rig.click("Undo the change");
+        assert_eq!(firmware_of(&f), "builtin:blink");
+        assert!(f.rig.app.shared_edit.is_none());
+        set_firmware(&mut f, "blink.asm");
+        f.rig.click("Make a copy");
+        assert_eq!(firmware_of(&f), "blink2.asm");
+        assert!(f.root.join("blink2.asm").is_file());
+        assert!(f.rig.app.shared_edit.is_none());
+        assert!(shows(&f, "📝 U1: blink2.asm") && shows(&f, "📝 U1: blink.asm"));
+    }
+
+    #[test]
+    fn circuits_that_already_share_a_file_can_still_open() {
+        let mut f = fixture("old-share");
+        std::fs::write(f.root.join("both.asm"), "nop\n").unwrap();
+        let mut s = example("Arduino blink");
+        for c in &mut s.components {
+            if let dunbrec_core::ComponentKind::Mcu { firmware, .. } = &mut c.kind {
+                *firmware = "both.asm".into();
+            }
+        }
+        let other = f.root.join("Other.dbr");
+        dunbrec_io::dbr::save(&s, &f.blink).unwrap();
+        dunbrec_io::dbr::save(&s, &other).unwrap();
+        let project = f.rig.app.project.as_mut().unwrap();
+        project.add_file(&other).unwrap();
+        f.rig.app.refresh_project();
+        f.rig.settle();
+        assert!(shows(&f, "📝 U1: both.asm") && !shows(&f, "⚠ U1: both.asm"));
+        f.open(&f.blink.clone());
+        assert!(f.rig.app.shared_ask.is_some());
+        f.rig.click("Open as it is");
+        assert_eq!(f.rig.open_names(), ["Blink"]);
+        assert!(!f.rig.app.active().doc.is_dirty());
+        assert!(shows(&f, "⚠ U1: both.asm"), "marked once open");
+        // The other cannot also be open without its own copy.
+        f.open(&other);
+        assert!(!shows(&f, "Open as it is"));
+        f.rig.click("Make a copy");
+        assert_eq!(f.rig.open_names(), ["Blink", "Other"]);
+        assert_eq!(firmware_of(&f), "both2.asm");
+        assert!(f.rig.app.shared_edit.is_none());
+    }
+
+    #[test]
+    fn deleting_a_used_file_names_the_chips_that_use_it() {
+        let mut f = fixture("warn");
+        f.open(&f.blink.clone());
+        f.give_the_chip_a_file();
+        f.rig
+            .app
+            .run_project_command(project_ui::Command::AskDelete(f.root.join("blink.asm")));
+        f.rig.settle();
+        assert!(shows(&f, "U1 in Blink uses blink.asm."), "{:?}", f.rig.seen);
+        f.rig.click("Cancel");
+        assert!(f.root.join("blink.asm").is_file());
+    }
+
+    #[test]
+    fn nothing_is_reported_about_circuits_that_are_not_open() {
+        let mut f = fixture("quiet");
+        // A circuit whose chip names a file that is not there.
+        let mut s = example("Arduino blink");
+        for c in &mut s.components {
+            if let dunbrec_core::ComponentKind::Mcu { firmware, .. } = &mut c.kind {
+                *firmware = "lost.asm".into();
+            }
+        }
+        dunbrec_io::dbr::save(&s, &f.blink).unwrap();
+        f.rig.app.refresh_project();
+        f.rig.settle();
+        assert!(shows(&f, "📝 U1: lost.asm") && !shows(&f, "⚠ U1: lost.asm"));
+        // The default layout shows Checks and Values: they have no circuit.
+        assert!(shows(&f, "No circuit open"));
+        let complains = |f: &Fixture| {
+            f.rig.seen.iter().any(|(text, _)| {
+                text.contains("Place some parts") || text.contains("wiring problems")
+            })
+        };
+        assert!(!complains(&f), "{:?}", f.rig.seen);
+        // Opening it says what is wrong.
+        f.open(&f.blink.clone());
+        assert!(f.rig.app.message.is_some());
+        f.rig.click("OK");
+        assert!(shows(&f, "⚠ U1: lost.asm"));
+        assert!(!shows(&f, "No circuit open"));
+    }
+
+    #[test]
+    fn a_missing_file_can_be_removed_from_the_panel() {
+        let mut f = fixture("lost");
+        f.open(&f.blink.clone());
+        f.give_the_chip_a_file();
+        assert!(f.rig.app.save(false));
+        let id = f.rig.app.active().id;
+        f.rig.app.request(Pending::CloseCircuit(id));
+        std::fs::remove_file(f.root.join("blink.asm")).unwrap();
+        f.open(&f.blink.clone());
+        f.rig.click("OK");
+        let secondary = egui::PointerButton::Secondary;
+        let row = |f: &Fixture| {
+            f.rig
+                .seen
+                .iter()
+                .find(|(text, _)| text == "⚠ U1: blink.asm")
+                .expect("the missing file is shown")
+                .1
+                .center()
+        };
+        f.rig.click_at(row(&f), secondary);
+        f.rig.click("Remove from project");
+        assert!(shows(&f, "U1 in Blink uses blink.asm."), "{:?}", f.rig.seen);
+        assert!(shows(&f, "Nothing is deleted from the disk."));
+        f.rig.click("Remove");
+        assert!(f.rig.app.message.is_none(), "{:?}", f.rig.app.message);
+        assert_eq!(firmware_of(&f), "");
+        assert!(!shows(&f, "⚠ U1: blink.asm") && !shows(&f, "Not used"));
+        assert!(
+            !f.rig
+                .app
+                .project
+                .as_ref()
+                .unwrap()
+                .contains(&f.root.join("blink.asm"))
+        );
+        assert!(f.rig.app.active().doc.is_dirty());
+        f.rig.app.active_mut().doc.undo();
+        f.rig.settle();
+        assert_eq!(firmware_of(&f), "blink.asm");
+    }
+
+    #[test]
+    fn deleting_a_file_leaves_no_closed_circuit_asking_for_it() {
+        let mut f = fixture("forget");
+        f.open(&f.blink.clone());
+        f.give_the_chip_a_file();
+        assert!(f.rig.app.save(false));
+        let id = f.rig.app.active().id;
+        f.rig.app.request(Pending::CloseCircuit(id));
+        f.rig.app.delete_in_project(&f.root.join("blink.asm"));
+        f.rig.settle();
+        assert!(!f.root.join("blink.asm").exists());
+        let saved = dunbrec_io::dbr::load(&f.blink).unwrap();
+        let code = project::code_of(&saved, &f.blink);
+        assert_eq!(code.chips[0].firmware, "");
+        f.open(&f.blink.clone());
+        assert!(f.rig.app.message.is_none());
+    }
+
+    /// Right-click the row labelled `label`.
+    fn menu_of(f: &mut Fixture, label: &str) {
+        let at = f
+            .rig
+            .seen
+            .iter()
+            .find(|(text, _)| text == label)
+            .unwrap_or_else(|| panic!("no row {label:?}: {:?}", f.rig.seen))
+            .1
+            .center();
+        f.rig.click_at(at, egui::PointerButton::Secondary);
+    }
+
+    /// "Blink" with its own assembly file, saved and closed.
+    fn blink_with_a_file(tag: &str) -> Fixture {
+        let mut f = fixture(tag);
+        f.open(&f.blink.clone());
+        f.give_the_chip_a_file();
+        assert!(f.rig.app.save(false));
+        let id = f.rig.app.active().id;
+        f.rig.app.request(Pending::CloseCircuit(id));
+        f.rig.settle();
+        f
+    }
+
+    #[test]
+    fn circuits_and_source_files_have_the_same_menu() {
+        let mut f = blink_with_a_file("menus");
+        for row in ["⚡ Blink", "📝 U1: blink.asm"] {
+            menu_of(&mut f, row);
+            for item in [
+                "Open",
+                "Rename…",
+                "Remove from project",
+                "Delete from disk…",
+            ] {
+                assert!(shows(&f, item), "{row}: {item}");
+            }
+            for gone in ["New", "Delete", "Folder…", "Add existing file…"] {
+                assert!(!shows(&f, gone), "{row}: {gone}");
+            }
+            f.rig
+                .click_at(egui::pos2(900.0, 500.0), egui::PointerButton::Primary);
+        }
+    }
+
+    #[test]
+    fn deleting_a_circuit_deletes_its_source_files() {
+        let mut f = blink_with_a_file("delete-all");
+        // One file another circuit also uses, and one no circuit uses.
+        std::fs::write(f.root.join("spare.asm"), "nop\n").unwrap();
+        let spare = f.root.join("spare.asm");
+        f.rig
+            .app
+            .project
+            .as_mut()
+            .unwrap()
+            .add_file(&spare)
+            .unwrap();
+        f.rig.settle();
+        menu_of(&mut f, "⚡ Blink");
+        f.rig.click("Delete from disk…");
+        assert!(shows(
+            &f,
+            "Delete the circuit “Blink” and its source files?"
+        ));
+        assert!(shows(&f, "•  blink.asm"), "{:?}", f.rig.seen);
+        assert!(shows(
+            &f,
+            "They go to the Recycle Bin, so you can get them back."
+        ));
+        f.rig.click("Cancel");
+        assert!(f.blink.is_file() && f.root.join("blink.asm").is_file());
+        menu_of(&mut f, "⚡ Blink");
+        f.rig.click("Delete from disk…");
+        f.rig.click("Delete");
+        assert!(!f.blink.exists() && !f.root.join("blink.asm").exists());
+        assert!(spare.is_file(), "not the circuit's");
+        let project = f.rig.app.project.as_ref().unwrap();
+        assert!(!project.contains(&f.root.join("blink.asm")) && project.contains(&spare));
+        assert!(f.rig.app.message.is_none(), "{:?}", f.rig.app.message);
+    }
+
+    #[test]
+    fn a_shared_file_outlives_one_of_its_circuits() {
+        let mut f = blink_with_a_file("delete-shared");
+        let twin = f.root.join("Twin.dbr");
+        std::fs::copy(&f.blink, &twin).unwrap();
+        f.rig.app.project.as_mut().unwrap().add_file(&twin).unwrap();
+        f.rig.settle();
+        f.rig
+            .app
+            .run_project_command(project_ui::Command::AskDelete(f.blink.clone()));
+        f.rig.settle();
+        assert!(shows(&f, "Delete the circuit “Blink”?"), "{:?}", f.rig.seen);
+        assert!(shows(&f, "•  blink.asm  (Twin)"));
+        f.rig.click("Delete");
+        assert!(!f.blink.exists() && f.root.join("blink.asm").is_file());
+    }
+
+    #[test]
+    fn removing_a_circuit_takes_its_files_out_and_leaves_the_disk_alone() {
+        let mut f = blink_with_a_file("remove-circuit");
+        menu_of(&mut f, "⚡ Blink");
+        f.rig.click("Remove from project");
+        assert!(f.rig.app.confirm_delete.is_none(), "nothing to ask");
+        let source = f.root.join("blink.asm");
+        assert!(f.blink.is_file() && source.is_file());
+        let project = f.rig.app.project.as_ref().unwrap();
+        assert!(!project.contains(&f.blink) && !project.contains(&source));
+        assert!(!shows(&f, "Not used"));
+    }
+
+    #[test]
+    fn a_chip_without_a_file_is_given_a_new_one() {
+        let mut f = fixture("new-for-chip");
+        assert!(shows(&f, "· U1: built-in blink"));
+        menu_of(&mut f, "· U1: built-in blink");
+        f.rig.click("New assembly file…");
+        assert!(f.rig.app.name_prompt.is_some());
+        f.rig.click("Create");
+        assert_eq!(f.rig.open_names(), ["Blink"]);
+        assert_eq!(firmware_of(&f), "main.asm");
+        assert!(f.root.join("main.asm").is_file());
+        assert!(
+            f.rig
+                .app
+                .project
+                .as_ref()
+                .unwrap()
+                .contains(&f.root.join("main.asm"))
+        );
+        assert!(
+            f.rig
+                .app
+                .active()
+                .is_in_front(&DocTab::Source("main.asm".into()))
+        );
+        assert!(shows(&f, "📝 U1: main.asm"));
+        assert!(f.rig.app.shared_edit.is_none() && f.rig.app.message.is_none());
+        // Removing the file leaves the chip's row, with no program.
+        menu_of(&mut f, "📝 U1: main.asm");
+        f.rig.click("Remove from project");
+        f.rig.click("Remove");
+        assert!(shows(&f, "· U1: no program"));
+        assert!(f.root.join("main.asm").is_file());
     }
 
     #[test]

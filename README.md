@@ -148,8 +148,9 @@ circuit can be pasted into another. The side panels, instruments and assistant b
 circuit: probes, plots and the conversation stay with the circuit they are about. Only the active
 circuit simulates, so going to another stops the run. Closing a tab (✕, a middle click or Ctrl+W)
 asks about that circuit's unsaved changes; closing the project or quitting asks once about all of
-them. Two circuits cannot use the same source file: opening one that does offers to open it with
-its own copy.
+them. Two circuits cannot use the same source file: giving a chip a file another circuit uses
+offers a copy (or undoes the change), and so does opening a circuit that shares one (if the other
+circuit is closed it can also be opened as it is).
 
 **Demo programs.** `blink`, `fade` and `pot-pwm-serial` come in AVR assembly and as Arduino
 sketches. Pick one under *Demo* in a microcontroller's properties and Dunbrec makes your own copy,
@@ -185,27 +186,40 @@ Every change to a project is saved to its file at once, so there is no project S
 project*, and opening a different project, close every open circuit, asking about unsaved changes
 first.
 
-The **Project** panel (View → Panels; it opens beside the palette) shows the project's name and
-the files it lists, in folders as they are on disk. Circuits are listed by name, sources with
-their extension. Double-click a circuit to open it in a tab, or a source file to show its tab
-under the circuit that uses it (or else the active circuit). Right-click the project's name, a folder or empty space to add: a new circuit, assembly
-file, Arduino sketch or folder (made on disk and listed), or *Add existing file…* for files that
-are already there (the ＋ Add button does the same). Right-click a file or folder to rename it
-(circuits that use a renamed source are updated, a folder rename included), to **Remove from
-project** (the file stays on disk), or to **Delete from disk**, which asks first and, if open
-circuits are in it, asks about their unsaved changes and then closes them. Names for
-new files and renames are asked for in a message box. A listed file that has gone from the disk
-shows in red with a ⚠. Source files made from a chip's properties are listed in the project
-too. Coming back to the window re-reads the project file and takes up
-edits made to the sources in other programs, except in a circuit with unsaved changes.
-Schematics saved by older versions keep their sources inside the `.dbr`; the panel offers *Move
-to files in this folder* for those.
+The **Project** panel (View → Panels; it opens beside the palette) shows the project's name, its
+circuits and any other files it lists. **Under each circuit is every microcontroller**: the source
+file it runs, named after the chip (`U1: blink.ino`, or `U1, U2: fade.asm` for a shared one),
+wherever the file is kept, or what it runs instead (`U1: no program`, `U1: built-in blink`). Source
+files that no chip runs are under **Not used**. The grouping follows each chip's firmware setting,
+at once for open circuits, saved or not, and a file a circuit comes to use is added to the
+project's list. Once a circuit is open, a file of its that the disk has lost shows in red with a ⚠,
+and one that another circuit also uses (from older projects) in amber; nothing is reported about
+circuits you have not opened.
+
+Double-click a circuit to open it in a tab, a file under a circuit to open that circuit at the
+file's tab, a chip without a file to open the circuit with the chip selected, or a **Not used**
+file to choose which microcontroller should run it. Right-click a chip without a file for *New
+sketch…* or *New assembly file…*. Right-click the project's name or empty space (or use ＋ Add)
+for *New circuit…* and *Add existing file…*.
+
+Circuits and files have the same menu: **Open**, **Rename…** (circuits that use a renamed source
+are updated), **Remove from project** (nothing is deleted from the disk) and **Delete from disk…**.
+What a missing file cannot do is greyed. Deleting sends files to the **Recycle Bin**, after asking;
+one that cannot go there is not deleted. **Deleting a circuit deletes the source files only it
+uses** too, listing them first (files another circuit uses are kept), and removing a circuit from
+the project takes those files out of the list with it. Removing or deleting a file that a chip runs
+asks first and leaves the chip with no program (in an open circuit as an unsaved change, in a
+closed one in its file). Unsaved changes in a circuit that is to be deleted are asked about first.
+Names for new files and renames are asked for in a message box. Folders in older projects are still
+shown. Coming back to the window re-reads the project file and takes up edits made to the sources
+in other programs, except in a circuit with unsaved changes. Schematics saved by older versions
+keep their sources inside the `.dbr`; the panel offers *Move to files in this folder* for those.
 
 **Writing firmware in assembly.** Each source file of a circuit has a tab beside its schematic,
 and keeps its own cursor and scroll position. A source is a file beside the circuit (`main.asm`, or
-in a subfolder `fw/main.asm`); the circuit file stores only the name. Make one with *Source file →
-New assembly file…* in a microcontroller's properties (which also points the chip at it), from a
-demo program, or with File → *New* or the Project panel. For a saved circuit the file is made on
+in a subfolder `fw/main.asm`); the circuit file stores only the name. A source file is always
+made for a microcontroller: *Source file → New assembly file…* in its properties, a demo program,
+or *New sketch…* / *New assembly file…* on the chip's row in the Project panel. For a saved circuit the file is made on
 disk at once and listed in the project if the circuit is; for an unsaved one it is written beside
 the circuit when you first save it, and a line above the text says so. The first one starts as a
 blink program for D13. The dialect is Atmel's: `ldi r16, 0xFF`, `sbi PORTB, PB5`, labels, `.equ`,
@@ -216,8 +230,8 @@ jump to it), and reported by line when the circuit runs. The part's firmware rea
 file's path, relative to the schematic (`main.asm`; older files say `source:<name>`). Click a line number to set or clear a breakpoint on it (red dot; an arrow marks the current instruction while the circuit is paused), and the debugger listing shows the source line beside each instruction.
 Macros, `.include` and data or EEPROM segments are not supported yet.
 
-**Writing Arduino C++.** File → *New* (or the Project panel's *New*) can also create an Arduino
-C++ sketch, and the demo programs include sketches. Sketches
+**Writing Arduino C++.** A chip's row in the Project panel can also create an Arduino C++ sketch
+(*New sketch…*), and the demo programs include sketches. Sketches
 are built by the Arduino command-line tool, which Dunbrec finds but does not include: install it
 (`winget install ArduinoSA.CLI` on Windows), then run `arduino-cli core install arduino:avr`.
 **Run** builds a sketch that has changed since it was last built and starts the simulation only if

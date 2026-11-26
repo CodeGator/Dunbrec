@@ -31,7 +31,8 @@ drafts the GitHub release (see `.github/workflows/release.yml`).
 | 0.5.0 (in progress) | Projects screen (nothing else shown without a project); assistant draws new circuits with real wires and can add sine sources; no circuit open until one is opened; a central area that never collapses; closable schematic tab. See "0.5.0" below |
 | 0.4.0 | Settings dialog; Assistant (Ollama or Claude); pop-out instruments; text size; every confirmation a message box; Code panel tabs; project behaviour changes. See "0.4.0" below |
 
-Health at handoff: `cargo test --workspace` 455 passed, 0 failed (1 ignored: an emulator speed
+Health at handoff: `cargo test --workspace` 474 passed, 0 failed (2 ignored: a real Recycle Bin check and an
+emulator speed
 benchmark); `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --check`
 clean. Toolchain: Rust 1.99 (edition 2024, MSRV 1.90), Windows 11.
 
@@ -302,7 +303,7 @@ toolbar, panels or instrument windows): New project, Open project, Recent projec
 Show folder, remove, Clear list) with search, sort (recent, name, folder), a filter (all /
 available / file missing) and paging (10 per page; `RECENT_PROJECT_LIMIT` is 50), Settings, Quit.
 A circuit file given on the command line waits there with an offer to make a project for it
-(`waiting_circuit`; `Project::create_for` lists it where it is, nothing is copied). Renaming
+(`waiting_circuit`; `Project::create_for` lists it where it is, nothing is copied). A project's whole box opens it (`recent_row` senses the box before its buttons). Renaming
 changes only the project file (`project::rename_file`); `Settings::rename_project` keeps the list.
 Closing a project closes its circuit (`close_circuit`). File > New is a submenu (circuit, assembly
 file, sketch, folder) that creates in the project, and the Project panel's right-click menus have
@@ -364,8 +365,26 @@ the demos look dead: blink changed every 12 s). `sync_speed` tells a running sim
 - *No shared source files:* `shared_sources` is checked when a circuit is opened (offering copies,
   `open_with_copies`) and when it is saved elsewhere. It only knows about *open* circuits. The
   assistant's new-file suggestions are not checked.
-- *Not done:* the Project panel's circuit / chip / file tree and "Not used" list, refusing a file
-  that a closed circuit uses, Ctrl+Tab and a window list.
+- *Project panel (stage 3):* `project::code_of` says what a circuit's chips run (`CircuitCode`);
+  `Project::refresh` reads it from every listed circuit file, and `DunbrecApp::project_code`
+  overrides the open ones with their live state. The panel shows each circuit's files under it and
+  unused ones under "Not used". Each frame `check_new_code` notices files a chip has come to use
+  (opens them; asks if another circuit uses them) and `list_used_files` adds them to the project.
+  `ask_assign` / `assign` give an unused file to a chip, moving any unsaved text with it.
+- *Menus:* circuits, files and folders share `project_ui::item_menu` (Open, Rename, Remove from
+  project, Delete from disk). Under a circuit every chip has a row (`code_rows`); one without a
+  source file offers a new one. Source files are only made for a chip; there is no "New folder"
+  or File > New submenu.
+- *Removing and deleting:* `project::removal` says which source files go with a circuit (those no
+  other circuit uses). Deleting uses the `trash` crate (Recycle Bin; tests remove for real instead,
+  see `discard`). Either way the chips that ran a file that goes are cleared
+  (`project::forget_sources`, `forget_in_circuits`): an undoable edit in an open circuit, written
+  straight to a closed circuit's file, as renaming does. `DeleteAsk` is the question for both.
+- *Nothing is reported about unopened circuits* (the user's decision): the red "lost file" and
+  amber "shared" marks show only for open circuits (`project_ui::View::open`), and with none open
+  Properties, Checks and Values say "No circuit open" instead of describing the blank placeholder.
+- *Not done:* Ctrl+Tab and a list of open circuits, "Close all". The assistant's new-file
+  suggestions can still write over a file of the same name.
 
 ## Gotchas
 

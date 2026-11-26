@@ -1,6 +1,6 @@
 # Multi-document editor (design)
 
-Status: **stages 1, 2 and 4 done** (2026-11-26, both rows of tabs); 3 and 5 to do. Written 2026-11-24;
+Status: **stages 1 to 4 done** (2026-11-26); 5 (polish) to do. Written 2026-11-24;
 decisions settled with the user 2026-11-26.
 
 ## Goal
@@ -41,18 +41,35 @@ Agreed with the user:
    "Blinker › blink.ino".
 5. **Closing** the project or app with several unsaved circuits asks once for all
    of them.
-6. The **Project panel** shows circuit, then chip, then the chip's file.
+6. The **Project panel** shows each circuit with its source files indented under
+   it, named after the chips that run them ("U1: blink.ino"), the same as the
+   file tabs. (Changed from circuit, chip, file when it was built.) The grouping
+   is worked out from the chips, with no second record in the project file.
 7. **"Edit code"** on a chip opens its file, and new source files are created from
    a chip.
 8. **Files no chip uses** are listed under "Not used". Deleting a chip leaves its
    file on disk (it becomes unused); undo restores the link.
 9. **Existing circuits that already use the same file** both still open, and a
    message box offers to make a copy.
+10. **Nothing is reported about a circuit that has not been opened:** its missing
+    or shared files are marked only once it is, and with none open the panels
+    about a circuit say so.
+11. **Deleting a source file**, present or missing, takes it away from the chips
+    that ran it, so that no circuit is left asking for it.
+12. **Circuits and source files have the same menu** (Open, Rename, Remove from
+    project, Delete from disk), and "Remove" is offered for a file in use (it
+    asks first; this replaces "not offered").
+13. **Deleting a circuit deletes the source files only it uses**, after listing
+    them; removing it takes them out of the project. Deletions go to the Recycle
+    Bin.
+14. **Every chip is listed** under its circuit, and that is where new source files
+    are made. No "New" menu on circuits, and no "New folder".
+
+Also agreed when stage 3 was built: double-clicking a "Not used" file asks which
+chip should use it; and a file another circuit uses brings an offer of a copy.
 
 Proposed, not yet confirmed:
 
-- Clicking a "Not used" file asks which chip should use it (a tab needs a circuit
-  to live in).
 - If programs later span several files, each chip gets its own folder.
 
 Dragging a source tab beside its circuit's schematic should work (shown possible
@@ -245,7 +262,7 @@ another circuit stops a running simulation like a click does.
 2. *Done.* **Several circuit tabs**: open adds a tab, tabs switch `active`, per-tab close
    and unsaved prompt, dirty dot, project close with a list, stop the simulation
    on switching. Replace `Pane::Schematic`.
-3. **Code and chips**: "Edit code" and new files on the chip, the no-sharing
+3. *Done.* **Code and chips**: "Edit code" and new files on the chip, the no-sharing
    rule, the circuit/chip/file tree and "Not used" in the Project panel.
 4. *Done, before stage 3 (agreed: names for circuits without names for files
    would only half answer the confusion).* **Second row**: source files as tabs, retire the single Code panel and its
@@ -257,7 +274,8 @@ Built differently from section 1: rather than `active: Option<usize>`, the app
 keeps a blank, unshown circuit when none is open. The clipboard is carried over on
 switching, and instruments, debugger, serial monitor and assistant are kept per
 circuit. The no-sharing rule is enforced between *open* circuits (on opening and
-on saving elsewhere); the rest of section 3 is still to do.
+on saving elsewhere). Stage 3 then added the project tree and extended the rule to
+closed circuits.
 
 ## Risks and notes
 

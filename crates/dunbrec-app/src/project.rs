@@ -23,7 +23,8 @@ use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 
 use dunbrec_core::{
-    ComponentKind, SOURCE_PREFIX, Schematic, SourceFile, SourceLanguage, source_language_of,
+    ComponentId, ComponentKind, SOURCE_PREFIX, Schematic, SourceFile, SourceLanguage,
+    source_language_of,
 };
 use serde::{Deserialize, Serialize};
 
@@ -109,6 +110,9 @@ pub struct Project {
     pub root: PathBuf,
     data: ProjectData,
     pub entries: Vec<Entry>,
+    /// What each listed circuit's microcontrollers run, as its file on the
+    /// disk says (read again by [`refresh`](Self::refresh)).
+    pub code: Vec<CircuitCode>,
 }
 
 /// True if `path` is `base` or inside it, by reading the paths.
@@ -123,6 +127,7 @@ impl Project {
             root: file.parent().unwrap_or(Path::new("")).to_path_buf(),
             data,
             entries: Vec::new(),
+            code: Vec::new(),
         };
         p.tidy();
         p.refresh();
@@ -306,7 +311,9 @@ impl Project {
         Ok(self.add_files(&[path.to_path_buf()])? > 0)
     }
 
-    /// Show a folder, even while nothing in it is listed.
+    /// Show a folder, even while nothing in it is listed. Nothing makes such
+    /// folders any more, but older projects have them.
+    #[cfg(test)]
     pub fn add_folder(&mut self, path: &Path) -> Result<(), String> {
         let listed = self.listed(path);
         if !self.data.folders.contains(&listed) {
@@ -389,6 +396,22 @@ impl Project {
         }
         sort_entries(&mut entries);
         self.entries = entries;
+        self.code = self
+            .schematics()
+            .into_iter()
+            .filter_map(|path| {
+                let s = dunbrec_io::dbr::load(&path).ok()?;
+                Some(code_of(&s, &path))
+            })
+            .collect();
+    }
+
+    /// True if the project was given `path` as a folder to show, even empty.
+    pub fn lists_folder(&self, path: &Path) -> bool {
+        self.data
+            .folders
+            .iter()
+            .any(|f| path_eq(&self.absolute(f), path))
     }
 
     /// Read the project file again (it was edited by hand or by another
@@ -572,6 +595,177 @@ pub fn valid_name(name: &str) -> bool {
     )
 }
 
+// ------------------------------------------- circuits and their code ---
+
+/// A source file a circuit's microcontrollers run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Use {
+    /// The name the circuit knows it by: its path from the circuit's folder.
+    pub name: String,
+    /// Where it is.
+    pub path: PathBuf,
+    /// The designators of the chips that run it.
+    pub chips: Vec<String>,
+}
+
+/// A microcontroller and what it is set to run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Chip {
+    pub id: ComponentId,
+    pub designator: String,
+    pub firmware: String,
+}
+
+/// The microcontrollers of a circuit file and the source files they run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CircuitCode {
+    /// The circuit file.
+    pub circuit: PathBuf,
+    /// In the order of their names.
+    pub uses: Vec<Use>,
+    pub chips: Vec<Chip>,
+}
+
+impl CircuitCode {
+    /// The circuit's name, as the Project panel and its tab show it.
+    pub fn name(&self) -> String {
+        self.circuit.file_stem().map_or_else(
+            || self.circuit.display().to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        )
+    }
+
+    /// How the circuit uses the file at `path`, if it does.
+    pub fn use_of(&self, path: &Path) -> Option<&Use> {
+        self.uses.iter().find(|u| path_eq(&u.path, path))
+    }
+}
+
+/// What the circuit `s`, whose file is `circuit`, runs. The chips' firmware
+/// settings are the one link between a circuit and a source file.
+pub fn code_of(s: &Schematic, circuit: &Path) -> CircuitCode {
+    let dir = circuit.parent().unwrap_or(Path::new(""));
+    let chips: Vec<Chip> = s
+        .components
+        .iter()
+        .filter_map(|c| match &c.kind {
+            ComponentKind::Mcu { firmware, .. } => Some(Chip {
+                id: c.id,
+                designator: c.designator.clone(),
+                firmware: firmware.trim().to_string(),
+            }),
+            _ => None,
+        })
+        .collect();
+    let uses = referenced_files(s)
+        .into_iter()
+        .map(|name| Use {
+            path: normalize(&dir.join(&name)),
+            chips: chips
+                .iter()
+                .filter(|c| c.firmware == name)
+                .map(|c| c.designator.clone())
+                .collect(),
+            name,
+        })
+        .collect();
+    CircuitCode {
+        circuit: circuit.to_path_buf(),
+        uses,
+        chips,
+    }
+}
+
+/// Give `s`, a circuit in the folder `dir`, a copy of its own of each source
+/// file in `names`: the file is copied beside it under a free name, and the
+/// chips that ran the old one run the copy. Returns the new files.
+pub fn copy_sources(
+    s: &mut Schematic,
+    dir: &Path,
+    names: &[String],
+) -> Result<Vec<PathBuf>, String> {
+    let mut made = Vec::new();
+    for name in names {
+        attach(s, dir, name)?;
+        let (Some(file), Some((base, extension))) =
+            (s.sources.get(name).cloned(), name.rsplit_once('.'))
+        else {
+            continue;
+        };
+        let taken = |n: &str| s.sources.keys().any(|k| k.eq_ignore_ascii_case(n));
+        let copy = new_source_copy(dir, base, extension, &file.text, taken)?;
+        for firmware in firmware_refs(s) {
+            if firmware.trim() == name {
+                firmware.clone_from(&copy);
+            }
+        }
+        s.sources.remove(name);
+        s.sources.insert(copy.clone(), file);
+        made.push(dir.join(copy));
+    }
+    Ok(made)
+}
+
+/// Take the source file `gone`, or every one in the folder `gone`, away from
+/// `s`, a circuit in the folder `dir`: the chips that ran one are left with no
+/// program. Returns how many chips that was.
+pub fn forget_sources(s: &mut Schematic, dir: &Path, gone: &Path) -> usize {
+    let gone = normalize(gone);
+    let lost =
+        |name: &str| is_file_source(name) && starts_with_ci(&normalize(&dir.join(name)), &gone);
+    let mut chips = 0;
+    for firmware in firmware_refs(s) {
+        if lost(firmware.trim()) {
+            firmware.clear();
+            chips += 1;
+        }
+    }
+    s.sources.retain(|name, _| !lost(name));
+    chips
+}
+
+/// What goes along when circuits leave the project or the disk.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Removal {
+    /// Source files that only those circuits use, which go with them.
+    pub extra: Vec<PathBuf>,
+    /// Source files of theirs that stay, each with the names of the other
+    /// circuits that use it.
+    pub kept: Vec<(PathBuf, Vec<String>)>,
+}
+
+/// What goes with the circuits in `going` (a circuit file, or a folder holding
+/// some), given what every circuit runs. Files inside `going` go anyway, and
+/// are in neither list.
+pub fn removal(code: &[CircuitCode], going: &Path) -> Removal {
+    let going = normalize(going);
+    let leaves = |path: &Path| starts_with_ci(path, &going);
+    let mut out = Removal::default();
+    for u in code
+        .iter()
+        .filter(|c| leaves(&c.circuit))
+        .flat_map(|c| &c.uses)
+        .filter(|u| !leaves(&u.path))
+    {
+        let known = out.extra.iter().any(|p| path_eq(p, &u.path))
+            || out.kept.iter().any(|(p, _)| path_eq(p, &u.path));
+        if known {
+            continue;
+        }
+        let others: Vec<String> = code
+            .iter()
+            .filter(|c| !leaves(&c.circuit) && c.use_of(&u.path).is_some())
+            .map(CircuitCode::name)
+            .collect();
+        if others.is_empty() {
+            out.extra.push(u.path.clone());
+        } else {
+            out.kept.push((u.path.clone(), others));
+        }
+    }
+    out
+}
+
 // -------------------------------------------------------- creating ---
 
 /// What a new source file starts as.
@@ -718,17 +912,6 @@ fn has_source(dir: &Path) -> bool {
         r.flatten()
             .any(|e| source_language_of(&e.file_name().to_string_lossy()).is_some())
     })
-}
-
-/// Create the folder `name` in `dir`.
-pub fn new_folder(dir: &Path, name: &str) -> Result<PathBuf, String> {
-    if !valid_name(name) {
-        return Err(format!("“{}” cannot be used as a folder name", name.trim()));
-    }
-    let path = dir.join(name.trim());
-    ensure_free(&path)?;
-    std::fs::create_dir(&path).map_err(|e| format!("cannot create {}: {e}", path.display()))?;
-    Ok(path)
 }
 
 // ---------------------------------------------- sources and schematics ---
@@ -948,20 +1131,39 @@ pub fn rename(
             out.rewritten.push(dbr_new);
         }
     }
+    // Those circuits now name the file differently.
+    project.refresh();
     Ok(out)
 }
 
-/// Delete a file, or a folder with everything in it, from the disk, and take
-/// it out of the project.
+/// Delete a file, or a folder with everything in it (if it is still there),
+/// by moving it to the Recycle Bin, and take it out of the project. The
+/// circuits that used it are the caller's to change (see [`forget_sources`]).
 pub fn delete(project: &mut Project, path: &Path) -> Result<(), String> {
+    if path.exists() {
+        discard(path)?;
+    }
+    project.remove(path)?;
+    Ok(())
+}
+
+/// Move a file or folder to the system's Recycle Bin, from which it can be got
+/// back. One that cannot go there is not deleted.
+#[cfg(not(test))]
+fn discard(path: &Path) -> Result<(), String> {
+    trash::delete(path)
+        .map_err(|e| format!("cannot move {} to the Recycle Bin: {e}", path.display()))
+}
+
+/// Tests must not fill the Recycle Bin of whoever runs them.
+#[cfg(test)]
+fn discard(path: &Path) -> Result<(), String> {
     let result = if path.is_dir() {
         std::fs::remove_dir_all(path)
     } else {
         std::fs::remove_file(path)
     };
-    result.map_err(|e| format!("cannot delete {}: {e}", path.display()))?;
-    project.remove(path)?;
-    Ok(())
+    result.map_err(|e| format!("cannot delete {}: {e}", path.display()))
 }
 
 /// Move the sources kept inside `s` by older versions into files in `dir`:
@@ -1153,8 +1355,6 @@ mod tests {
         let d = new_schematic(&root, "amp").unwrap();
         assert_eq!(d, root.join("amp.dbr"));
         assert!(new_schematic(&root, "amp.dbr").is_err());
-        assert!(new_folder(&root, "fw").unwrap().is_dir());
-        assert!(new_folder(&root, "fw").is_err());
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -1654,6 +1854,158 @@ loop: rjmp loop
                 &[]
             )
             .is_err()
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_circuit_takes_the_files_only_it_uses() {
+        let circuit = |name: &str, files: &[&str]| CircuitCode {
+            circuit: PathBuf::from("p").join(name),
+            uses: files
+                .iter()
+                .map(|f| Use {
+                    name: f.to_string(),
+                    path: normalize(&PathBuf::from("p").join(f)),
+                    chips: vec!["U1".into()],
+                })
+                .collect(),
+            chips: Vec::new(),
+        };
+        let code = [
+            circuit("a.dbr", &["own.asm", "both.asm"]),
+            circuit("b.dbr", &["both.asm", "other.asm"]),
+            circuit("sub/c.dbr", &["sub/in.asm", "far.asm"]),
+        ];
+        let p = |f: &str| normalize(&PathBuf::from("p").join(f));
+        let a = removal(&code, &p("a.dbr"));
+        assert_eq!(a.extra, [p("own.asm")]);
+        assert_eq!(a.kept, [(p("both.asm"), vec!["b".to_string()])]);
+        // A folder: what is inside it goes anyway.
+        let folder = removal(&code, &p("sub"));
+        assert_eq!(folder.extra, [p("far.asm")]);
+        assert!(folder.kept.is_empty());
+        // A source file takes nothing with it.
+        assert_eq!(removal(&code, &p("own.asm")), Removal::default());
+    }
+
+    /// Puts a file of its own in the real Recycle Bin and takes it out again;
+    /// run by hand: `cargo test -p dunbrec-app recycle -- --ignored`.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "uses the real Recycle Bin"]
+    fn a_file_goes_to_the_recycle_bin() {
+        let name = format!("dunbrec-recycle-test-{}.txt", std::process::id());
+        let file = std::env::temp_dir().join(&name);
+        std::fs::write(&file, "a test of deleting to the Recycle Bin").unwrap();
+        trash::delete(&file).unwrap();
+        assert!(!file.exists());
+        let mine: Vec<_> = trash::os_limited::list()
+            .unwrap()
+            .into_iter()
+            .filter(|item| item.name.to_string_lossy().contains(&name))
+            .collect();
+        let found = mine.len();
+        trash::os_limited::purge_all(mine).unwrap();
+        assert_eq!(found, 1, "it is in the bin");
+    }
+
+    #[test]
+    fn a_deleted_file_is_taken_from_the_chips_that_ran_it() {
+        let dir = Path::new("proj");
+        let mut s = Schematic::new();
+        for firmware in ["a.asm", "fw/b.ino", "fw/c.ino", "builtin:blink"] {
+            s.add_component(
+                ComponentKind::Mcu {
+                    firmware: firmware.into(),
+                    clock: 16e6,
+                },
+                Default::default(),
+            );
+        }
+        for name in ["a.asm", "fw/b.ino", "kept"] {
+            let file = SourceFile {
+                language: SourceLanguage::Asm,
+                text: "nop".into(),
+            };
+            s.sources.insert(name.into(), file);
+        }
+        let ran = |s: &Schematic| -> Vec<String> {
+            code_of(s, Path::new("proj/x.dbr"))
+                .chips
+                .into_iter()
+                .map(|c| c.firmware)
+                .collect()
+        };
+        assert_eq!(forget_sources(&mut s, dir, &dir.join("other.asm")), 0);
+        assert_eq!(forget_sources(&mut s, dir, &dir.join("a.asm")), 1);
+        assert_eq!(ran(&s), ["", "fw/b.ino", "fw/c.ino", "builtin:blink"]);
+        // A folder takes everything in it.
+        assert_eq!(forget_sources(&mut s, dir, &dir.join("fw")), 2);
+        assert_eq!(ran(&s), ["", "", "", "builtin:blink"]);
+        assert_eq!(s.sources.keys().collect::<Vec<_>>(), ["kept"]);
+    }
+
+    #[test]
+    fn the_chips_say_which_circuit_a_source_file_belongs_to() {
+        let root = scratch("code");
+        let chip = |firmware: &str| ComponentKind::Mcu {
+            firmware: firmware.into(),
+            clock: 16e6,
+        };
+        let mut s = Schematic::new();
+        for firmware in [
+            " main.asm ",
+            "main.asm",
+            "fw/b.ino",
+            "builtin:blink",
+            "x.hex",
+        ] {
+            s.add_component(chip(firmware), Default::default());
+        }
+        let circuit = root.join("a.dbr");
+        let code = code_of(&s, &circuit);
+        assert_eq!(code.name(), "a");
+        assert_eq!(code.chips.len(), 5);
+        let uses: Vec<(&str, Vec<&str>)> = code
+            .uses
+            .iter()
+            .map(|u| {
+                (
+                    u.name.as_str(),
+                    u.chips.iter().map(String::as_str).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            uses,
+            [("fw/b.ino", vec!["U3"]), ("main.asm", vec!["U1", "U2"])]
+        );
+        assert!(code.use_of(&root.join("fw").join("b.ino")).is_some());
+        assert!(code.use_of(&root.join("b.ino")).is_none());
+
+        // A project reads this from the circuit files it lists.
+        std::fs::create_dir_all(&root).unwrap();
+        dunbrec_io::dbr::save(&s, &circuit).unwrap();
+        let (mut project, _) = Project::create(&root.join("P")).unwrap();
+        project.add_file(&circuit).unwrap();
+        let read = project.code.iter().find(|c| c.name() == "a").unwrap();
+        assert_eq!(read, &code);
+        assert!(!project.lists_folder(&root.join("fw")));
+        project.add_folder(&root.join("fw")).unwrap();
+        assert!(project.lists_folder(&root.join("fw")));
+
+        // A copy of its own for a shared file, without writing over any.
+        std::fs::write(root.join("main.asm"), "nop\n").unwrap();
+        std::fs::write(root.join("main2.asm"), "mine\n").unwrap();
+        let made = copy_sources(&mut s, &root, &["main.asm".to_string()]).unwrap();
+        assert_eq!(made, [root.join("main3.asm")]);
+        assert_eq!(s.sources["main3.asm"].text, "nop\n");
+        assert!(!s.sources.contains_key("main.asm"));
+        assert_eq!(code_of(&s, &circuit).uses[1].name, "main3.asm");
+        assert_eq!(
+            std::fs::read_to_string(root.join("main2.asm")).unwrap(),
+            "mine\n"
         );
         std::fs::remove_dir_all(&root).unwrap();
     }

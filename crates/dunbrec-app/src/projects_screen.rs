@@ -342,59 +342,86 @@ impl ProjectsScreen {
         });
     }
 
+    /// One project of the list, in a box that opens it wherever it is
+    /// clicked, except on its own buttons.
     fn recent_row(&mut self, ui: &mut Ui, path: &Path, width: f32) -> Option<Command> {
         let mut out = None;
         let exists = path.is_file();
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.set_width(width - 20.0);
-            ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    let name = RichText::new(stem_of(path)).size(17.0).strong();
-                    if ui
-                        .add_enabled(exists, egui::Button::new(name).frame(false))
-                        .on_hover_text(path.display().to_string())
-                        .clicked()
-                    {
-                        out = Some(Command::OpenRecent(path.to_path_buf()));
-                    }
-                    let folder = path.parent().unwrap_or(Path::new("")).display().to_string();
-                    ui.label(RichText::new(folder).weak().small());
-                    if !exists {
-                        ui.colored_label(
-                            Color32::from_rgb(225, 90, 90),
-                            "The project file is not there any more.",
-                        );
-                    }
-                });
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .small_button("×")
-                        .on_hover_text("Remove from the list (no file is touched)")
-                        .clicked()
-                    {
-                        out = Some(Command::Forget(path.to_path_buf()));
-                    }
-                    ui.add_enabled_ui(exists, |ui| {
+        let sense = if exists {
+            egui::Sense::click()
+        } else {
+            egui::Sense::hover()
+        };
+        // The box is sensed before what is in it, so its buttons come first.
+        let card = ui.scope_builder(egui::UiBuilder::new().id_salt(path).sense(sense), |ui| {
+            let pointed = exists && (ui.response().hovered() || ui.response().has_focus());
+            let mut frame = egui::Frame::group(ui.style());
+            if pointed {
+                let visuals = ui.visuals();
+                frame = frame
+                    .fill(visuals.widgets.hovered.weak_bg_fill)
+                    .stroke(egui::Stroke::new(1.5_f32, visuals.selection.bg_fill));
+            }
+            frame.show(ui, |ui| {
+                ui.set_width(width - 20.0);
+                // Selecting the text would take the clicks meant for the box.
+                ui.style_mut().interaction.selectable_labels = false;
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        let mut name = RichText::new(stem_of(path)).size(17.0).strong();
+                        if !exists {
+                            name = name.weak();
+                        }
+                        ui.label(name);
+                        let folder = path.parent().unwrap_or(Path::new("")).display().to_string();
+                        ui.label(RichText::new(folder).weak().small());
+                        if !exists {
+                            ui.colored_label(
+                                Color32::from_rgb(225, 90, 90),
+                                "The project file is not there any more.",
+                            );
+                        }
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
-                            .small_button("Rename…")
-                            .on_hover_text(
-                                "Rename the project (its circuit files keep their names)",
-                            )
+                            .small_button("×")
+                            .on_hover_text("Remove from the list (no file is touched)")
                             .clicked()
                         {
-                            self.rename = Some(Rename {
-                                file: path.to_path_buf(),
-                                name: stem_of(path),
-                                fresh: true,
-                            });
+                            out = Some(Command::Forget(path.to_path_buf()));
                         }
-                        if ui.small_button("Show folder").clicked() {
-                            out = Some(Command::ShowFolder(path.to_path_buf()));
-                        }
+                        ui.add_enabled_ui(exists, |ui| {
+                            if ui
+                                .small_button("Rename…")
+                                .on_hover_text(
+                                    "Rename the project (its circuit files keep \
+                                             their names)",
+                                )
+                                .clicked()
+                            {
+                                self.rename = Some(Rename {
+                                    file: path.to_path_buf(),
+                                    name: stem_of(path),
+                                    fresh: true,
+                                });
+                            }
+                            if ui.small_button("Show folder").clicked() {
+                                out = Some(Command::ShowFolder(path.to_path_buf()));
+                            }
+                        });
                     });
                 });
             });
         });
+        let mut card = card.response;
+        if exists {
+            card = card
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text(path.display().to_string());
+        }
+        if card.clicked() {
+            out = Some(Command::OpenRecent(path.to_path_buf()));
+        }
         out
     }
 
@@ -524,6 +551,140 @@ mod tests {
         assert_eq!(show(Filter::All), ["a", "b", "c"]);
         assert_eq!(show(Filter::Available), ["a", "c"]);
         assert_eq!(show(Filter::Missing), ["b"]);
+    }
+
+    /// The screen in a headless window, clicked by position.
+    struct Rig {
+        ctx: egui::Context,
+        screen: ProjectsScreen,
+        recent: Vec<PathBuf>,
+        seen: Vec<(String, egui::Rect)>,
+        asked: Vec<Command>,
+        time: f64,
+    }
+
+    impl Rig {
+        fn frame(&mut self, events: Vec<egui::Event>) {
+            self.time += 0.1;
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900.0, 800.0),
+                )),
+                time: Some(self.time),
+                events,
+                ..Default::default()
+            };
+            let (screen, recent, asked) = (&mut self.screen, &self.recent, &mut self.asked);
+            let out = self.ctx.run(input, |ctx| {
+                let view = View {
+                    recent,
+                    waiting: None,
+                };
+                asked.extend(screen.show(ctx, &view));
+            });
+            if let Some(update) = out.platform_output.accesskit_update {
+                self.seen = update
+                    .nodes
+                    .iter()
+                    .filter_map(|(_, n)| {
+                        let text = n.label().or_else(|| n.value())?.to_string();
+                        let b = n.bounds()?;
+                        let min = egui::pos2(b.x0 as f32, b.y0 as f32);
+                        let max = egui::pos2(b.x1 as f32, b.y1 as f32);
+                        Some((text, egui::Rect::from_min_max(min, max)))
+                    })
+                    .collect();
+            }
+        }
+
+        /// Where the `nth` thing labelled `label` is.
+        fn find(&self, label: &str, nth: usize) -> egui::Rect {
+            let mut found: Vec<egui::Rect> = self
+                .seen
+                .iter()
+                .filter(|(text, _)| text == label)
+                .map(|(_, rect)| *rect)
+                .collect();
+            found.sort_by(|a, b| a.top().total_cmp(&b.top()));
+            *found
+                .get(nth)
+                .unwrap_or_else(|| panic!("no {label:?} number {nth}"))
+        }
+
+        /// Click at `at` and return what the screen asked for.
+        fn click(&mut self, at: egui::Pos2) -> Vec<Command> {
+            self.asked.clear();
+            self.frame(vec![egui::Event::PointerMoved(at)]);
+            self.frame(vec![]);
+            for pressed in [true, false] {
+                self.frame(vec![egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                }]);
+            }
+            self.frame(vec![]);
+            std::mem::take(&mut self.asked)
+        }
+    }
+
+    #[test]
+    fn a_projects_box_opens_it_wherever_it_is_clicked_but_on_its_buttons() {
+        let dir = std::env::temp_dir().join(format!("dunbrec-cards-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let there = dir.join("There.dbrproj");
+        std::fs::write(&there, "{}").unwrap();
+        let gone = dir.join("Gone.dbrproj");
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut rig = Rig {
+            ctx,
+            screen: ProjectsScreen::default(),
+            recent: vec![there.clone(), gone.clone()],
+            seen: Vec::new(),
+            asked: Vec::new(),
+            time: 0.0,
+        };
+        for _ in 0..4 {
+            rig.frame(vec![]);
+        }
+        let open = vec![Command::OpenRecent(there.clone())];
+        let name = rig.find("There", 0);
+        let folder = rig.find(&dir.display().to_string(), 0);
+        let show = rig.find("Show folder", 0);
+        // The name, the folder under it, and the empty part of the box.
+        assert_eq!(rig.click(name.center()), open);
+        assert_eq!(rig.click(folder.left_center() + egui::vec2(8.0, 0.0)), open);
+        assert_eq!(
+            rig.click(egui::pos2(show.left() - 40.0, name.center().y)),
+            open
+        );
+        assert_eq!(
+            rig.click(egui::pos2(name.left() - 4.0, folder.bottom())),
+            open
+        );
+        // The buttons do their own thing and no more.
+        assert_eq!(
+            rig.click(show.center()),
+            [Command::ShowFolder(there.clone())]
+        );
+        let remove = rig.find("×", 0);
+        assert_eq!(rig.click(remove.center()), [Command::Forget(there.clone())]);
+        let rename = rig.find("Rename…", 0);
+        assert!(rig.click(rename.center()).is_empty());
+        assert!(rig.screen.rename.is_some());
+        rig.screen.rename = None;
+        for _ in 0..4 {
+            rig.frame(vec![]);
+        }
+        // A project whose file has gone cannot be opened, only removed.
+        let missing = rig.find("Gone", 0);
+        assert!(rig.click(missing.center()).is_empty());
+        let remove = rig.find("×", 1);
+        assert_eq!(rig.click(remove.center()), [Command::Forget(gone)]);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

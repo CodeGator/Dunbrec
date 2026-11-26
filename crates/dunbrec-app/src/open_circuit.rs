@@ -26,7 +26,7 @@ use crate::code_ui::CodeEditor;
 use crate::debugger_ui::Debugger;
 use crate::document::Document;
 use crate::instruments_ui::Bench;
-use crate::project;
+use crate::project::{self, CircuitCode, Use};
 use crate::properties::{DemoRequest, Properties};
 use crate::serial_ui::SerialMonitor;
 
@@ -93,6 +93,9 @@ pub struct OpenCircuit {
     pub tabs: DockState<DocTab>,
     /// Source files whose tabs the user has closed.
     pub hidden: BTreeSet<String>,
+    /// The files the chips ran when last looked at, and the document
+    /// generation then: a file that is new among them is checked.
+    pub checked: (u64, BTreeSet<PathBuf>),
     /// This circuit's instruments while another circuit is the active one.
     pub tools: Tools,
     /// The netlist, and the document generation it was built from.
@@ -124,11 +127,56 @@ impl OpenCircuit {
             code: CodeEditor::default(),
             tabs: DockState::new(vec![DocTab::Schematic]),
             hidden: BTreeSet::new(),
+            checked: Default::default(),
             tools: Tools::default(),
             dc: None,
         };
         circuit.sync_tabs();
+        circuit.checked = (circuit.doc.generation(), circuit.used_paths());
         circuit
+    }
+
+    /// What the circuit's microcontrollers run, as it is now; `None` while it
+    /// has no file.
+    pub fn code(&self) -> Option<CircuitCode> {
+        self.doc
+            .path()
+            .map(|path| project::code_of(self.doc.schematic(), path))
+    }
+
+    /// Where the source files the chips run are.
+    fn used_paths(&self) -> BTreeSet<PathBuf> {
+        self.code()
+            .map(|code| code.uses.into_iter().map(|u| u.path).collect())
+            .unwrap_or_default()
+    }
+
+    /// The source files the chips have started to run since the last call.
+    /// Those on the disk are opened, so that they have their tabs.
+    pub fn newly_used(&mut self) -> Vec<Use> {
+        if self.checked.0 == self.doc.generation() {
+            return Vec::new();
+        }
+        let Some(code) = self.code() else {
+            self.checked = (self.doc.generation(), BTreeSet::new());
+            return Vec::new();
+        };
+        let new: Vec<Use> = code
+            .uses
+            .into_iter()
+            .filter(|u| !self.checked.1.contains(&u.path))
+            .collect();
+        if let Some(dir) = self.firmware_dir() {
+            for u in &new {
+                let open = self.doc.schematic().sources.contains_key(&u.name);
+                if !open && u.path.is_file() {
+                    // A file that cannot be read says so when it is run.
+                    let _ = project::attach(self.doc.schematic_mut(), &dir, &u.name);
+                }
+            }
+        }
+        self.checked = (self.doc.generation(), self.used_paths());
+        new
     }
 
     /// The circuit's name, as its tab shows it: its file's name, or for one
