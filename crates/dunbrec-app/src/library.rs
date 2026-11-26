@@ -375,7 +375,8 @@ pub fn palette() -> &'static [PaletteEntry] {
             name: "ATmega328P (Arduino)",
             group: "Microcontrollers",
             make: || ComponentKind::Mcu {
-                firmware: "builtin:blink".into(),
+                // No program until the user chooses a demo or a file.
+                firmware: String::new(),
                 clock: dunbrec_core::DEFAULT_MCU_CLOCK,
             },
         },

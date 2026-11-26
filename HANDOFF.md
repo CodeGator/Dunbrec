@@ -8,7 +8,7 @@ high level, one line on what it is written in, no steps and no other technical d
 **no user guide**, by the user's decision: the project is too young and changes too much to keep
 one up to date.
 
-*Last updated: 2026-11-26, version 0.6.0 in progress, nothing new yet. Version 0.5.0 released (several circuits open at once, designed in [docs/multi-document-editor.md](docs/multi-document-editor.md) and built in all its stages; easier schematic editing; larger menus and toolbar; coloured sketches).*
+*Last updated: 2026-11-26, version 0.6.0 in progress: a real LED part (first of the LED displays), and every chip's program is now a visible source file. Version 0.5.0 is released and published. Start at "0.6.0" below.*
 
 ## Status
 
@@ -18,8 +18,12 @@ Version 0.3.0 was released on 2026-11-21 (tag `v0.3.0`, merged to `main`; 0.1.0 
 released the same day). Version 0.4.0 was merged to `main` and pushed to `release` on 2026-11-22;
 the workflow drafts the GitHub release `v0.4.0`, which is published by hand. Version 0.5.0 was
 merged to `main`, pushed to `release` and published on 2026-11-26. Work branches are named after
-the application version and merged into `main`; this one is `0.6.0`. A release is cut by merging the branch into `main` and pushing `main:release`, which
-drafts the GitHub release (see `.github/workflows/release.yml`).
+the application version and merged into `main`; this one is `0.6.0`, which exists only on this
+computer (not pushed). A release is cut by merging the branch into `main` and pushing
+`main:release`, which drafts the GitHub release (see `.github/workflows/release.yml`). Publishing
+the draft is a separate step, done when the user asks (`gh release edit v<version> --draft=false
+--latest`, after checking the assets and checksums). Then the next version's branch is made from
+`main` with the version bumped.
 
 | Phase | Content |
 |---|---|
@@ -34,10 +38,11 @@ drafts the GitHub release (see `.github/workflows/release.yml`).
 | 13 | Dockable panels: every panel is an `egui_dock` tab; layout saved between sessions |
 | 0.2.0 | Switches group: SPST, SPDT, DPST, DPDT (`ComponentKind::MultiSwitch`, `SwitchContacts` device) and hold-to-press push buttons (`Switch { momentary }`, `Canvas::push_buttons`) |
 | 0.3.0 | Projects (a `.dbrproj` file listing circuits and firmware files), Junction and hops, J key, CD4066, Linear group |
+| 0.6.0 (in progress) | LED part; a chip's program is always a source file; new circuits join the project when saved. See "0.6.0" below |
 | 0.5.0 | Projects screen (nothing else shown without a project); assistant draws new circuits with real wires and can add sine sources; no circuit open until one is opened; a central area that never collapses; closable schematic tab. See "0.5.0" below |
 | 0.4.0 | Settings dialog; Assistant (Ollama or Claude); pop-out instruments; text size; every confirmation a message box; Code panel tabs; project behaviour changes. See "0.4.0" below |
 
-Health at handoff: `cargo test --workspace` 518 passed, 0 failed (2 ignored: a real Recycle Bin check and an
+Health at handoff: `cargo test --workspace` 522 passed, 0 failed (2 ignored: a real Recycle Bin check and an
 emulator speed
 benchmark); `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --check`
 clean. Toolchain: Rust 1.99 (edition 2024, MSRV 1.90), Windows 11.
@@ -126,10 +131,10 @@ Key mechanisms worth knowing before changing the engine:
   - Own AVR emulator; simavr was rejected because it is GPL (that reason lapsed when the
     project became GPL-3.0; the in-house emulator stays).
   - ATmega328P first.
-  - Firmware is a `.hex` path stored in the schematic (relative to the `.dbr`), reloaded on
-    every Run, plus `builtin:<name>` demo programs, a source file's path (`main.asm`,
-    `fw/blink.ino`: the file beside the `.dbr`, built on every Run), and the older
-    `source:<name>` (text kept inside the schematic).
+  - A chip's firmware field is a `.hex` path (relative to the `.dbr`, reloaded on every Run), a
+    source file's path (`main.asm`, `fw/blink.ino`: the file beside the `.dbr`, built on Run),
+    empty (no program), or the older `source:<name>` (text kept inside the schematic) and
+    `builtin:<name>` (which the app replaces with a sketch on opening, see "0.6.0").
   - File format: `Schematic.sources` (a map of name to `{ language, text }`) was added with
     `#[serde(default)]`, so older `.dbr` files load unchanged and the version number was not
     bumped. An older Dunbrec opening a file that has sources ignores them.
@@ -166,9 +171,8 @@ Key mechanisms worth knowing before changing the engine:
    and `millis` (see `mcu_tests.rs`, "Real Arduino sketches"). They need `arduino-cli` with the
    `arduino:avr` core and skip without it. Not covered: timer interrupts through `attachInterrupt`
    and `Timer1`-style libraries, `tone()`, `pulseIn`, `shiftOut`.
-3. **UI verification of phase 11 in the running app.**
-   - Covered so far by worker-thread tests and a screenshot of the schematic.
-   - Pressing Run and watching the serial monitor in the window has not been done.
+3. **UI verification of phase 11 in the running app:** done. The readme screenshots show an
+   Arduino sketch running with the serial monitor.
 4. **Assistant (0.4.0).** Not yet done: adding parts with more than two pins is drawn on labels
    only (no real wires); rewiring (moving a pin to another net) is not a suggestion; controlled
    sources, the CD4066, discrete LEDs and microcontrollers cannot be added; the logic analyser's
@@ -187,7 +191,9 @@ Key mechanisms worth knowing before changing the engine:
    - MCU: SPI, I²C, EEPROM, watchdog, serial receive and other chips.
    - Simulation: a fixed temperature of 27 °C, MOSFET level 1 only, and a single logic family.
    - Import: KiCad hierarchical sheets, SPICE `.param` expressions and EXP/SFFM sources.
-8. **Projects** (built in 0.3.0; changed in 0.4.0, see "0.4.0"). A project is a *file*,
+8. **Projects** (built in 0.3.0; changed in 0.4.0 and 0.5.0, and where those sections differ
+   from this item they are right: for one, there is no "New folder", and circuits do not share
+   source files). A project is a *file*,
    `<name>.dbrproj` (JSON, `project::EXTENSION`), listing the project's files relative to its
    own folder (`files`) and any folders to show while empty (`folders`); `version` 1. The
    `.dbr` circuits and the `.asm`/`.ino` sources are ordinary files, and the project view shows
@@ -263,8 +269,8 @@ How the assistant works (the rules worth keeping):
   **Every addition is verified** against the netlist (each new pin on the requested net; no
   existing net joined or split) or nothing changes. Removal deletes the part and the stubs or
   ground drawn for it; wires the user drew stay.
-- **Parts it cannot add:** controlled sources, CD4066, microcontrollers, discrete LEDs (there is
-  no such part; only the logic LED).
+- **Parts it cannot add:** controlled sources, CD4066, microcontrollers and LEDs (the LED part
+  came in 0.6.0; the assistant's prompt still says it cannot add discrete LEDs).
 
 Other 0.4.0 behaviour:
 
@@ -283,7 +289,9 @@ Other 0.4.0 behaviour:
 
 ## 0.5.0
 
-Built on the `0.5.0` branch. What it adds, and the decisions behind it (all agreed with the user):
+Built on the `0.5.0` branch. What it adds, and the decisions behind it (all agreed with the user).
+The paragraphs run oldest first: "Several circuits" and what follows it supersede the single
+schematic tab, the Code panel and the New submenu described earlier.
 
 **Assistant builds circuits properly.**
 
@@ -334,9 +342,8 @@ the tab's right-click Close come through `TabViewer::on_close`, which asks to cl
 Choosing one in a chip's properties (`Properties::demo`, then `DunbrecApp::use_demo` and
 `OpenCircuit::add_demo`) writes a new file beside the circuit with `project::new_source_copy`
 (never overwrites), points the chip at it, lists it in the project, opens the Code panel and, for
-a sketch, starts a build. The compiled-in `builtin:` programs (`programs.rs`) remain for new
-chips, the examples and older circuits; *Edit code* on such a chip makes a copy. Keep a demo's
-two sources and its compiled-in program behaving alike (tests in `demos.rs`).
+a sketch, starts a build. Keep a demo's two sources and its compiled-in program behaving alike
+(tests in `demos.rs`).
 
 **Scrolling the schematic.** The wheel scrolls (Shift: sideways, which egui does itself), Ctrl or
 a pinch zooms, middle-drag and the two scroll bars move the view (`Canvas::scroll_bars`; the bars
@@ -420,6 +427,29 @@ the demos look dead: blink changed every 12 s). `sync_speed` tells a running sim
 
 ## 0.6.0 (in progress)
 
+**Where things stand.** The single LED is committed (`eaae1d2`). The source-file changes below
+were built and tested after it and were **not yet committed** when this was written (check
+`git status`). The user has not yet tried them in the running app. Next in the agreed plan is the
+bar display, once the user is happy with the single LED.
+
+**What a chip runs is always a file the user can see** (the user found it confusing that a demo
+ran with no source file; the table of changes was agreed).
+
+- A new chip has no program.
+- A circuit opened with `builtin:` chips (the examples, older circuits) gets their sketches as its
+  own sources (`OpenCircuit::give_builtins_files`, called from `add_circuit` and at startup), kept
+  in memory until saved. An older circuit then counts as unsaved; an untouched example does not.
+- `builtin:` still loads, and the example schematics still use it, so simulation tests need no
+  toolchain. Running an Arduino example in the app now needs `arduino-cli` (accepted by the user).
+- Source files that exist only in memory (`OpenCircuit::unwritten`) take a free name when saved
+  (`avoid_files_in`: `blink2.ino`), never writing over or sharing a file. So do files copied by
+  Save As to a folder where a different file has the name.
+- A circuit saved for the first time while a project is open joins the project (`save_to`, which
+  the Save dialog in `save_circuit` calls). The dialog is titled with the circuit's name and, for
+  a new circuit, starts in the project folder.
+- The shared app test fixture's chip runs a `.hex` file, so tests of other things are not
+  affected by the sketches.
+
 **LED displays** (asked for by the user; plan agreed 2026-11-26). Build in this order, letting the
 user try each: (1) single LED, *done*; (2) 10-segment bar display, each LED with its own two
 pins; (3) one-digit 7-segment with decimal point, common cathode or common anode; (4) four-digit
@@ -431,7 +461,13 @@ pins; (3) one-digit 7-segment with decimal point, common cathode or common anode
 - *Persistence of vision* (needed by multiplexed digits): `LedMeter` averages each current over
   20 ms of simulated time at real speed, less in slow motion.
 - `ComponentKind::Led { colour }`; `LedColour::model` is the diode model (no library entry), also
-  written by the SPICE export. The assistant cannot add LEDs yet.
+  written by the SPICE export. Drawing is `Painter::led_light` and `too_much_current` in
+  `canvas.rs`; the palette group is "Displays". The assistant cannot add LEDs yet, and the curve
+  tracer does not list them.
+- *For the displays:* `Sample::currents` holds one current per netlist element (at its first pin),
+  which is what `LedMeter` reads. A part with several LEDs needs a current for each, for example by
+  becoming one element per LED in the netlist, or by the device reporting them. `pins()` returns
+  static lists, so each variant (common cathode or anode, digit count) needs its own.
 
 ## Gotchas
 
@@ -445,4 +481,17 @@ pins; (3) one-digit 7-segment with decimal point, common cathode or common anode
 - A long Python edit script inline in a Git Bash heredoc can fail to parse (the shell choked on
   it once, applying nothing); write the script to a file in the scratchpad and run that.
 - Rebuilding while the app is running fails (the exe is locked). Close it normally first, so the
-  unsaved-changes prompt still appears; do not kill it.
+  unsaved-changes prompt still appears; do not kill it. From PowerShell, `CloseMainWindow()` on
+  the `dunbrec` process asks politely; if the window stays open it is asking the user something.
+- **Screenshots** (including `docs/images`, used by the readme) were made by patching the app
+  temporarily so that it sets up a scene, sends `ViewportCommand::Screenshot` and quits; no
+  script is kept. Points that went wrong once:
+  - With no project open `update` returns early, so a hook at its end never runs: give the scene
+    a project, or the window sits on the Projects screen.
+  - Drop input events in `raw_input_hook` and retitle the window, or the user may take it for the
+    real app and work in it.
+  - The active circuit's instruments are the app's own fields (`bench`, `serial`), not
+    `circuit.tools`.
+  - Use the release build (the debug one shows "10% speed"), hide the file path above a source
+    file (`location_note`), and give each run its own settings store.
+  - Restore the patched files, check none of the code is left, and rebuild.

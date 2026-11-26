@@ -438,6 +438,10 @@ impl DunbrecApp {
         if !startup_problems.is_empty() {
             app.message = Some(source_problems(&startup_problems));
         }
+        // A circuit given at start does not come through `add_circuit`.
+        if app.circuit_open {
+            app.active_mut().give_builtins_files(|_| false);
+        }
         app
     }
 
@@ -979,6 +983,15 @@ impl DunbrecApp {
 
     /// Open `circuit` in a tab of its own and make it the active one.
     fn add_circuit(&mut self, mut circuit: OpenCircuit) {
+        // What its chips run is always a file the user can see.
+        let used: Vec<PathBuf> = (0..self.open_ids().len())
+            .filter_map(|i| self.circuits[i].code())
+            .chain(self.project_code())
+            .filter(|c| circuit.doc.path() != Some(c.circuit.as_path()))
+            .flat_map(|c| c.uses)
+            .map(|u| u.path)
+            .collect();
+        circuit.give_builtins_files(|path| used.iter().any(|u| project::path_eq(u, path)));
         circuit.id = self.next_id;
         self.next_id += 1;
         if self.circuit_open {
@@ -1180,13 +1193,28 @@ impl DunbrecApp {
             _ => {
                 // Show which circuit is being named.
                 self.switch_to(index);
-                rfd::FileDialog::new()
+                let circuit = &self.circuits[index];
+                let mut dialog = rfd::FileDialog::new()
+                    .set_title(format!("Save circuit “{}”", circuit.name()))
                     .add_filter("Dunbrec schematic", &["dbr"])
-                    .set_file_name(format!("{}.dbr", self.circuits[index].name()))
-                    .save_file()
+                    .set_file_name(format!("{}.dbr", circuit.name()));
+                // A new circuit belongs with the project, to begin with.
+                if circuit.doc.path().is_none()
+                    && let Some(project) = &self.project
+                {
+                    dialog = dialog.set_directory(&project.root);
+                }
+                dialog.save_file()
             }
         };
-        let Some(mut path) = path else { return false };
+        let Some(path) = path else { return false };
+        self.save_to(index, path)
+    }
+
+    /// Save the circuit at `index` as the file `path`. A circuit saved for the
+    /// first time while a project is open joins the project.
+    fn save_to(&mut self, index: usize, mut path: PathBuf) -> bool {
+        let first_time = self.circuits[index].doc.path().is_none();
         if path.extension().is_none() {
             path.set_extension("dbr");
         }
@@ -1202,7 +1230,11 @@ impl DunbrecApp {
             return false;
         }
         // Its source files are written beside it, which must not write over
-        // those of another open circuit.
+        // other files: new ones take free names...
+        if let Some(dir) = path.parent() {
+            self.circuits[index].avoid_files_in(dir);
+        }
+        // ...and none may be that of another open circuit.
         if let Some(dir) = path.parent()
             && let Some((name, owner)) = self
                 .shared_sources(self.circuits[index].doc.schematic(), dir, Some(index))
@@ -1236,8 +1268,12 @@ impl DunbrecApp {
             Ok(()) => {
                 self.settings.remember(&path);
                 self.circuits[index].doc.mark_saved(path.clone());
+                self.circuits[index].sources_written();
                 // New source files of a schematic in the project are the project's.
                 if let Some(p) = &mut self.project {
+                    if first_time && let Err(e) = p.add_file(&path) {
+                        self.message = Some(Message::error("Could not update the project file", e));
+                    }
                     if p.contains(&path) && !written.is_empty() {
                         let _ = p.add_files(&written);
                     }
@@ -4460,8 +4496,7 @@ mod tests {
         };
         rig.settle();
 
-        // The box shows which built-in program the chip runs.
-        rig.click("blink");
+        rig.click("Choose…");
         rig.click("blink (assembly)");
         let root = project.root.clone();
         assert!(
@@ -4546,7 +4581,16 @@ mod tests {
         let (mut project, _) = Project::create(&root.join("P")).unwrap();
         let blink = root.join("Blink.dbr");
         let divider = root.join("Divider.dbr");
-        dunbrec_io::dbr::save(&example("Arduino blink"), &blink).unwrap();
+        // Its chip runs a compiled program: no source file to begin with.
+        let mut s = example("Arduino blink");
+        for c in &mut s.components {
+            if let dunbrec_core::ComponentKind::Mcu { firmware, .. } = &mut c.kind {
+                *firmware = "blink.hex".into();
+            }
+        }
+        let image = dunbrec_mcu::programs::builtin("blink").unwrap();
+        std::fs::write(root.join("blink.hex"), dunbrec_mcu::hex::write(&image)).unwrap();
+        dunbrec_io::dbr::save(&s, &blink).unwrap();
         dunbrec_io::dbr::save(&(examples()[0].build)(), &divider).unwrap();
         project
             .add_files(&[blink.clone(), divider.clone()])
@@ -5098,7 +5142,7 @@ mod tests {
             .active_mut()
             .doc
             .edit(|s| s.sources.get_mut("blink.asm").unwrap().text = "; edited\nnop\n".into());
-        set_firmware(&mut f, "builtin:blink");
+        set_firmware(&mut f, "blink.hex");
         let other = f.root.join("Other.dbr");
         dunbrec_io::dbr::save(&example("Arduino blink"), &other).unwrap();
         f.rig
@@ -5142,7 +5186,7 @@ mod tests {
         set_firmware(&mut f, "blink.asm");
         assert!(f.rig.app.shared_edit.is_some());
         f.rig.click("Undo the change");
-        assert_eq!(firmware_of(&f), "builtin:blink");
+        assert_eq!(firmware_of(&f), "blink.ino", "its own, as it opened");
         assert!(f.rig.app.shared_edit.is_none());
         set_firmware(&mut f, "blink.asm");
         f.rig.click("Make a copy");
@@ -5858,6 +5902,135 @@ mod tests {
             f.rig.frame(vec![]);
         }
         f.rig.app.stop_sim();
+    }
+
+    /// Open the "Arduino blink" example, as File > Open example does.
+    fn open_blink_example(f: &mut Fixture) {
+        let index = examples()
+            .iter()
+            .position(|e| e.name == "Arduino blink")
+            .unwrap();
+        f.rig.app.request(Pending::Example(index));
+        f.rig.settle();
+    }
+
+    #[test]
+    fn a_new_chip_has_no_program_until_one_is_chosen() {
+        let chip = palette_groups("arduino")
+            .into_iter()
+            .flat_map(|(_, entries)| entries)
+            .map(|e| (e.make)())
+            .find(|k| matches!(k, dunbrec_core::ComponentKind::Mcu { .. }))
+            .unwrap();
+        assert!(matches!(
+            chip,
+            dunbrec_core::ComponentKind::Mcu { firmware, .. } if firmware.is_empty()
+        ));
+    }
+
+    #[test]
+    fn an_example_opens_with_its_own_sketch_and_saving_it_joins_the_project() {
+        let mut f = fixture("example");
+        let root = f.rig.app.project.as_ref().unwrap().root.clone();
+        open_blink_example(&mut f);
+        let circuit = f.rig.app.active();
+        // Its chip already runs the sketch, though the circuit has no file.
+        assert!(circuit.doc.schematic().components.iter().any(|c| matches!(
+            &c.kind,
+            dunbrec_core::ComponentKind::Mcu { firmware, .. } if firmware == "blink.ino"
+        )));
+        assert!(
+            circuit.doc.schematic().sources["blink.ino"]
+                .text
+                .contains("setup")
+        );
+        assert!(
+            circuit
+                .tabs
+                .find_tab(&DocTab::Source("blink.ino".into()))
+                .is_some()
+        );
+        assert!(circuit.is_in_front(&DocTab::Schematic));
+        // Nothing has been written, and there is nothing to lose yet.
+        assert!(!circuit.doc.is_dirty() && !root.join("blink.ino").exists());
+
+        let saved = root.join("Arduino blink.dbr");
+        assert!(f.rig.app.save_to(f.rig.app.active, saved.clone()));
+        f.rig.settle();
+        let project = f.rig.app.project.as_ref().unwrap();
+        assert!(project.contains(&saved));
+        assert!(project.contains(&root.join("blink.ino")));
+        assert!(shows(&f, "📝 U1: blink.ino"), "{:?}", f.rig.seen);
+        assert!(f.rig.app.message.is_none());
+    }
+
+    #[test]
+    fn a_second_new_sketch_never_writes_over_or_shares_the_first() {
+        let mut f = fixture("twice");
+        let root = f.rig.app.project.as_ref().unwrap().root.clone();
+        // Someone's own file is already there.
+        std::fs::write(root.join("blink.ino"), "// mine").unwrap();
+        for (name, file) in [("One", "blink2.ino"), ("Two", "blink3.ino")] {
+            open_blink_example(&mut f);
+            assert!(
+                f.rig
+                    .app
+                    .save_to(f.rig.app.active, root.join(format!("{name}.dbr")))
+            );
+            f.rig.settle();
+            assert_eq!(firmware_of(&f), file);
+            assert!(root.join(file).is_file());
+            assert!(
+                f.rig
+                    .app
+                    .active()
+                    .tabs
+                    .find_tab(&DocTab::Source(file.into()))
+                    .is_some()
+            );
+            assert!(f.rig.app.message.is_none() && f.rig.app.shared_edit.is_none());
+        }
+        assert_eq!(
+            std::fs::read_to_string(root.join("blink.ino")).unwrap(),
+            "// mine"
+        );
+        // Saving again keeps the name.
+        f.add_a_resistor();
+        assert!(f.rig.app.save(false));
+        assert_eq!(firmware_of(&f), "blink3.ino");
+        assert!(!root.join("blink4.ino").exists());
+    }
+
+    #[test]
+    fn an_older_circuit_gets_its_sketch_as_an_unsaved_change() {
+        let mut f = fixture("older");
+        let old = f.root.join("Old.dbr");
+        dunbrec_io::dbr::save(&example("Arduino blink"), &old).unwrap();
+        f.open(&old);
+        assert_eq!(firmware_of(&f), "blink.ino");
+        assert!(f.rig.app.active().doc.is_dirty());
+        // Not on the disk, nor in the circuit file, until saved.
+        assert!(!f.root.join("blink.ino").exists());
+        assert!(!f.rig.app.active_mut().doc.undo(), "no step to undo");
+        assert!(f.rig.app.save(false));
+        assert!(f.root.join("blink.ino").is_file());
+        let saved = dunbrec_io::dbr::load(&old).unwrap();
+        assert_eq!(
+            project::code_of(&saved, &old).chips[0].firmware,
+            "blink.ino"
+        );
+        // Saving elsewhere, where a different file has that name, copies the
+        // sketch under another.
+        let other = f.root.join("sub");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("blink.ino"), "// another").unwrap();
+        assert!(f.rig.app.save_to(f.rig.app.active, other.join("Old.dbr")));
+        assert_eq!(firmware_of(&f), "blink2.ino");
+        assert!(other.join("blink2.ino").is_file());
+        assert_eq!(
+            std::fs::read_to_string(other.join("blink.ino")).unwrap(),
+            "// another"
+        );
     }
 
     #[test]

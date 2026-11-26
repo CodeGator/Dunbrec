@@ -30,6 +30,19 @@ use crate::project::{self, CircuitCode, Use};
 use crate::properties::{DemoRequest, Properties};
 use crate::serial_ui::SerialMonitor;
 
+/// `name` itself, or the first of `name2`, `name3`... (before the extension)
+/// that is not `taken`.
+fn free_name(name: &str, taken: impl Fn(&str) -> bool) -> String {
+    if !taken(name) {
+        return name.to_string();
+    }
+    let (stem, extension) = name.rsplit_once('.').unwrap_or((name, ""));
+    (2u32..)
+        .map(|n| format!("{stem}{n}.{extension}"))
+        .find(|candidate| !taken(candidate))
+        .expect("some number is free")
+}
+
 /// A tab in a circuit's own row.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum DocTab {
@@ -93,6 +106,8 @@ pub struct OpenCircuit {
     pub tabs: DockState<DocTab>,
     /// Source files whose tabs the user has closed.
     pub hidden: BTreeSet<String>,
+    /// Source files that exist only here: saving gives them names no file has.
+    unwritten: BTreeSet<String>,
     /// The files the chips ran when last looked at, and the document
     /// generation then: a file that is new among them is checked.
     pub checked: (u64, BTreeSet<PathBuf>),
@@ -127,6 +142,7 @@ impl OpenCircuit {
             code: CodeEditor::default(),
             tabs: DockState::new(vec![DocTab::Schematic]),
             hidden: BTreeSet::new(),
+            unwritten: BTreeSet::new(),
             checked: Default::default(),
             tools: Tools::default(),
             dc: None,
@@ -334,6 +350,7 @@ impl OpenCircuit {
             }
             None => {
                 let name = crate::code_ui::unused_file_name(sources, base, extension);
+                self.unwritten.insert(name.clone());
                 (name, None)
             }
         };
@@ -351,6 +368,127 @@ impl OpenCircuit {
         });
         self.show_source(&name);
         Ok(NewFile { name, path, text })
+    }
+
+    /// Give every microcontroller that runs a program built into Dunbrec (an
+    /// example's, or an older circuit's) the sketch of that program as a
+    /// source file of the circuit's own, so that what a chip runs can always
+    /// be read and changed. Chips that ran the same program share the file,
+    /// which is written when the circuit is saved. `used` says whether another
+    /// circuit already uses a path.
+    pub fn give_builtins_files(&mut self, used: impl Fn(&Path) -> bool) {
+        let dir = self.firmware_dir();
+        let mut wanted: Vec<(&'static dunbrec_mcu::demos::Demo, Vec<_>)> = Vec::new();
+        for c in &self.doc.schematic().components {
+            if let ComponentKind::Mcu { firmware, .. } = &c.kind
+                && let Some(name) = firmware.strip_prefix(dunbrec_mcu::firmware::BUILTIN_PREFIX)
+                && let Some(demo) = dunbrec_mcu::demos::demo(name)
+            {
+                match wanted.iter_mut().find(|(d, _)| d.name == demo.name) {
+                    Some((_, chips)) => chips.push(c.id),
+                    None => wanted.push((demo, vec![c.id])),
+                }
+            }
+        }
+        if wanted.is_empty() {
+            return;
+        }
+        for (demo, chips) in wanted {
+            let sources = &self.doc.schematic().sources;
+            let name = free_name(&format!("{}.ino", demo.name), |name| {
+                sources.keys().any(|k| k.eq_ignore_ascii_case(name))
+                    || dir.as_ref().is_some_and(|dir| {
+                        let path = project::normalize(&dir.join(name));
+                        path.exists() || used(&path)
+                    })
+            });
+            let file = SourceFile {
+                language: SourceLanguage::Cpp,
+                text: demo.sketch.replace("\r\n", "\n"),
+            };
+            // Not an undo step: the circuit opens this way.
+            let s = self.doc.schematic_mut();
+            s.sources.insert(name.clone(), file);
+            for id in chips {
+                if let Some(c) = s.component_mut(id)
+                    && let ComponentKind::Mcu { firmware, .. } = &mut c.kind
+                {
+                    *firmware = name.clone();
+                }
+            }
+            self.unwritten.insert(name);
+        }
+        // A circuit with a file now differs from it.
+        if dir.is_some() {
+            self.doc.mark_unsaved();
+        }
+        self.sync_tabs();
+        self.checked = (self.doc.generation(), self.used_paths());
+    }
+
+    /// Before saving into `dir`: rename the source files that would write over
+    /// a file there, or come to share it. Those that exist only here avoid
+    /// every file; those being copied to another folder avoid files that hold
+    /// something else.
+    pub fn avoid_files_in(&mut self, dir: &Path) {
+        let moving = self.firmware_dir().as_deref() != Some(dir);
+        let clashing: Vec<String> = self
+            .doc
+            .schematic()
+            .sources
+            .iter()
+            .filter(|(name, _)| project::is_file_source(name))
+            .filter(|(name, file)| {
+                let path = dir.join(name);
+                if self.unwritten.contains(*name) {
+                    path.exists()
+                } else {
+                    moving && path.is_file() && {
+                        std::fs::read_to_string(&path).map_or(true, |disk| disk != file.text)
+                    }
+                }
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        for old in clashing {
+            let sources = &self.doc.schematic().sources;
+            let new = free_name(&old, |name| {
+                sources.keys().any(|k| k.eq_ignore_ascii_case(name)) || dir.join(name).exists()
+            });
+            let in_front = self
+                .tabs
+                .find_tab(&DocTab::Source(old.clone()))
+                .is_some_and(|(surface, node, index)| {
+                    matches!(&self.tabs[surface][node], Node::Leaf(leaf) if leaf.active == index)
+                });
+            let s = self.doc.schematic_mut();
+            if let Some(file) = s.sources.remove(&old) {
+                s.sources.insert(new.clone(), file);
+            }
+            for c in &mut s.components {
+                if let ComponentKind::Mcu { firmware, .. } = &mut c.kind
+                    && *firmware == old
+                {
+                    *firmware = new.clone();
+                }
+            }
+            // The old name stays here too: undo can bring it back.
+            self.unwritten.insert(new.clone());
+            if self.hidden.contains(&old) {
+                self.hidden.insert(new.clone());
+            }
+            self.sync_tabs();
+            if in_front {
+                self.show_source(&new);
+            }
+        }
+    }
+
+    /// Note that every source file the circuit has is now on the disk.
+    pub fn sources_written(&mut self) {
+        for name in self.doc.schematic().sources.keys() {
+            self.unwritten.remove(name);
+        }
     }
 
     // ------------------------------------------------ derived results ---
