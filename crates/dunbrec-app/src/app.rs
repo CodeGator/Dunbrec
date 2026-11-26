@@ -32,11 +32,27 @@ use crate::settings::{STORAGE_KEY, Settings};
 const SHORTCUTS: &[(&str, &str)] = &[
     ("Ctrl+N / Ctrl+O / Ctrl+S", "New circuit, open, save"),
     ("Ctrl+W", "Close the circuit"),
+    (
+        "Ctrl+Tab / Ctrl+Shift+Tab",
+        "The next or previous open circuit",
+    ),
     ("Ctrl+Shift+S", "Save as"),
     ("Ctrl+Z / Ctrl+Y", "Undo, redo"),
     ("Ctrl+C / Ctrl+X / Ctrl+V", "Copy, cut, paste"),
     ("Ctrl+D", "Duplicate the selection"),
     ("Ctrl+A", "Select everything"),
+    ("Click a part or wire", "Select it"),
+    (
+        "Drag",
+        "Move the selection; from empty space, select with a box",
+    ),
+    ("Click a pin", "Start a wire from it"),
+    ("Drag a wire corner", "Reshape the wire"),
+    (
+        "Double-click while wiring",
+        "Finish the wire (it also ends on a pin or another wire)",
+    ),
+    ("Right-click while using a tool", "Stop using it"),
     ("Del", "Delete the selection"),
     ("R / X", "Rotate / mirror (selection or part being placed)"),
     (
@@ -89,6 +105,10 @@ enum Pending {
     CloseProject,
     /// Close one circuit, by its id (the project stays open).
     CloseCircuit(u32),
+    /// Close every open circuit.
+    CloseAll,
+    /// Close every open circuit but the one with this id.
+    CloseOthers(u32),
     /// Leave the open project (and its circuits) for another one.
     SwitchProject(ProjectTarget),
     Quit,
@@ -156,6 +176,9 @@ pub struct DunbrecApp {
     circuit_tab_rects: Vec<(u32, egui::Rect)>,
     /// The mouse button is down on a circuit tab.
     dragging_circuit: bool,
+    /// How many circuits Ctrl+Tab has asked to move on by (back, if
+    /// negative) since the last frame.
+    cycle_by: isize,
     /// Where the active circuit's own tabs were drawn, for tests to click.
     #[cfg(test)]
     file_tab_rects: Vec<(DocTab, egui::Rect)>,
@@ -358,6 +381,7 @@ impl DunbrecApp {
             next_id: 1,
             circuit_tab_rects: Vec::new(),
             dragging_circuit: false,
+            cycle_by: 0,
             #[cfg(test)]
             file_tab_rects: Vec::new(),
             shared_ask: None,
@@ -434,8 +458,14 @@ impl DunbrecApp {
                 .filter(|&i| self.circuits[i].doc.is_dirty())
                 .into_iter()
                 .collect(),
-            Pending::CloseProject | Pending::SwitchProject(_) | Pending::Quit => {
-                self.dirty_circuits()
+            Pending::CloseProject
+            | Pending::CloseAll
+            | Pending::SwitchProject(_)
+            | Pending::Quit => self.dirty_circuits(),
+            Pending::CloseOthers(keep) => {
+                let mut dirty = self.dirty_circuits();
+                dirty.retain(|&i| self.circuits[i].id != *keep);
+                dirty
             }
             _ => Vec::new(),
         }
@@ -480,6 +510,8 @@ impl DunbrecApp {
                     self.close_circuit_at(index);
                 }
             }
+            Pending::CloseAll => self.close_all_circuits(),
+            Pending::CloseOthers(keep) => self.close_other_circuits(keep),
             Pending::SwitchProject(to) => {
                 self.close_project();
                 self.go_to_project(to);
@@ -998,6 +1030,47 @@ impl DunbrecApp {
         }
     }
 
+    /// Close every circuit but `keep`, which becomes the active one.
+    fn close_other_circuits(&mut self, keep: u32) {
+        let Some(index) = self.index_of(keep) else {
+            return;
+        };
+        self.switch_to(index);
+        for id in self.open_ids() {
+            if id != keep
+                && let Some(index) = self.index_of(id)
+            {
+                self.close_circuit_at(index);
+            }
+        }
+    }
+
+    /// Make the circuit `step` tabs along from the active one the active
+    /// circuit, going round at the ends.
+    fn cycle_circuits(&mut self, step: isize) {
+        let order = dock::circuit_order(&self.dock);
+        let id = self.active().id;
+        let Some(at) = order.iter().position(|&o| o == id) else {
+            return;
+        };
+        let to = (at as isize + step).rem_euclid(order.len() as isize) as usize;
+        if let Some(index) = self.index_of(order[to]) {
+            self.switch_to(index);
+        }
+    }
+
+    /// Whether a message or question is waiting for the user.
+    fn asking(&self) -> bool {
+        self.pending.is_some()
+            || self.message.is_some()
+            || self.confirm_delete.is_some()
+            || self.name_prompt.is_some()
+            || self.shared_ask.is_some()
+            || self.shared_edit.is_some()
+            || self.assign_ask.is_some()
+            || (self.circuit_open && self.active().canvas.has_label_request())
+    }
+
     /// Put the active circuit's tab in front, adding or removing circuit tabs
     /// as needed.
     fn show_active_tab(&mut self) {
@@ -1334,15 +1407,6 @@ impl DunbrecApp {
             C::OpenSchematic(path) => self.request(Pending::OpenPath(path)),
             C::OpenCircuitSource { circuit, name } => self.open_circuit_source(circuit, &name),
             C::AskAssign(file) => self.ask_assign(file),
-            C::OpenChip { circuit, chip } => self.open_chip(circuit, chip),
-            C::AskNewSource {
-                circuit,
-                chip,
-                who,
-                what,
-            } => {
-                self.name_prompt = Some(project_ui::NamePrompt::source(&circuit, chip, &who, what));
-            }
             C::CreateForChip {
                 circuit,
                 chip,
@@ -1400,19 +1464,6 @@ impl DunbrecApp {
         };
         if let Err(e) = project.add_files(&paths) {
             self.message = Some(Message::error("Could not update the project file", e));
-        }
-    }
-
-    /// Open the circuit in `circuit` with its microcontroller `chip` selected.
-    fn open_chip(&mut self, circuit: PathBuf, chip: dunbrec_core::ComponentId) {
-        self.request(Pending::OpenPath(circuit.clone()));
-        if let Some(index) = self.circuit_with_file(&circuit) {
-            self.switch_to(index);
-            let open = self.active_mut();
-            open.canvas.selection = [Item::Component(chip)].into_iter().collect();
-            if let Some(at) = open.tabs.find_tab(&DocTab::Schematic) {
-                open.tabs.set_active_tab(at);
-            }
         }
     }
 
@@ -1871,6 +1922,11 @@ impl DunbrecApp {
     // ---------------------------------------------------- shortcuts ---
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
+        // Ctrl+Tab works while typing too, but not past a question.
+        let step = std::mem::take(&mut self.cycle_by);
+        if step != 0 && self.circuit_open && !self.asking() {
+            self.cycle_circuits(step);
+        }
         if ctx.wants_keyboard_input() {
             return;
         }
@@ -1990,6 +2046,34 @@ impl DunbrecApp {
         self.start_sim_with(false);
     }
 
+    /// Before the user's own Build or Run: save the active circuit and its
+    /// source files, so that what is built is what is on the disk. A circuit
+    /// that has never been saved is built as it is, without asking for a name.
+    /// False if saving failed, which has been explained.
+    fn save_before_build(&mut self) -> bool {
+        let doc = &self.active().doc;
+        doc.path().is_none() || !doc.is_dirty() || self.save(false)
+    }
+
+    /// Run as the user asked (a restart the app makes by itself, after the
+    /// circuit is rewired, saves nothing).
+    fn run_pressed(&mut self, paused: bool) {
+        if self.save_before_build() {
+            self.start_sim_with(paused);
+        }
+    }
+
+    /// The Build button of a sketch.
+    fn build_pressed(&mut self, ctx: &egui::Context, name: &str) {
+        if !self.save_before_build() {
+            return;
+        }
+        let circuit = self.active_mut();
+        if let Some(file) = circuit.doc.schematic().sources.get(name) {
+            circuit.code.build_sketch(ctx, name, &file.text);
+        }
+    }
+
     /// Start the live simulation, optionally paused at time zero (for the
     /// debugger to step from the first instruction).
     fn start_sim_with(&mut self, paused: bool) {
@@ -2107,7 +2191,7 @@ impl DunbrecApp {
             return;
         }
         match &mut self.live {
-            None => self.start_sim(),
+            None => self.run_pressed(false),
             Some(live) if live.paused => live.send(Command::Resume),
             Some(live) => live.send(Command::Pause),
         }
@@ -2256,8 +2340,8 @@ impl DunbrecApp {
                         }
                     }
                     None => {
-                        if ui.button("▶ Run").on_hover_text("Start the live simulation (Space)").clicked() {
-                            self.start_sim();
+                        if ui.button("▶ Run").on_hover_text("Save the circuit and start the live simulation (Space)").clicked() {
+                            self.run_pressed(false);
                         }
                     }
                     Some(live) => {
@@ -2269,7 +2353,7 @@ impl DunbrecApp {
                             self.stop_sim();
                         }
                         if ui.button("↺ Restart").clicked() {
-                            self.start_sim();
+                            self.run_pressed(false);
                         }
                     }
                 }
@@ -2409,7 +2493,7 @@ impl DunbrecApp {
             self.debug_loaded = Some(circuit.netlist.0);
         }
         if self.debugger.window(ctx, &mut self.live) == DebugAction::StartPaused {
-            self.start_sim_with(true);
+            self.run_pressed(true);
         }
     }
 
@@ -2650,9 +2734,9 @@ impl DunbrecApp {
         if let Some(command) = project_command {
             self.run_project_command(command);
         }
-        for id in closing {
+        for action in closing {
             if self.pending.is_none() {
-                self.request(Pending::CloseCircuit(id));
+                self.request(action);
             }
         }
         if open_settings {
@@ -2665,15 +2749,42 @@ impl DunbrecApp {
         if let Some(request) = self.active_mut().properties.demo.take() {
             self.use_demo(ctx, request);
         }
-        if let Some(chip) = self.active_mut().properties.new_file.take() {
-            let text = if self.active().doc.schematic().sources.is_empty() {
-                crate::code_ui::STARTER
-            } else {
-                "; New assembly file\n"
-            };
-            let made = self
-                .active_mut()
-                .add_source(chip, "main", SourceLanguage::Asm, text);
+        if let Some(name) = self.active_mut().code.take_build_request() {
+            self.build_pressed(ctx, &name);
+        }
+        if let Some((chip, language)) = self.active_mut().properties.new_file.take() {
+            self.new_source_for(chip, language);
+        }
+    }
+
+    /// Give a chip of the active circuit a new source file: ask for its name,
+    /// or, while the circuit has no folder yet, keep it in memory under the
+    /// first free one until the circuit is saved.
+    fn new_source_for(&mut self, chip: dunbrec_core::ComponentId, language: SourceLanguage) {
+        let (what, base, text) = match language {
+            SourceLanguage::Cpp => (
+                project_ui::Create::Sketch,
+                "sketch",
+                crate::code_ui::STARTER_SKETCH,
+            ),
+            SourceLanguage::Asm => (
+                project_ui::Create::Assembly,
+                "main",
+                crate::code_ui::STARTER,
+            ),
+        };
+        let circuit = self.active();
+        if let Some(path) = circuit.doc.path() {
+            let designator = circuit
+                .doc
+                .schematic()
+                .component(chip)
+                .map(|c| c.designator.clone())
+                .unwrap_or_default();
+            let who = format!("{designator} in {}", circuit.name());
+            self.name_prompt = Some(project_ui::NamePrompt::source(path, chip, &who, what));
+        } else {
+            let made = self.active_mut().add_source(chip, base, language, text);
             self.take_new_file(made);
         }
     }
@@ -2974,6 +3085,9 @@ impl DunbrecApp {
                         ui.close();
                     }
                 });
+                ui.menu_button("Window", |ui| {
+                    self.window_menu(ui);
+                });
                 ui.menu_button("Help", |ui| {
                     if ui.button("Keyboard shortcuts").clicked() {
                         self.show_shortcuts = true;
@@ -2986,6 +3100,53 @@ impl DunbrecApp {
                 });
             });
         });
+    }
+
+    /// Moving between the open circuits, closing them, and the list of them.
+    fn window_menu(&mut self, ui: &mut egui::Ui) {
+        let order = dock::circuit_order(&self.dock);
+        let several = order.len() > 1;
+        let active = self.active().id;
+        for (label, step) in [
+            ("Next circuit   Ctrl+Tab", 1),
+            ("Previous circuit   Ctrl+Shift+Tab", -1),
+        ] {
+            if ui.add_enabled(several, egui::Button::new(label)).clicked() {
+                self.cycle_circuits(step);
+                ui.close();
+            }
+        }
+        ui.separator();
+        if ui
+            .add_enabled(several, egui::Button::new("Close all but this one"))
+            .clicked()
+        {
+            self.request(Pending::CloseOthers(active));
+            ui.close();
+        }
+        if ui
+            .add_enabled(self.circuit_open, egui::Button::new("Close all circuits"))
+            .clicked()
+        {
+            self.request(Pending::CloseAll);
+            ui.close();
+        }
+        ui.separator();
+        if !self.circuit_open {
+            ui.label(RichText::new("No circuit open").weak());
+        }
+        for id in order {
+            let Some(index) = self.index_of(id) else {
+                continue;
+            };
+            let circuit = &self.circuits[index];
+            let dot = if circuit.doc.is_dirty() { " •" } else { "" };
+            let name = format!("{}{dot}", circuit.name());
+            if ui.selectable_label(index == self.active, name).clicked() {
+                self.switch_to(index);
+                ui.close();
+            }
+        }
     }
 
     fn dialogs(&mut self, ctx: &egui::Context) {
@@ -3190,45 +3351,52 @@ impl DunbrecApp {
                 .collapsible(false)
                 .resizable(false)
                 .show(ctx, |ui| {
-                    egui::Grid::new("shortcuts").striped(true).show(ui, |ui| {
-                        for (keys, what) in SHORTCUTS {
-                            ui.monospace(*keys);
-                            ui.label(*what);
-                            ui.end_row();
-                        }
-                    });
+                    let tallest = ctx.content_rect().height() * 0.75;
+                    egui::ScrollArea::vertical()
+                        .max_height(tallest)
+                        .show(ui, |ui| {
+                            egui::Grid::new("shortcuts").striped(true).show(ui, |ui| {
+                                for (keys, what) in SHORTCUTS {
+                                    ui.monospace(*keys);
+                                    ui.label(*what);
+                                    ui.end_row();
+                                }
+                            });
+                        });
                 });
             self.show_shortcuts = open;
         }
     }
 
+    /// The bar along the bottom: how to use the tool in hand, if it is not
+    /// plain selecting, and the zoom of the schematic. Empty with no circuit
+    /// open. (It also takes the colour of a running simulation.)
     fn status_bar(&self, ctx: &egui::Context) {
         let frame = self.run_frame(ctx);
-        egui::TopBottomPanel::bottom("status").frame(frame).show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                let hint = match &self.active().canvas.tool {
-                    Tool::Select => "Click to select · click a pin to start a wire · drag a wire corner to reshape it · drag to move · drag empty space to box-select · R rotate · X mirror · Del delete",
-                    Tool::Place { .. } => "Click to place · R rotate · X mirror · Esc or right-click to stop",
-                    Tool::Wire => "Click to start a wire (a part's body selects it instead), click to bend · ends on a pin or wire, not inside a part · double-click, Esc or right-click to stop",
-                    Tool::Label => "Click on a wire or pin to name that net",
-                    Tool::Probe => "Click a wire or pin to connect the chosen instrument input (a part, for current) · Esc to stop",
-                };
-                // The right-hand end is placed first; the hint for the tool
-                // gets what is left, and is cut short rather than run under
-                // it. (Pointing at it then shows the whole of it.)
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(format!(
-                        "{:.0}%",
-                        self.active().canvas.camera.scale / 14.0 * 100.0
-                    ));
-                    ui.label(RichText::new("Wheel: scroll · Ctrl+wheel: zoom").weak());
-                    ui.add_space(12.0);
-                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                        ui.add(egui::Label::new(RichText::new(hint).weak()).truncate());
+        egui::TopBottomPanel::bottom("status")
+            .frame(frame)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    // As tall empty as full, so that nothing above it moves.
+                    ui.set_min_height(ui.spacing().interact_size.y);
+                    if !self.circuit_open {
+                        return;
+                    }
+                    let canvas = &self.active().canvas;
+                    // The zoom is placed first; the hint gets what is left,
+                    // and is cut short rather than run under it. (Pointing at
+                    // it then shows the whole of it.)
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(format!("{:.0}%", canvas.camera.scale / 14.0 * 100.0));
+                        ui.add_space(12.0);
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            if let Some(hint) = tool_hint(&canvas.tool) {
+                                ui.add(egui::Label::new(hint).truncate());
+                            }
+                        });
                     });
                 });
             });
-        });
     }
 }
 
@@ -3322,6 +3490,17 @@ pub(crate) fn describe_diagnostic(schematic: &Schematic, d: &Diagnostic) -> Stri
             format!("More than one part is called {designator}.")
         }
     }
+}
+
+/// How to use `tool`, for the bar along the bottom; selecting needs no words.
+fn tool_hint(tool: &Tool) -> Option<&'static str> {
+    Some(match tool {
+        Tool::Select => return None,
+        Tool::Place { .. } => "Click to place. R rotates, X mirrors. Esc to stop.",
+        Tool::Wire => "Wire: click to start, click to bend. Esc to stop.",
+        Tool::Label => "Click a wire or pin to name it. Esc to stop.",
+        Tool::Probe => "Click a wire, pin or part to connect. Esc to stop.",
+    })
 }
 
 /// Placing junctions: what the J key picks.
@@ -3567,8 +3746,8 @@ struct PaneViewer<'a> {
     active_id: u32,
     tabs: &'a mut DockState<DocTab>,
     hidden: &'a mut std::collections::BTreeSet<String>,
-    /// Circuits whose tabs the user closed this frame.
-    closing: &'a mut Vec<u32>,
+    /// Closing the user asked for from the circuit tabs this frame.
+    closing: &'a mut Vec<Pending>,
     tab_rects: &'a mut Vec<(u32, egui::Rect)>,
     #[cfg(test)]
     file_tab_rects: &'a mut Vec<(DocTab, egui::Rect)>,
@@ -3715,10 +3894,30 @@ impl TabViewer for PaneViewer<'_> {
     /// changes; the tab itself is taken out by the circuit closing.
     fn on_close(&mut self, tab: &mut Pane) -> OnCloseResponse {
         if let Pane::Circuit(id) = *tab {
-            self.closing.push(id);
+            self.closing.push(Pending::CloseCircuit(id));
             OnCloseResponse::Ignore
         } else {
             OnCloseResponse::Close
+        }
+    }
+
+    /// A circuit tab's menu closes more than the one tab as well.
+    fn context_menu(
+        &mut self,
+        ui: &mut egui::Ui,
+        tab: &mut Pane,
+        _surface: egui_dock::SurfaceIndex,
+        _node: egui_dock::NodeIndex,
+    ) {
+        let Pane::Circuit(id) = *tab else { return };
+        let others = egui::Button::new("Close all but this one");
+        if ui.add_enabled(self.circuits.len() > 1, others).clicked() {
+            self.closing.push(Pending::CloseOthers(id));
+            ui.close();
+        }
+        if ui.button("Close all").clicked() {
+            self.closing.push(Pending::CloseAll);
+            ui.close();
         }
     }
 
@@ -3868,6 +4067,27 @@ impl TabViewer for DocViewer<'_> {
 }
 
 impl eframe::App for DunbrecApp {
+    /// Ctrl+Tab is taken out before egui sees it: it would move the keyboard
+    /// focus, or type a tab into a source file.
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, input: &mut egui::RawInput) {
+        let mut step = 0;
+        input.events.retain(|event| match event {
+            egui::Event::Key {
+                key: Key::Tab,
+                pressed,
+                modifiers,
+                ..
+            } if modifiers.ctrl => {
+                if *pressed {
+                    step += if modifiers.shift { -1 } else { 1 };
+                }
+                false
+            }
+            _ => true,
+        });
+        self.cycle_by += step;
+    }
+
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, STORAGE_KEY, &self.settings);
         eframe::set_value(storage, LAYOUT_KEY, &self.dock);
@@ -4003,12 +4223,13 @@ mod tests {
             use eframe::App as _;
             self.time += 0.1;
             let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 900.0));
-            let input = egui::RawInput {
+            let mut input = egui::RawInput {
                 screen_rect: Some(screen),
                 time: Some(self.time),
                 events,
                 ..Default::default()
             };
+            self.app.raw_input_hook(&self.ctx, &mut input);
             let app = &mut self.app;
             let mut frame = eframe::Frame::_new_kittest();
             let out = self.ctx.run(input, |ctx| app.update(ctx, &mut frame));
@@ -5106,85 +5327,364 @@ mod tests {
     }
 
     #[test]
-    fn a_chip_without_a_file_is_given_a_new_one() {
+    fn a_new_file_is_made_from_the_chips_properties() {
         let mut f = fixture("new-for-chip");
-        assert!(shows(&f, "· U1: built-in blink"));
-        menu_of(&mut f, "· U1: built-in blink");
-        f.rig.click("New assembly file…");
-        assert!(f.rig.app.name_prompt.is_some());
-        f.rig.click("Create");
-        assert_eq!(f.rig.open_names(), ["Blink"]);
-        assert_eq!(firmware_of(&f), "main.asm");
-        assert!(f.root.join("main.asm").is_file());
-        assert!(
+        // A chip without a file is nothing to show in the project.
+        let under_blink = |f: &Fixture| {
             f.rig
-                .app
-                .project
-                .as_ref()
-                .unwrap()
-                .contains(&f.root.join("main.asm"))
-        );
+                .seen
+                .iter()
+                .any(|(text, _)| text.contains("U1:") || text.contains("no program"))
+        };
+        assert!(!under_blink(&f), "{:?}", f.rig.seen);
+        f.open(&f.blink.clone());
+        let chip = f.chip();
+        f.rig.app.active_mut().canvas.selection = [Item::Component(chip)].into_iter().collect();
+        f.rig.settle();
+        for (item, file) in [
+            ("New assembly file…", "main.asm"),
+            ("New Arduino sketch…", "sketch.ino"),
+        ] {
+            f.rig.click("Source file");
+            f.rig.click(item);
+            assert!(shows(&f, "Name of the new file for U1 in Blink:"));
+            f.rig.click("Create");
+            assert_eq!(firmware_of(&f), file);
+            assert!(f.root.join(file).is_file());
+            assert!(
+                f.rig
+                    .app
+                    .project
+                    .as_ref()
+                    .unwrap()
+                    .contains(&f.root.join(file))
+            );
+            assert!(f.rig.app.active().is_in_front(&DocTab::Source(file.into())));
+            assert!(shows(&f, &format!("📝 U1: {file}")));
+            assert!(f.rig.app.shared_edit.is_none() && f.rig.app.message.is_none());
+        }
+        // Removing the file leaves just the circuit.
+        menu_of(&mut f, "📝 U1: sketch.ino");
+        f.rig.click("Remove from project");
+        f.rig.click("Remove");
+        assert!(!shows(&f, "📝 U1: sketch.ino") && !under_blink(&f) || shows(&f, "Not used"));
+        assert_eq!(firmware_of(&f), "");
+        assert!(f.root.join("sketch.ino").is_file());
+        // A circuit with no file yet keeps the new one until it is saved.
+        f.rig.app.request(Pending::Example(8));
+        f.rig.settle();
+        let chip = f.chip();
+        f.rig.app.new_source_for(chip, SourceLanguage::Asm);
+        assert!(f.rig.app.name_prompt.is_none());
         assert!(
             f.rig
                 .app
                 .active()
-                .is_in_front(&DocTab::Source("main.asm".into()))
+                .doc
+                .schematic()
+                .sources
+                .contains_key("main.asm")
         );
-        assert!(shows(&f, "📝 U1: main.asm"));
-        assert!(f.rig.app.shared_edit.is_none() && f.rig.app.message.is_none());
-        // Removing the file leaves the chip's row, with no program.
-        menu_of(&mut f, "📝 U1: main.asm");
-        f.rig.click("Remove from project");
-        f.rig.click("Remove");
-        assert!(shows(&f, "· U1: no program"));
-        assert!(f.root.join("main.asm").is_file());
+    }
+
+    fn ctrl_tab(rig: &mut Rig, shift: bool) {
+        let modifiers = Modifiers {
+            ctrl: true,
+            command: true,
+            shift,
+            ..Default::default()
+        };
+        for pressed in [true, false] {
+            rig.frame(vec![egui::Event::Key {
+                key: Key::Tab,
+                physical_key: None,
+                pressed,
+                repeat: false,
+                modifiers,
+            }]);
+        }
+        rig.settle();
+    }
+
+    /// "Blink", "Divider" and an example, in that order, the last in front.
+    fn three_open(tag: &str) -> (Fixture, String) {
+        let mut f = fixture(tag);
+        f.open_both();
+        f.rig.app.request(Pending::Example(1));
+        f.rig.settle();
+        let third = f.rig.active_name();
+        (f, third)
     }
 
     #[test]
-    fn the_hints_along_the_bottom_never_overlap() {
-        let mut f = fixture("status");
-        f.open(&f.blink.clone());
-        for width in [700.0, 1000.0, 2400.0] {
-            let ctx = egui::Context::default();
-            ctx.enable_accesskit();
-            let mut bounds = Vec::new();
-            for _ in 0..3 {
-                let input = egui::RawInput {
-                    screen_rect: Some(egui::Rect::from_min_size(
-                        egui::Pos2::ZERO,
-                        egui::vec2(width, 600.0),
-                    )),
-                    ..Default::default()
-                };
-                let out = ctx.run(input, |ctx| f.rig.app.status_bar(ctx));
-                if let Some(update) = out.platform_output.accesskit_update {
-                    bounds = update
-                        .nodes
-                        .iter()
-                        // Not the runs of text inside each label, which are placed
-                        // as if every line began at its left edge.
-                        .filter(|(_, n)| n.role() != egui::accesskit::Role::TextRun)
-                        .filter_map(|(_, n)| {
-                            let text = n.label().or_else(|| n.value())?.to_string();
-                            let b = n.bounds()?;
-                            Some((text, b.x0, b.x1))
-                        })
-                        .collect();
-                }
+    fn ctrl_tab_goes_round_the_circuits_in_tab_order() {
+        let (mut f, third) = three_open("cycle");
+        ctrl_tab(&mut f.rig, false);
+        assert_eq!(f.rig.active_name(), "Blink", "round from the last");
+        ctrl_tab(&mut f.rig, false);
+        assert_eq!(f.rig.active_name(), "Divider");
+        ctrl_tab(&mut f.rig, true);
+        ctrl_tab(&mut f.rig, true);
+        assert_eq!(f.rig.active_name(), third, "and back round");
+        // The order is the tabs', wherever they have been dragged.
+        let from = f.rig.circuit_tab(&third);
+        let to = f.rig.circuit_tab("Blink") - egui::vec2(20.0, 0.0);
+        f.rig.drag(from, to);
+        assert_eq!(
+            dock::circuit_order(&f.rig.app.dock)[0],
+            f.rig.app.active().id
+        );
+        ctrl_tab(&mut f.rig, false);
+        assert_eq!(f.rig.active_name(), "Blink");
+    }
+
+    #[test]
+    fn ctrl_tab_leaves_the_text_alone_stops_the_run_and_waits_for_questions() {
+        let mut f = fixture("cycle-typing");
+        f.open_both();
+        f.rig.click_circuit("Blink");
+        f.give_the_chip_a_file();
+        let text = f.rig.app.active().doc.schematic().sources["blink.asm"]
+            .text
+            .clone();
+        // Put the cursor in the source file.
+        f.rig
+            .click_at(egui::pos2(700.0, 400.0), egui::PointerButton::Primary);
+        assert!(f.rig.ctx.wants_keyboard_input(), "typing");
+        ctrl_tab(&mut f.rig, false);
+        assert_eq!(f.rig.active_name(), "Divider");
+        ctrl_tab(&mut f.rig, false);
+        assert_eq!(
+            f.rig.app.active().doc.schematic().sources["blink.asm"].text,
+            text
+        );
+        f.rig.click(" Run");
+        assert!(f.rig.app.live.is_some(), "{:?}", f.rig.app.live_error);
+        ctrl_tab(&mut f.rig, false);
+        assert!(f.rig.app.live.is_none());
+        // Not while a question is up.
+        f.add_a_resistor();
+        f.rig.app.request(Pending::Quit);
+        f.rig.settle();
+        let before = f.rig.active_name();
+        ctrl_tab(&mut f.rig, false);
+        assert_eq!(f.rig.active_name(), before);
+    }
+
+    #[test]
+    fn the_window_menu_lists_the_circuits_and_goes_to_them() {
+        let (mut f, third) = three_open("window");
+        f.rig.click("Window");
+        for item in [
+            "Next circuit   Ctrl+Tab",
+            "Previous circuit   Ctrl+Shift+Tab",
+            "Close all but this one",
+            "Close all circuits",
+            "Blink",
+            "Divider",
+        ] {
+            assert!(shows(&f, item), "{item}: {:?}", f.rig.seen);
+        }
+        assert!(shows(&f, &third));
+        f.rig.click("Divider");
+        assert_eq!(f.rig.active_name(), "Divider");
+        f.rig.click("Window");
+        f.rig.click("Close all but this one");
+        assert_eq!(f.rig.open_names(), ["Divider"]);
+        f.rig.click("Window");
+        f.rig.click("Close all circuits");
+        assert!(f.rig.open_names().is_empty());
+        f.rig.click("Window");
+        assert!(shows(&f, "No circuit open"));
+    }
+
+    #[test]
+    fn a_tab_menu_closes_the_others_or_all_asking_once() {
+        let (mut f, third) = three_open("tab-menu");
+        let secondary = egui::PointerButton::Secondary;
+        // Two unsaved circuits; keeping one of them asks only about the other.
+        f.rig.click_circuit("Blink");
+        f.add_a_resistor();
+        f.rig.click_circuit("Divider");
+        f.add_a_resistor();
+        let at = f.rig.circuit_tab("Divider");
+        f.rig.click_at(at, secondary);
+        f.rig.click("Close all but this one");
+        assert!(shows(
+            &f,
+            "“Blink” has unsaved changes. Keep editing or discard those changes?"
+        ));
+        f.rig.click("Keep editing");
+        assert_eq!(f.rig.open_names().len(), 3);
+        // Closing all asks about both together.
+        let at = f.rig.circuit_tab(&third);
+        f.rig.click_at(at, secondary);
+        f.rig.click("Close all");
+        assert!(shows(&f, "These circuits have unsaved changes:"));
+        f.rig.click("Cancel");
+        assert_eq!(f.rig.open_names().len(), 3);
+        let blink = Fixture::parts(&f.blink);
+        let at = f.rig.circuit_tab(&third);
+        f.rig.click_at(at, secondary);
+        f.rig.click("Close all");
+        f.rig.click("Save all");
+        assert!(f.rig.open_names().is_empty() && !f.rig.app.circuit_open);
+        assert_eq!(Fixture::parts(&f.blink), blink + 1);
+    }
+
+    /// What the bar along the bottom shows in a window `width` wide: each
+    /// text and where it starts and ends.
+    fn bottom_bar(app: &DunbrecApp, width: f32) -> Vec<(String, f64, f64)> {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut shown = Vec::new();
+        for _ in 0..3 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, 600.0),
+                )),
+                ..Default::default()
+            };
+            let out = ctx.run(input, |ctx| app.status_bar(ctx));
+            if let Some(update) = out.platform_output.accesskit_update {
+                shown = update
+                    .nodes
+                    .iter()
+                    // Not the runs of text inside each label, which are
+                    // placed as if every line began at its left edge.
+                    .filter(|(_, n)| n.role() != egui::accesskit::Role::TextRun)
+                    .filter_map(|(_, n)| {
+                        let text = n.label().or_else(|| n.value())?.to_string();
+                        let b = n.bounds()?;
+                        Some((text, b.x0, b.x1))
+                    })
+                    .collect();
             }
+        }
+        shown
+    }
+
+    #[test]
+    fn the_bottom_bar_says_only_what_helps() {
+        let mut f = fixture("status");
+        assert!(bottom_bar(&f.rig.app, 1000.0).is_empty(), "no circuit");
+        f.open(&f.blink.clone());
+        let selecting = bottom_bar(&f.rig.app, 1000.0);
+        assert_eq!(selecting.len(), 1, "{selecting:?}");
+        assert_eq!(selecting[0].0, "100%");
+        f.rig.app.active_mut().canvas.tool = Tool::Wire;
+        for width in [300.0, 1000.0] {
+            let shown = bottom_bar(&f.rig.app, width);
+            assert_eq!(shown.len(), 2, "{shown:?}");
             let of = |start: &str| {
-                bounds
+                shown
                     .iter()
                     .find(|(text, ..)| text.starts_with(start))
-                    .unwrap_or_else(|| panic!("no {start:?} at {width}: {bounds:?}"))
+                    .unwrap_or_else(|| panic!("no {start:?} at {width}: {shown:?}"))
             };
-            let (hint, wheel, zoom) = (of("Click to select"), of("Wheel:"), of("100%"));
-            assert!(hint.2 <= wheel.1, "{width}: {hint:?} runs into {wheel:?}");
-            assert!(
-                wheel.2 <= zoom.1 && zoom.2 <= f64::from(width),
-                "{width}: {bounds:?}"
-            );
+            let (hint, zoom) = (of("Wire: click to start"), of("100%"));
+            assert!(hint.2 <= zoom.1, "{width}: {shown:?}");
+            assert!(zoom.2 <= f64::from(width), "{width}: {shown:?}");
         }
+    }
+
+    #[test]
+    fn every_tool_but_selecting_has_a_hint() {
+        assert_eq!(tool_hint(&Tool::Select), None);
+        for tool in [Tool::Wire, Tool::Label, Tool::Probe, junction_tool()] {
+            assert!(tool_hint(&tool).is_some_and(|h| h.ends_with("Esc to stop.")));
+        }
+    }
+
+    /// Change the active circuit's source file `name` as typing would.
+    fn type_into(f: &mut Fixture, name: &str, line: &str) {
+        f.rig.app.active_mut().doc.edit(|s| {
+            s.sources.get_mut(name).unwrap().text.push_str(line);
+        });
+        f.rig.settle();
+    }
+
+    #[test]
+    fn run_saves_the_circuit_and_its_files_first() {
+        let mut f = fixture("save-run");
+        f.open(&f.blink.clone());
+        f.give_the_chip_a_file();
+        type_into(&mut f, "blink.asm", "; typed\n");
+        assert!(f.rig.app.active().doc.is_dirty());
+        f.rig.click(" Run");
+        assert!(f.rig.app.live.is_some(), "{:?}", f.rig.app.live_error);
+        assert!(!f.rig.app.active().doc.is_dirty());
+        let file = f.root.join("blink.asm");
+        let on_disk = || std::fs::read_to_string(&file).unwrap();
+        assert!(on_disk().ends_with("; typed\n"));
+        let saved = dunbrec_io::dbr::load(&f.blink).unwrap();
+        assert_eq!(
+            project::code_of(&saved, &f.blink).chips[0].firmware,
+            "blink.asm"
+        );
+        // A restart the app makes by itself, for new wiring, saves nothing.
+        let parts = Fixture::parts(&f.blink);
+        f.add_a_resistor();
+        f.rig.settle();
+        assert!(f.rig.app.active().doc.is_dirty());
+        assert_eq!(Fixture::parts(&f.blink), parts);
+        // Restart is the user's doing.
+        f.rig.app.run_pressed(false);
+        f.rig.settle();
+        assert_eq!(Fixture::parts(&f.blink), parts + 1);
+    }
+
+    #[test]
+    fn build_saves_first_even_if_the_build_then_fails() {
+        let mut f = fixture("save-build");
+        f.open(&f.blink.clone());
+        let chip = f.chip();
+        let ctx = f.rig.ctx.clone();
+        f.rig.app.use_demo(
+            &ctx,
+            DemoRequest {
+                chip,
+                demo: "blink",
+                language: SourceLanguage::Cpp,
+            },
+        );
+        // The build the demo starts has to be over for the button to work.
+        let started = std::time::Instant::now();
+        while f.rig.app.active().code.is_building() {
+            assert!(started.elapsed().as_secs() < 180, "the build never ended");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            f.rig.frame(vec![]);
+        }
+        type_into(&mut f, "blink.ino", "this is not C++\n");
+        assert!(f.rig.app.active().doc.is_dirty());
+        f.rig.click("Build");
+        assert!(!f.rig.app.active().doc.is_dirty());
+        let on_disk = std::fs::read_to_string(f.root.join("blink.ino")).unwrap();
+        assert!(on_disk.ends_with("this is not C++\n"));
+    }
+
+    #[test]
+    fn nothing_runs_if_the_circuit_cannot_be_saved() {
+        let mut f = fixture("save-fails");
+        f.open(&f.blink.clone());
+        f.add_a_resistor();
+        let nowhere = f.root.join("no such folder").join("x.dbr");
+        f.rig.app.active_mut().doc.set_path(nowhere);
+        f.rig.app.run_pressed(false);
+        assert!(f.rig.app.live.is_none());
+        assert!(f.rig.app.message.is_some());
+    }
+
+    #[test]
+    fn a_circuit_never_saved_runs_without_asking_for_a_name() {
+        let mut f = fixture("save-untitled");
+        f.rig.app.request(Pending::Example(0));
+        f.rig.settle();
+        f.add_a_resistor();
+        // A Save dialog here would hang the test.
+        assert!(f.rig.app.save_before_build());
+        assert!(f.rig.app.active().doc.path().is_none());
     }
 
     #[test]

@@ -3,7 +3,7 @@
 State of the project for whoever picks it up next. User-facing documentation is in
 [README.md](README.md); this file covers status, decisions and open work.
 
-*Last updated: 2026-11-26, version 0.5.0 in progress (0.4.0 released: assistant, settings, message boxes, project behaviour). Next task: the multi-document editor, designed in [docs/multi-document-editor.md](docs/multi-document-editor.md): both rows of tabs built, not yet tried by hand.*
+*Last updated: 2026-11-26, version 0.5.0 in progress (0.4.0 released: assistant, settings, message boxes, project behaviour). The multi-document editor, designed in [docs/multi-document-editor.md](docs/multi-document-editor.md), is built (all stages).*
 
 ## Status
 
@@ -31,7 +31,7 @@ drafts the GitHub release (see `.github/workflows/release.yml`).
 | 0.5.0 (in progress) | Projects screen (nothing else shown without a project); assistant draws new circuits with real wires and can add sine sources; no circuit open until one is opened; a central area that never collapses; closable schematic tab. See "0.5.0" below |
 | 0.4.0 | Settings dialog; Assistant (Ollama or Claude); pop-out instruments; text size; every confirmation a message box; Code panel tabs; project behaviour changes. See "0.4.0" below |
 
-Health at handoff: `cargo test --workspace` 475 passed, 0 failed (2 ignored: a real Recycle Bin check and an
+Health at handoff: `cargo test --workspace` 484 passed, 0 failed (2 ignored: a real Recycle Bin check and an
 emulator speed
 benchmark); `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --check`
 clean. Toolchain: Rust 1.99 (edition 2024, MSRV 1.90), Windows 11.
@@ -336,6 +336,10 @@ two sources and its compiled-in program behaving alike (tests in `demos.rs`).
 a pinch zooms, middle-drag and the two scroll bars move the view (`Canvas::scroll_bars`; the bars
 cover `scroll_extent`: the drawing plus half a screen, and what is in view).
 
+**Build and Run save first** (`save_before_build`, the user's choice): `run_pressed` for every
+run the user asks for, `build_pressed` for the Build button. The app's own restarts
+(`sync_live`) and the build a new demo starts save nothing.
+
 **Run builds sketches first.** `start_sim_with` finds unbuilt ones (`unbuilt_sketches`,
 `dunbrec_sim::unbuilt_sketch`) and sets `run_after_build`; `continue_run` builds them one by one
 through the circuit's `CodeEditor`, then starts, or shows the failing file and a message.
@@ -373,10 +377,13 @@ the demos look dead: blink changed every 12 s). `sync_speed` tells a running sim
   `ask_assign` / `assign` give an unused file to a chip, moving any unsaved text with it.
 - *No close-all buttons* on the outer dock's tab bars (the user found them confusing: they closed
   a whole group). Each tab keeps its own close button; the collapse triangle stays.
+- *Status bar* (the user could not read the old one): only `tool_hint` for a tool other than
+  Select, and the zoom; nothing with no circuit. Mouse gestures are listed in Help > Keyboard
+  shortcuts (`SHORTCUTS`).
 - *Menus:* circuits, files and folders share `project_ui::item_menu` (Open, Rename, Remove from
-  project, Delete from disk). Under a circuit every chip has a row (`code_rows`); one without a
-  source file offers a new one. Source files are only made for a chip; there is no "New folder"
-  or File > New submenu.
+  project, Delete from disk). Under a circuit are only its source files (the user's decision: a
+  chip without one is not worth showing). New files are made from the chip's properties
+  (`new_source_for`); there is no "New folder" or File > New submenu.
 - *Removing and deleting:* `project::removal` says which source files go with a circuit (those no
   other circuit uses). Deleting uses the `trash` crate (Recycle Bin; tests remove for real instead,
   see `discard`). Either way the chips that ran a file that goes are cleared
@@ -385,8 +392,11 @@ the demos look dead: blink changed every 12 s). `sync_speed` tells a running sim
 - *Nothing is reported about unopened circuits* (the user's decision): the red "lost file" and
   amber "shared" marks show only for open circuits (`project_ui::View::open`), and with none open
   Properties, Checks and Values say "No circuit open" instead of describing the blank placeholder.
-- *Not done:* Ctrl+Tab and a list of open circuits, "Close all". The assistant's new-file
-  suggestions can still write over a file of the same name.
+- *Moving between circuits (stage 5):* Ctrl+Tab is taken from the raw input
+  (`raw_input_hook`, so egui neither moves focus nor types a tab) and applied by `shortcuts`
+  unless a question is up. `window_menu`; `Pending::CloseAll` / `CloseOthers`.
+- *Not done:* reopening the last circuits when a project opens (the design's "maybe"). The
+  assistant's new-file suggestions can still write over a file of the same name.
 
 ## Gotchas
 

@@ -30,9 +30,9 @@ pub struct Properties {
     /// A demo program the user asked to have a copy of; the app makes the
     /// file and clears this.
     pub demo: Option<DemoRequest>,
-    /// A microcontroller the user asked to give a new assembly file; the app
-    /// makes it and clears this.
-    pub new_file: Option<ComponentId>,
+    /// A microcontroller the user asked to give a new source file, and in
+    /// which language; the app makes it and clears this.
+    pub new_file: Option<(ComponentId, SourceLanguage)>,
 }
 
 /// A microcontroller asking for its own copy of a demo program.
@@ -376,9 +376,13 @@ impl Properties {
                                         changed = true;
                                     }
                                 }
-                                if ui.selectable_label(false, "New assembly file…").clicked()
-                                {
-                                    self.new_file = Some(id);
+                                for (language, label) in [
+                                    (SourceLanguage::Cpp, "New Arduino sketch…"),
+                                    (SourceLanguage::Asm, "New assembly file…"),
+                                ] {
+                                    if ui.selectable_label(false, label).clicked() {
+                                        self.new_file = Some((id, language));
+                                    }
                                 }
                             });
                         ui.end_row();

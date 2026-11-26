@@ -397,6 +397,9 @@ pub struct CodeEditor {
     built: BTreeMap<String, Built>,
     /// A sketch being compiled on a worker thread.
     building: Option<Building>,
+    /// The sketch whose Build button was pressed; the app saves the circuit
+    /// and then has it built.
+    wanted: Option<String>,
     /// The last finished build of each sketch.
     cpp: BTreeMap<String, CppBuild>,
     /// A place (file, line, column) to move the cursor to on the next frame.
@@ -462,6 +465,11 @@ impl CodeEditor {
             text: text.to_string(),
             rx,
         });
+    }
+
+    /// The sketch the user asked to build, once.
+    pub fn take_build_request(&mut self) -> Option<String> {
+        self.wanted.take()
     }
 
     /// Whether a sketch is being compiled.
@@ -634,13 +642,12 @@ impl CodeEditor {
         if ui
             .add_enabled(!building, egui::Button::new("Build"))
             .on_hover_text(
-                "Compile this sketch with arduino-cli, to check it. Run also builds it \
-                 first if it has changed.",
+                "Save the circuit, then compile this sketch with arduino-cli to check \
+                 it. Run also does this if the sketch has changed.",
             )
             .clicked()
         {
-            let ctx = ui.ctx().clone();
-            self.start_build(&ctx, name, text);
+            self.wanted = Some(name.to_string());
         }
         if building {
             ui.spinner();

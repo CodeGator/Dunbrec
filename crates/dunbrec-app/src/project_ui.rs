@@ -6,12 +6,12 @@
 
 use std::path::{Path, PathBuf};
 
-use dunbrec_core::{ComponentId, SOURCE_PREFIX, source_language_of};
+use dunbrec_core::ComponentId;
 use egui::{Color32, RichText, Ui};
 
 use crate::dialog::{self, Dialog};
 use crate::project::{
-    Chip, CircuitCode, Entry, EntryKind, Project, Use, path_eq, relative_to, valid_name,
+    CircuitCode, Entry, EntryKind, Project, Use, path_eq, relative_to, valid_name,
 };
 
 /// What a new item is.
@@ -82,20 +82,8 @@ pub enum Command {
         dir: PathBuf,
         name: String,
     },
-    /// Open a circuit with one of its microcontrollers selected.
-    OpenChip {
-        circuit: PathBuf,
-        chip: ComponentId,
-    },
-    /// The user chose to give a microcontroller a new source file; the app
-    /// asks for its name and then sends [`Command::CreateForChip`].
-    AskNewSource {
-        circuit: PathBuf,
-        chip: ComponentId,
-        /// "U1 in Blink", for the question.
-        who: String,
-        what: Create,
-    },
+    /// Make a new source file for a microcontroller (asked for in the chip's
+    /// properties, and named in a [`NamePrompt`]).
     CreateForChip {
         circuit: PathBuf,
         chip: ComponentId,
@@ -319,16 +307,13 @@ impl ProjectPanel {
                     out = Some(command);
                 }
             });
+            // Only a circuit with source files has anything under it.
             if let Some(code) = view.code.iter().find(|c| same(&c.circuit, &e.path))
-                && !code.chips.is_empty()
+                && !code.uses.is_empty()
             {
                 ui.indent(("code", &e.path), |ui| {
-                    for row in code_rows(code) {
-                        let command = match row {
-                            CodeRow::File(u) => self.used_row(ui, code, u, view),
-                            CodeRow::Chip(chip) => chip_row(ui, code, chip),
-                        };
-                        if let Some(command) = command {
+                    for u in by_chip(&code.uses) {
+                        if let Some(command) = self.used_row(ui, code, u, view) {
                             out = Some(command);
                         }
                     }
@@ -507,96 +492,12 @@ fn root_menu(ui: &mut Ui, root: &Path) -> Option<Command> {
     out
 }
 
-/// A row under a circuit.
-enum CodeRow<'a> {
-    /// A source file one or more of its chips run.
-    File(&'a Use),
-    /// A chip that runs no source file.
-    Chip(&'a Chip),
-}
-
-/// Whether a firmware setting names a source file of its own.
-fn runs_a_file(firmware: &str) -> bool {
-    source_language_of(firmware).is_some() && !firmware.starts_with(SOURCE_PREFIX)
-}
-
-/// The rows under a circuit, in the order of the chips' designators, so that
-/// every chip is there.
-fn code_rows(code: &CircuitCode) -> Vec<CodeRow<'_>> {
+/// A circuit's source files in the order of the chips that run them.
+fn by_chip(uses: &[Use]) -> Vec<&Use> {
     // U2 before U10.
-    let key = |designator: &str| (designator.len(), designator.to_string());
-    let mut rows: Vec<((usize, String), CodeRow)> = code
-        .uses
-        .iter()
-        .map(|u| {
-            let first = u.chips.iter().map(|d| key(d)).min().unwrap_or_default();
-            (first, CodeRow::File(u))
-        })
-        .chain(
-            code.chips
-                .iter()
-                .filter(|c| !runs_a_file(&c.firmware))
-                .map(|c| (key(&c.designator), CodeRow::Chip(c))),
-        )
-        .collect();
-    rows.sort_by(|a, b| a.0.cmp(&b.0));
-    rows.into_iter().map(|(_, row)| row).collect()
-}
-
-/// What the row of a chip without a source file says.
-fn chip_title(chip: &Chip) -> String {
-    let runs = if chip.firmware.is_empty() {
-        "no program".to_string()
-    } else if let Some(name) = chip
-        .firmware
-        .strip_prefix(dunbrec_mcu::firmware::BUILTIN_PREFIX)
-    {
-        format!("built-in {name}")
-    } else if let Some(name) = chip.firmware.strip_prefix(SOURCE_PREFIX) {
-        format!("{name} (in the circuit file)")
-    } else {
-        chip.firmware.clone()
-    };
-    format!("{}: {runs}", chip.designator)
-}
-
-/// A microcontroller that runs no source file: where one is made for it.
-fn chip_row(ui: &mut Ui, code: &CircuitCode, chip: &Chip) -> Option<Command> {
-    let mut out = None;
-    let open = Command::OpenChip {
-        circuit: code.circuit.clone(),
-        chip: chip.id,
-    };
-    let row = ui
-        .selectable_label(
-            false,
-            RichText::new(format!("· {}", chip_title(chip))).weak(),
-        )
-        .on_hover_text("Right-click to give it a new source file");
-    if row.double_clicked() {
-        out = Some(open.clone());
-    }
-    row.context_menu(|ui| {
-        if ui.button("Open").clicked() {
-            out = Some(open.clone());
-            ui.close();
-        }
-        ui.separator();
-        for (what, label) in [
-            (Create::Sketch, "New sketch…"),
-            (Create::Assembly, "New assembly file…"),
-        ] {
-            if ui.button(label).clicked() {
-                out = Some(Command::AskNewSource {
-                    circuit: code.circuit.clone(),
-                    chip: chip.id,
-                    who: format!("{} in {}", chip.designator, code.name()),
-                    what,
-                });
-                ui.close();
-            }
-        }
-    });
+    let first = |u: &Use| u.chips.iter().map(|d| (d.len(), d.clone())).min();
+    let mut out: Vec<&Use> = uses.iter().collect();
+    out.sort_by_key(|u| first(u));
     out
 }
 
@@ -1065,10 +966,8 @@ mod tests {
                 "· notes.txt",
                 "⚡ Other",
                 "⚠ U1: shared.asm",
+                // Chips with no source file add nothing to see.
                 "⚡ Plain",
-                "· U1: built-in blink",
-                "· U2: no program",
-                "· U3: fw.hex",
                 "Not used",
                 "📝 old.asm",
             ],

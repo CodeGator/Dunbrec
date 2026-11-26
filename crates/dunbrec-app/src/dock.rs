@@ -220,6 +220,24 @@ pub fn sync_documents(dock: &mut DockState<Pane>, circuits: &[u32]) -> bool {
     changed
 }
 
+/// The open circuits in the order of their tabs, which the user can change.
+pub fn circuit_order(dock: &DockState<Pane>) -> Vec<u32> {
+    let Some((surface, node, _)) = dock.find_tab(&Pane::Workspace) else {
+        return Vec::new();
+    };
+    match &dock[surface][node] {
+        Node::Leaf(leaf) => leaf
+            .tabs
+            .iter()
+            .filter_map(|tab| match tab {
+                Pane::Circuit(id) => Some(*id),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// The circuit whose tab is in front in the central area, if one is.
 pub fn front_circuit(dock: &DockState<Pane>) -> Option<u32> {
     let (surface, node, _) = dock.find_tab(&Pane::Workspace)?;
@@ -352,6 +370,7 @@ mod tests {
         assert_eq!(leaf_of(&dock, Pane::Circuit(2)), centre);
         bring_to_front(&mut dock, Pane::Circuit(1));
         assert_eq!(front_circuit(&dock), Some(1));
+        assert_eq!(circuit_order(&dock), [1, 2]);
         assert!(!sync_documents(&mut dock, &[1, 2]));
         // Closing them all leaves the area, and the panels where they were.
         assert!(sync_documents(&mut dock, &[2]));
