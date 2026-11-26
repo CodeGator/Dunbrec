@@ -31,7 +31,7 @@ drafts the GitHub release (see `.github/workflows/release.yml`).
 | 0.5.0 (in progress) | Projects screen (nothing else shown without a project); assistant draws new circuits with real wires and can add sine sources; no circuit open until one is opened; a central area that never collapses; closable schematic tab. See "0.5.0" below |
 | 0.4.0 | Settings dialog; Assistant (Ollama or Claude); pop-out instruments; text size; every confirmation a message box; Code panel tabs; project behaviour changes. See "0.4.0" below |
 
-Health at handoff: `cargo test --workspace` 474 passed, 0 failed (2 ignored: a real Recycle Bin check and an
+Health at handoff: `cargo test --workspace` 475 passed, 0 failed (2 ignored: a real Recycle Bin check and an
 emulator speed
 benchmark); `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --check`
 clean. Toolchain: Rust 1.99 (edition 2024, MSRV 1.90), Windows 11.
@@ -371,6 +371,8 @@ the demos look dead: blink changed every 12 s). `sync_speed` tells a running sim
   unused ones under "Not used". Each frame `check_new_code` notices files a chip has come to use
   (opens them; asks if another circuit uses them) and `list_used_files` adds them to the project.
   `ask_assign` / `assign` give an unused file to a chip, moving any unsaved text with it.
+- *No close-all buttons* on the outer dock's tab bars (the user found them confusing: they closed
+  a whole group). Each tab keeps its own close button; the collapse triangle stays.
 - *Menus:* circuits, files and folders share `project_ui::item_menu` (Open, Rename, Remove from
   project, Delete from disk). Under a circuit every chip has a row (`code_rows`); one without a
   source file offers a new one. Source files are only made for a chip; there is no "New folder"

@@ -2628,6 +2628,9 @@ impl DunbrecApp {
         };
         DockArea::new(&mut self.dock)
             .style(egui_dock::Style::from_egui(ctx.style().as_ref()))
+            // Each tab has its own close button. One more that closes a whole
+            // group at once only invites doing it by accident.
+            .show_leaf_close_all_buttons(false)
             .allowed_splits(splits)
             .show(ctx, &mut viewer);
         if ctx.input(|i| !i.pointer.any_down() && !i.pointer.any_released()) {
@@ -3210,10 +3213,19 @@ impl DunbrecApp {
                     Tool::Label => "Click on a wire or pin to name that net",
                     Tool::Probe => "Click a wire or pin to connect the chosen instrument input (a part, for current) · Esc to stop",
                 };
-                ui.label(RichText::new(hint).weak());
+                // The right-hand end is placed first; the hint for the tool
+                // gets what is left, and is cut short rather than run under
+                // it. (Pointing at it then shows the whole of it.)
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(format!("{:.0}%", self.active().canvas.camera.scale / 14.0 * 100.0));
+                    ui.label(format!(
+                        "{:.0}%",
+                        self.active().canvas.camera.scale / 14.0 * 100.0
+                    ));
                     ui.label(RichText::new("Wheel: scroll · Ctrl+wheel: zoom").weak());
+                    ui.add_space(12.0);
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.add(egui::Label::new(RichText::new(hint).weak()).truncate());
+                    });
                 });
             });
         });
@@ -5126,6 +5138,53 @@ mod tests {
         f.rig.click("Remove");
         assert!(shows(&f, "· U1: no program"));
         assert!(f.root.join("main.asm").is_file());
+    }
+
+    #[test]
+    fn the_hints_along_the_bottom_never_overlap() {
+        let mut f = fixture("status");
+        f.open(&f.blink.clone());
+        for width in [700.0, 1000.0, 2400.0] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            let mut bounds = Vec::new();
+            for _ in 0..3 {
+                let input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(width, 600.0),
+                    )),
+                    ..Default::default()
+                };
+                let out = ctx.run(input, |ctx| f.rig.app.status_bar(ctx));
+                if let Some(update) = out.platform_output.accesskit_update {
+                    bounds = update
+                        .nodes
+                        .iter()
+                        // Not the runs of text inside each label, which are placed
+                        // as if every line began at its left edge.
+                        .filter(|(_, n)| n.role() != egui::accesskit::Role::TextRun)
+                        .filter_map(|(_, n)| {
+                            let text = n.label().or_else(|| n.value())?.to_string();
+                            let b = n.bounds()?;
+                            Some((text, b.x0, b.x1))
+                        })
+                        .collect();
+                }
+            }
+            let of = |start: &str| {
+                bounds
+                    .iter()
+                    .find(|(text, ..)| text.starts_with(start))
+                    .unwrap_or_else(|| panic!("no {start:?} at {width}: {bounds:?}"))
+            };
+            let (hint, wheel, zoom) = (of("Click to select"), of("Wheel:"), of("100%"));
+            assert!(hint.2 <= wheel.1, "{width}: {hint:?} runs into {wheel:?}");
+            assert!(
+                wheel.2 <= zoom.1 && zoom.2 <= f64::from(width),
+                "{width}: {bounds:?}"
+            );
+        }
     }
 
     #[test]
