@@ -68,9 +68,11 @@ reopen in a default place, so a window can never be lost. Instruments → **Dock
 brings every popped-out one back at once.
 
 **Settings.** File → Settings… has a page for each group. *Appearance* sets the theme (follow
-Windows, light or dark) and the **text size** (normal, large, extra large, huge), which scales
-the whole interface. *Assistant* chooses the language model (see below). Changes apply at once and
-are remembered; the one exception is a Claude API key, which has its own *Save* button.
+Windows, light or dark), the **text size** (normal, large, extra large, huge), which scales
+the whole interface, and the **menu and toolbar size** (small, medium or large; medium unless you
+change it), which enlarges the top of the window further. *Assistant* chooses the language model
+(see below). Changes apply at once and are remembered; the one exception is a Claude API key,
+which has its own *Save* button.
 
 **Checking.** The Checks panel lists wiring problems in plain English (missing ground,
 unconnected pins, missing models), and the DC operating point is recalculated after every edit

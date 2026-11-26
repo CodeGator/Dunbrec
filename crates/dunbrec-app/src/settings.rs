@@ -28,6 +28,37 @@ impl Theme {
     }
 }
 
+/// How large the menu bar, its menus and the toolbar are drawn, compared with
+/// the rest of the interface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum BarSize {
+    Small,
+    #[default]
+    Medium,
+    Large,
+}
+
+impl BarSize {
+    pub const ALL: [BarSize; 3] = [BarSize::Small, BarSize::Medium, BarSize::Large];
+
+    /// What their text and buttons are multiplied by, on top of the text size.
+    pub fn factor(self) -> f32 {
+        match self {
+            BarSize::Small => 1.0,
+            BarSize::Medium => 1.35,
+            BarSize::Large => 1.7,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            BarSize::Small => "Small",
+            BarSize::Medium => "Medium",
+            BarSize::Large => "Large",
+        }
+    }
+}
+
 /// How large the whole interface is drawn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum TextSize {
@@ -71,6 +102,7 @@ impl TextSize {
 pub struct Settings {
     pub theme: Theme,
     pub text_size: TextSize,
+    pub bar_size: BarSize,
     /// Most recent first.
     pub recent: Vec<PathBuf>,
     /// Project folders, most recent first.
@@ -189,6 +221,18 @@ mod tests {
         assert_eq!(s.theme, Theme::Dark);
         assert_eq!(s.text_size, TextSize::Normal);
         assert!(s.recent.is_empty());
+    }
+
+    #[test]
+    fn menu_and_toolbar_sizes_grow_from_the_plain_one() {
+        let factors: Vec<f32> = BarSize::ALL.iter().map(|b| b.factor()).collect();
+        assert_eq!(factors[0], 1.0);
+        assert!(factors.windows(2).all(|w| w[0] < w[1]));
+        // Settings saved before there was a choice get the middle one.
+        let s: Settings = ron::from_str("(text_size: Large)").unwrap();
+        assert_eq!(s.bar_size, BarSize::Medium);
+        let s: Settings = ron::from_str("(bar_size: Large)").unwrap();
+        assert_eq!(s.bar_size, BarSize::Large);
     }
 
     #[test]

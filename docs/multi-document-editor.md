@@ -1,7 +1,7 @@
 # Multi-document editor (design)
 
-Status: **all stages done** (2026-11-26), except the "maybe" in stage 5: reopening
-the last circuits when a project opens. Written 2026-11-24;
+Status: **all stages done** (2026-11-26). The "maybe" in stage 5, reopening the
+last circuits when a project opens, is **not wanted** (see decision 15). Written 2026-11-24;
 decisions settled with the user 2026-11-26.
 
 ## Goal
@@ -67,6 +67,8 @@ Agreed with the user:
     circuit without any, shows nothing extra. (This replaces listing every chip.)
     New source files are made from the chip's properties. No "New" menu on
     circuits, and no "New folder".
+15. **Nothing is reopened:** not the last project at start, and not the last
+    circuits when a project opens.
 
 Also agreed when stage 3 was built: double-clicking a "Not used" file asks which
 chip should use it; and a file another circuit uses brings an offer of a copy.
@@ -270,7 +272,7 @@ another circuit stops a running simulation like a click does.
 4. *Done, before stage 3 (agreed: names for circuits without names for files
    would only half answer the confusion).* **Second row**: source files as tabs, retire the single Code panel and its
    picker.
-5. *Done, without reopening.* **Polish**: Ctrl+Tab, window list, close-all variants, maybe reopen the last
+5. *Done; reopening dropped (decision 15).* **Polish**: Ctrl+Tab, window list, close-all variants, maybe reopen the last
    documents when a project opens.
 
 Built differently from section 1: rather than `active: Option<usize>`, the app

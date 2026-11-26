@@ -264,6 +264,23 @@ fn same_structure(a: &Netlist, b: &Netlist) -> bool {
             .all(|(x, y)| x.component == y.component && x.nodes == y.nodes)
 }
 
+/// Make everything drawn with `style` larger by the factor `by`: what the
+/// "Menu and toolbar size" setting does to those two.
+fn enlarge(style: &mut egui::Style, by: f32) {
+    for font in style.text_styles.values_mut() {
+        font.size *= by;
+    }
+    let spacing = &mut style.spacing;
+    spacing.interact_size *= by;
+    spacing.button_padding *= by;
+    spacing.item_spacing.x *= by;
+    spacing.icon_width *= by;
+    spacing.icon_width_inner *= by;
+    spacing.icon_spacing *= by;
+    spacing.combo_width *= by;
+    spacing.menu_width *= by;
+}
+
 /// Whether the circuit has a microcontroller, which sets the "Auto" speed.
 fn has_mcu(netlist: &Netlist) -> bool {
     netlist
@@ -2322,8 +2339,14 @@ impl DunbrecApp {
 
     fn run_toolbar(&mut self, ctx: &egui::Context) {
         let frame = self.run_frame(ctx);
+        let size = self.settings.bar_size.factor();
         egui::TopBottomPanel::top("run").frame(frame).show(ctx, |ui| {
-            ui.horizontal(|ui| {
+            enlarge(ui.style_mut(), size);
+            ui.add_space(3.0);
+            // In a narrow window the rest goes on a second line.
+            ui.horizontal_wrapped(|ui| {
+                // Whole words and buttons move down; none is broken up.
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
                 if !self.circuit_open {
                     ui.disable();
                 }
@@ -2366,11 +2389,11 @@ impl DunbrecApp {
                     // after it sideways.
                     let height = ui.spacing().interact_size.y;
                     ui.allocate_ui_with_layout(
-                        egui::vec2(130.0, height),
+                        egui::vec2(130.0 * size, height),
                         egui::Layout::left_to_right(egui::Align::Center),
                         |ui| {
                             // The slot shrinks to its contents unless told not to.
-                            ui.set_min_size(egui::vec2(130.0, height));
+                            ui.set_min_size(egui::vec2(130.0 * size, height));
                             ui.label(
                                 RichText::new(format!("t = {}", format_value(self.live_time, "s")))
                                     .monospace(),
@@ -2378,10 +2401,10 @@ impl DunbrecApp {
                         },
                     );
                     ui.allocate_ui_with_layout(
-                        egui::vec2(96.0, height),
+                        egui::vec2(96.0 * size, height),
                         egui::Layout::left_to_right(egui::Align::Center),
                         |ui| {
-                            ui.set_min_size(egui::vec2(96.0, height));
+                            ui.set_min_size(egui::vec2(96.0 * size, height));
                             if self.live_keeping_up < 0.95 {
                                 ui.label(
                                     RichText::new(format!(
@@ -2440,6 +2463,7 @@ impl DunbrecApp {
                     ui.label(RichText::new(h).color(Color32::from_rgb(230, 150, 40)));
                 }
             });
+            ui.add_space(3.0);
         });
     }
 
@@ -2828,277 +2852,290 @@ impl DunbrecApp {
     // ---------------------------------------------------------- UI ---
 
     fn menu_bar(&mut self, ctx: &egui::Context) {
+        let size = self.settings.bar_size.factor();
+        // For the bar and, separately, for each menu that drops from it.
+        let style = egui::style::StyleModifier::new(move |style| {
+            egui::containers::menu::menu_style(style);
+            enlarge(style, size);
+            // A menu remembers how wide it was, from a smaller size too; its
+            // lines must widen it rather than break.
+            style.wrap_mode = Some(egui::TextWrapMode::Extend);
+        });
+        let menus = egui::containers::menu::MenuConfig::new().style(style.clone());
         egui::TopBottomPanel::top("menu").show(ctx, |ui| {
-            egui::MenuBar::new().ui(ui, |ui| {
-                ui.menu_button("File", |ui| {
-                    if ui
-                        .button("New circuit…   Ctrl+N")
-                        .on_hover_text("Make a circuit in the project")
-                        .clicked()
-                    {
-                        self.new_circuit();
-                        ui.close();
-                    }
-                    if ui.button("Open…      Ctrl+O").clicked() {
-                        self.request(Pending::Open);
-                        ui.close();
-                    }
-                    ui.add_enabled_ui(!self.settings.recent.is_empty(), |ui| {
-                        ui.menu_button("Open recent", |ui| {
-                            for path in self.settings.recent.clone() {
-                                let name = path.file_name().map_or_else(
-                                    || path.display().to_string(),
-                                    |n| n.to_string_lossy().into_owned(),
-                                );
-                                if ui
-                                    .button(name)
-                                    .on_hover_text(path.display().to_string())
-                                    .clicked()
-                                {
-                                    self.request(Pending::OpenPath(path));
+            egui::MenuBar::new()
+                .style(style)
+                .config(menus)
+                .ui(ui, |ui| {
+                    ui.menu_button("File", |ui| {
+                        if ui
+                            .button("New circuit…   Ctrl+N")
+                            .on_hover_text("Make a circuit in the project")
+                            .clicked()
+                        {
+                            self.new_circuit();
+                            ui.close();
+                        }
+                        if ui.button("Open…      Ctrl+O").clicked() {
+                            self.request(Pending::Open);
+                            ui.close();
+                        }
+                        ui.add_enabled_ui(!self.settings.recent.is_empty(), |ui| {
+                            ui.menu_button("Open recent", |ui| {
+                                for path in self.settings.recent.clone() {
+                                    let name = path.file_name().map_or_else(
+                                        || path.display().to_string(),
+                                        |n| n.to_string_lossy().into_owned(),
+                                    );
+                                    if ui
+                                        .button(name)
+                                        .on_hover_text(path.display().to_string())
+                                        .clicked()
+                                    {
+                                        self.request(Pending::OpenPath(path));
+                                        ui.close();
+                                    }
+                                }
+                                ui.separator();
+                                if ui.button("Clear list").clicked() {
+                                    self.settings.clear_recent();
+                                    ui.close();
+                                }
+                            });
+                        });
+                        ui.menu_button("Open example", |ui| {
+                            for (i, ex) in examples().iter().enumerate() {
+                                if ui.button(ex.name).clicked() {
+                                    self.request(Pending::Example(i));
                                     ui.close();
                                 }
                             }
-                            ui.separator();
-                            if ui.button("Clear list").clicked() {
-                                self.settings.clear_recent();
-                                ui.close();
-                            }
                         });
-                    });
-                    ui.menu_button("Open example", |ui| {
-                        for (i, ex) in examples().iter().enumerate() {
-                            if ui.button(ex.name).clicked() {
-                                self.request(Pending::Example(i));
-                                ui.close();
-                            }
+                        ui.separator();
+                        if ui
+                            .button("Close project")
+                            .on_hover_text("Go back to the Projects screen")
+                            .clicked()
+                        {
+                            self.run_project_command(project_ui::Command::CloseProject);
+                            ui.close();
+                        }
+                        ui.separator();
+                        if ui.button("Import SPICE netlist…").clicked() {
+                            self.request(Pending::ImportSpice);
+                            ui.close();
+                        }
+                        if ui.button("Import KiCad schematic…").clicked() {
+                            self.request(Pending::ImportKicad);
+                            ui.close();
+                        }
+                        if ui
+                            .add_enabled(
+                                self.circuit_open,
+                                egui::Button::new("Export SPICE netlist…"),
+                            )
+                            .clicked()
+                        {
+                            self.export_spice();
+                            ui.close();
+                        }
+                        ui.separator();
+                        if ui
+                            .add_enabled(
+                                self.circuit_open,
+                                egui::Button::new("Close circuit   Ctrl+W"),
+                            )
+                            .on_hover_text("Close the circuit; the project stays open")
+                            .clicked()
+                        {
+                            let id = self.active().id;
+                            self.request(Pending::CloseCircuit(id));
+                            ui.close();
+                        }
+                        if ui
+                            .add_enabled(self.circuit_open, egui::Button::new("Save       Ctrl+S"))
+                            .clicked()
+                        {
+                            self.save(false);
+                            ui.close();
+                        }
+                        if ui
+                            .add_enabled(
+                                self.circuit_open,
+                                egui::Button::new("Save as…   Ctrl+Shift+S"),
+                            )
+                            .clicked()
+                        {
+                            self.save(true);
+                            ui.close();
+                        }
+                        ui.separator();
+                        if ui.button("Settings…").clicked() {
+                            self.settings_dialog.open();
+                            ui.close();
+                        }
+                        ui.separator();
+                        if ui.button("Quit").clicked() {
+                            ctx.send_viewport_cmd(ViewportCommand::Close);
+                            ui.close();
                         }
                     });
-                    ui.separator();
-                    if ui
-                        .button("Close project")
-                        .on_hover_text("Go back to the Projects screen")
-                        .clicked()
-                    {
-                        self.run_project_command(project_ui::Command::CloseProject);
-                        ui.close();
-                    }
-                    ui.separator();
-                    if ui.button("Import SPICE netlist…").clicked() {
-                        self.request(Pending::ImportSpice);
-                        ui.close();
-                    }
-                    if ui.button("Import KiCad schematic…").clicked() {
-                        self.request(Pending::ImportKicad);
-                        ui.close();
-                    }
-                    if ui
-                        .add_enabled(
-                            self.circuit_open,
-                            egui::Button::new("Export SPICE netlist…"),
-                        )
-                        .clicked()
-                    {
-                        self.export_spice();
-                        ui.close();
-                    }
-                    ui.separator();
-                    if ui
-                        .add_enabled(
-                            self.circuit_open,
-                            egui::Button::new("Close circuit   Ctrl+W"),
-                        )
-                        .on_hover_text("Close the circuit; the project stays open")
-                        .clicked()
-                    {
-                        let id = self.active().id;
-                        self.request(Pending::CloseCircuit(id));
-                        ui.close();
-                    }
-                    if ui
-                        .add_enabled(self.circuit_open, egui::Button::new("Save       Ctrl+S"))
-                        .clicked()
-                    {
-                        self.save(false);
-                        ui.close();
-                    }
-                    if ui
-                        .add_enabled(
-                            self.circuit_open,
-                            egui::Button::new("Save as…   Ctrl+Shift+S"),
-                        )
-                        .clicked()
-                    {
-                        self.save(true);
-                        ui.close();
-                    }
-                    ui.separator();
-                    if ui.button("Settings…").clicked() {
-                        self.settings_dialog.open();
-                        ui.close();
-                    }
-                    ui.separator();
-                    if ui.button("Quit").clicked() {
-                        ctx.send_viewport_cmd(ViewportCommand::Close);
-                        ui.close();
-                    }
-                });
-                ui.menu_button("Edit", |ui| {
-                    if !self.circuit_open {
-                        ui.disable();
-                    }
-                    if ui
-                        .add_enabled(
-                            self.active().doc.can_undo(),
-                            egui::Button::new("Undo   Ctrl+Z"),
-                        )
-                        .clicked()
-                    {
-                        self.active_mut().doc.undo();
-                        ui.close();
-                    }
-                    if ui
-                        .add_enabled(
-                            self.active().doc.can_redo(),
-                            egui::Button::new("Redo   Ctrl+Y"),
-                        )
-                        .clicked()
-                    {
-                        self.active_mut().doc.redo();
-                        ui.close();
-                    }
-                    ui.separator();
-                    let has_selection = !self.active().canvas.selection.is_empty();
-                    if ui
-                        .add_enabled(has_selection, egui::Button::new("Rotate   R"))
-                        .clicked()
-                    {
-                        self.active_mut().transform_selection(false);
-                        ui.close();
-                    }
-                    if ui
-                        .add_enabled(has_selection, egui::Button::new("Mirror   X"))
-                        .clicked()
-                    {
-                        self.active_mut().transform_selection(true);
-                        ui.close();
-                    }
-                    if ui
-                        .add_enabled(has_selection, egui::Button::new("Delete   Del"))
-                        .clicked()
-                    {
-                        self.active_mut().delete_selection();
-                        ui.close();
-                    }
-                    ui.separator();
-                    if ui
-                        .add_enabled(has_selection, egui::Button::new("Copy        Ctrl+C"))
-                        .clicked()
-                    {
-                        self.active_mut().copy();
-                        ui.close();
-                    }
-                    if ui
-                        .add_enabled(
-                            self.active().canvas.clipboard.is_some(),
-                            egui::Button::new("Paste       Ctrl+V"),
-                        )
-                        .clicked()
-                    {
-                        self.active_mut().paste();
-                        ui.close();
-                    }
-                    if ui
-                        .add_enabled(has_selection, egui::Button::new("Duplicate   Ctrl+D"))
-                        .clicked()
-                    {
-                        self.active_mut().copy();
-                        self.active_mut().paste();
-                        ui.close();
-                    }
-                });
-                ui.menu_button("Simulate", |ui| {
-                    if !self.circuit_open {
-                        ui.disable();
-                    }
-                    ui.checkbox(&mut self.live_dc, "Live DC operating point");
-                    ui.checkbox(&mut self.show_voltages, "Show node voltages on schematic");
-                    if ui.button("Recalculate DC now").clicked() {
-                        self.active_mut().run_dc();
-                        ui.close();
-                    }
-                });
-                ui.menu_button("Instruments", |ui| {
-                    if !self.circuit_open {
-                        ui.disable();
-                    }
-                    ui.checkbox(&mut self.bench.show_scope, "📈 Oscilloscope");
-                    ui.checkbox(&mut self.bench.show_meter, "🔢 Multimeter");
-                    ui.checkbox(&mut self.bench.show_logic, "📊 Logic analyser");
-                    ui.checkbox(&mut self.analyses.show_fgen, "〰 Function generator");
-                    ui.checkbox(&mut self.serial.show, "⌨ Serial monitor");
-                    ui.checkbox(&mut self.debugger.show, "🐞 MCU debugger");
-                    ui.separator();
-                    ui.checkbox(
-                        &mut self.analyses.show_bode,
-                        "📉 Bode plotter (AC analysis)",
-                    );
-                    ui.checkbox(&mut self.analyses.show_transfer, "↗ DC transfer (DC sweep)");
-                    ui.checkbox(&mut self.analyses.show_tracer, "〽 Curve tracer");
-                    ui.separator();
-                    if ui
-                        .add_enabled(
-                            crate::float::any_popped(ctx),
-                            egui::Button::new("Dock all instruments"),
-                        )
-                        .on_hover_text(
-                            "Bring every instrument that is in a window of its own back \
+                    ui.menu_button("Edit", |ui| {
+                        if !self.circuit_open {
+                            ui.disable();
+                        }
+                        if ui
+                            .add_enabled(
+                                self.active().doc.can_undo(),
+                                egui::Button::new("Undo   Ctrl+Z"),
+                            )
+                            .clicked()
+                        {
+                            self.active_mut().doc.undo();
+                            ui.close();
+                        }
+                        if ui
+                            .add_enabled(
+                                self.active().doc.can_redo(),
+                                egui::Button::new("Redo   Ctrl+Y"),
+                            )
+                            .clicked()
+                        {
+                            self.active_mut().doc.redo();
+                            ui.close();
+                        }
+                        ui.separator();
+                        let has_selection = !self.active().canvas.selection.is_empty();
+                        if ui
+                            .add_enabled(has_selection, egui::Button::new("Rotate   R"))
+                            .clicked()
+                        {
+                            self.active_mut().transform_selection(false);
+                            ui.close();
+                        }
+                        if ui
+                            .add_enabled(has_selection, egui::Button::new("Mirror   X"))
+                            .clicked()
+                        {
+                            self.active_mut().transform_selection(true);
+                            ui.close();
+                        }
+                        if ui
+                            .add_enabled(has_selection, egui::Button::new("Delete   Del"))
+                            .clicked()
+                        {
+                            self.active_mut().delete_selection();
+                            ui.close();
+                        }
+                        ui.separator();
+                        if ui
+                            .add_enabled(has_selection, egui::Button::new("Copy        Ctrl+C"))
+                            .clicked()
+                        {
+                            self.active_mut().copy();
+                            ui.close();
+                        }
+                        if ui
+                            .add_enabled(
+                                self.active().canvas.clipboard.is_some(),
+                                egui::Button::new("Paste       Ctrl+V"),
+                            )
+                            .clicked()
+                        {
+                            self.active_mut().paste();
+                            ui.close();
+                        }
+                        if ui
+                            .add_enabled(has_selection, egui::Button::new("Duplicate   Ctrl+D"))
+                            .clicked()
+                        {
+                            self.active_mut().copy();
+                            self.active_mut().paste();
+                            ui.close();
+                        }
+                    });
+                    ui.menu_button("Simulate", |ui| {
+                        if !self.circuit_open {
+                            ui.disable();
+                        }
+                        ui.checkbox(&mut self.live_dc, "Live DC operating point");
+                        ui.checkbox(&mut self.show_voltages, "Show node voltages on schematic");
+                        if ui.button("Recalculate DC now").clicked() {
+                            self.active_mut().run_dc();
+                            ui.close();
+                        }
+                    });
+                    ui.menu_button("Instruments", |ui| {
+                        if !self.circuit_open {
+                            ui.disable();
+                        }
+                        ui.checkbox(&mut self.bench.show_scope, "📈 Oscilloscope");
+                        ui.checkbox(&mut self.bench.show_meter, "🔢 Multimeter");
+                        ui.checkbox(&mut self.bench.show_logic, "📊 Logic analyser");
+                        ui.checkbox(&mut self.analyses.show_fgen, "〰 Function generator");
+                        ui.checkbox(&mut self.serial.show, "⌨ Serial monitor");
+                        ui.checkbox(&mut self.debugger.show, "🐞 MCU debugger");
+                        ui.separator();
+                        ui.checkbox(
+                            &mut self.analyses.show_bode,
+                            "📉 Bode plotter (AC analysis)",
+                        );
+                        ui.checkbox(&mut self.analyses.show_transfer, "↗ DC transfer (DC sweep)");
+                        ui.checkbox(&mut self.analyses.show_tracer, "〽 Curve tracer");
+                        ui.separator();
+                        if ui
+                            .add_enabled(
+                                crate::float::any_popped(ctx),
+                                egui::Button::new("Dock all instruments"),
+                            )
+                            .on_hover_text(
+                                "Bring every instrument that is in a window of its own back \
                              inside the main window",
-                        )
-                        .clicked()
-                    {
-                        crate::float::dock_all(ctx);
-                        ui.close();
-                    }
-                });
-                ui.menu_button("View", |ui| {
-                    ui.checkbox(&mut self.show_voltages, "Node voltages on the schematic");
-                    ui.separator();
-                    ui.menu_button("Panels", |ui| {
-                        for pane in Pane::SIDE_PANELS {
-                            let mut open = dock::is_open(&self.dock, pane);
-                            if ui.checkbox(&mut open, pane.title()).changed() {
-                                if open {
-                                    dock::open(&mut self.dock, pane);
-                                } else {
-                                    dock::close(&mut self.dock, pane);
+                            )
+                            .clicked()
+                        {
+                            crate::float::dock_all(ctx);
+                            ui.close();
+                        }
+                    });
+                    ui.menu_button("View", |ui| {
+                        ui.checkbox(&mut self.show_voltages, "Node voltages on the schematic");
+                        ui.separator();
+                        ui.menu_button("Panels", |ui| {
+                            for pane in Pane::SIDE_PANELS {
+                                let mut open = dock::is_open(&self.dock, pane);
+                                if ui.checkbox(&mut open, pane.title()).changed() {
+                                    if open {
+                                        dock::open(&mut self.dock, pane);
+                                    } else {
+                                        dock::close(&mut self.dock, pane);
+                                    }
                                 }
                             }
+                        });
+                        if ui
+                            .button("Reset layout")
+                            .on_hover_text("Put every panel back where it started")
+                            .clicked()
+                        {
+                            self.dock = dock::default_layout();
+                            ui.close();
                         }
                     });
-                    if ui
-                        .button("Reset layout")
-                        .on_hover_text("Put every panel back where it started")
-                        .clicked()
-                    {
-                        self.dock = dock::default_layout();
-                        ui.close();
-                    }
+                    ui.menu_button("Window", |ui| {
+                        self.window_menu(ui);
+                    });
+                    ui.menu_button("Help", |ui| {
+                        if ui.button("Keyboard shortcuts").clicked() {
+                            self.show_shortcuts = true;
+                            ui.close();
+                        }
+                        if ui.button("About Dunbrec").clicked() {
+                            self.show_about = true;
+                            ui.close();
+                        }
+                    });
                 });
-                ui.menu_button("Window", |ui| {
-                    self.window_menu(ui);
-                });
-                ui.menu_button("Help", |ui| {
-                    if ui.button("Keyboard shortcuts").clicked() {
-                        self.show_shortcuts = true;
-                        ui.close();
-                    }
-                    if ui.button("About Dunbrec").clicked() {
-                        self.show_about = true;
-                        ui.close();
-                    }
-                });
-            });
         });
     }
 
@@ -4200,6 +4237,7 @@ impl eframe::App for DunbrecApp {
 mod tests {
     use super::*;
     use crate::library::palette;
+    use crate::settings::BarSize;
 
     #[test]
     fn the_j_key_picks_the_same_tool_as_the_palette_junction() {
@@ -5587,6 +5625,140 @@ mod tests {
             assert!(hint.2 <= zoom.1, "{width}: {shown:?}");
             assert!(zoom.2 <= f64::from(width), "{width}: {shown:?}");
         }
+    }
+
+    #[test]
+    fn the_toolbar_is_large_and_all_of_it_fits_a_narrow_window() {
+        // At the middle size, which is what a new user gets.
+        let mut f = fixture("toolbar");
+        f.open(&f.blink.clone());
+        for width in [640.0_f32, 1600.0] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            let mut shown: Vec<(String, egui::accesskit::Rect)> = Vec::new();
+            for _ in 0..4 {
+                let input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(width, 600.0),
+                    )),
+                    ..Default::default()
+                };
+                let app = &mut f.rig.app;
+                let out = ctx.run(input, |ctx| app.run_toolbar(ctx));
+                if let Some(update) = out.platform_output.accesskit_update {
+                    shown = update
+                        .nodes
+                        .iter()
+                        .filter(|(_, n)| n.role() != egui::accesskit::Role::TextRun)
+                        .filter_map(|(_, n)| {
+                            let text = n.label().or_else(|| n.value())?.to_string();
+                            Some((text, n.bounds()?))
+                        })
+                        .collect();
+                }
+            }
+            let of = |end: &str| {
+                shown
+                    .iter()
+                    .find(|(text, _)| text.ends_with(end))
+                    .unwrap_or_else(|| panic!("no {end:?} at {width}: {shown:?}"))
+                    .1
+            };
+            let run = of(" Run");
+            assert!(run.y1 - run.y0 >= 24.0, "{run:?}");
+            for end in [
+                " Run",
+                "Speed",
+                "Oscilloscope",
+                "Multimeter",
+                "Function gen",
+            ] {
+                let r = of(end);
+                assert!(
+                    r.x0 >= 0.0 && r.x1 <= f64::from(width),
+                    "{width}: {end} {r:?}"
+                );
+            }
+            // One line when there is room, more when there is not.
+            let wrapped = of("Function gen").y0 > run.y1;
+            assert_eq!(wrapped, width < 1000.0, "{width}: {shown:?}");
+        }
+    }
+
+    /// How tall the thing labelled exactly or lastly `label` is drawn.
+    fn height_of(rig: &Rig, label: &str) -> f32 {
+        rig.seen
+            .iter()
+            .find(|(text, _)| text == label)
+            .or_else(|| rig.seen.iter().find(|(text, _)| text.starts_with(label)))
+            .unwrap_or_else(|| panic!("no {label:?}: {:?}", rig.seen))
+            .1
+            .height()
+    }
+
+    #[test]
+    fn the_chosen_size_changes_the_menus_and_the_toolbar() {
+        let mut f = fixture("bar-size");
+        f.open(&f.blink.clone());
+        // The menu bar, an open menu, a menu within it, and the toolbar.
+        let heights: Vec<[f32; 4]> = BarSize::ALL
+            .into_iter()
+            .map(|size| {
+                f.rig.app.settings.bar_size = size;
+                f.rig.settle();
+                let bar = height_of(&f.rig, "File");
+                let run = f
+                    .rig
+                    .seen
+                    .iter()
+                    .find(|(text, _)| text.ends_with(" Run"))
+                    .unwrap()
+                    .1
+                    .height();
+                f.rig.click("File");
+                let item = height_of(&f.rig, "Open…");
+                // Its label ends with the arrow that marks a menu.
+                let opener = f
+                    .rig
+                    .seen
+                    .iter()
+                    .find(|(text, _)| text.starts_with("Open recent"))
+                    .unwrap_or_else(|| panic!("no recent menu: {:?}", f.rig.seen))
+                    .1
+                    .center();
+                f.rig.click_at(opener, egui::PointerButton::Primary);
+                let within = height_of(&f.rig, "Clear");
+                f.rig.frame(vec![egui::Event::Key {
+                    key: Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::NONE,
+                }]);
+                f.rig.settle();
+                [bar, item, within, run]
+            })
+            .collect();
+        for part in 0..4 {
+            let [small, medium, large] = [heights[0][part], heights[1][part], heights[2][part]];
+            assert!(small < medium && medium < large, "{part}: {heights:?}");
+        }
+        // A menu within a menu is enlarged once, like the one it is in.
+        for [_, item, within, _] in &heights {
+            assert!((item - within).abs() < 1.0, "{heights:?}");
+        }
+    }
+
+    #[test]
+    fn the_size_is_chosen_in_the_settings() {
+        let mut f = fixture("bar-setting");
+        f.rig.app.settings_dialog.open();
+        f.rig.settle();
+        assert!(shows(&f, "Menu and toolbar size"));
+        f.rig.click("Medium");
+        f.rig.click("Large");
+        assert_eq!(f.rig.app.settings.bar_size, BarSize::Large);
     }
 
     #[test]

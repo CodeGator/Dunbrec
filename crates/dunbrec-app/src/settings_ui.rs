@@ -10,7 +10,7 @@ use std::sync::mpsc::{Receiver, channel};
 use egui::{Color32, ComboBox, Context, RichText, TextEdit, Ui};
 
 use crate::ai::{self, AiSettings, Provider};
-use crate::settings::{Settings, TextSize, Theme};
+use crate::settings::{BarSize, Settings, TextSize, Theme};
 
 type ModelList = Result<Vec<String>, String>;
 
@@ -131,6 +131,20 @@ impl SettingsDialog {
         ui.label(
             RichText::new("Makes everything larger: menus, panels, dialogs and the schematic.")
                 .weak(),
+        );
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.label("Menu and toolbar size");
+            ComboBox::from_id_salt("bar size")
+                .selected_text(settings.bar_size.name())
+                .show_ui(ui, |ui| {
+                    for size in BarSize::ALL {
+                        ui.selectable_value(&mut settings.bar_size, size, size.name());
+                    }
+                });
+        });
+        ui.label(
+            RichText::new("The menus and the toolbar at the top, on top of the text size.").weak(),
         );
     }
 

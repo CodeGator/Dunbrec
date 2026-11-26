@@ -31,7 +31,7 @@ drafts the GitHub release (see `.github/workflows/release.yml`).
 | 0.5.0 (in progress) | Projects screen (nothing else shown without a project); assistant draws new circuits with real wires and can add sine sources; no circuit open until one is opened; a central area that never collapses; closable schematic tab. See "0.5.0" below |
 | 0.4.0 | Settings dialog; Assistant (Ollama or Claude); pop-out instruments; text size; every confirmation a message box; Code panel tabs; project behaviour changes. See "0.4.0" below |
 
-Health at handoff: `cargo test --workspace` 484 passed, 0 failed (2 ignored: a real Recycle Bin check and an
+Health at handoff: `cargo test --workspace` 488 passed, 0 failed (2 ignored: a real Recycle Bin check and an
 emulator speed
 benchmark); `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --check`
 clean. Toolchain: Rust 1.99 (edition 2024, MSRV 1.90), Windows 11.
@@ -377,6 +377,9 @@ the demos look dead: blink changed every 12 s). `sync_speed` tells a running sim
   `ask_assign` / `assign` give an unused file to a chip, moving any unsaved text with it.
 - *No close-all buttons* on the outer dock's tab bars (the user found them confusing: they closed
   a whole group). Each tab keeps its own close button; the collapse triangle stays.
+- *Menu bar and toolbar* are enlarged by `Settings::bar_size` (Small/Medium/Large, Medium by
+  default; the user could hardly see them). The menus need the factor twice, on the bar and in
+  their `MenuConfig`. The toolbar wraps in a narrow window.
 - *Status bar* (the user could not read the old one): only `tool_hint` for a tool other than
   Select, and the zoom; nothing with no circuit. Mouse gestures are listed in Help > Keyboard
   shortcuts (`SHORTCUTS`).
@@ -395,8 +398,9 @@ the demos look dead: blink changed every 12 s). `sync_speed` tells a running sim
 - *Moving between circuits (stage 5):* Ctrl+Tab is taken from the raw input
   (`raw_input_hook`, so egui neither moves focus nor types a tab) and applied by `shortcuts`
   unless a question is up. `window_menu`; `Pending::CloseAll` / `CloseOthers`.
-- *Not done:* reopening the last circuits when a project opens (the design's "maybe"). The
-  assistant's new-file suggestions can still write over a file of the same name.
+- *Not wanted* (the user, 2026-11-26): reopening the last project or its circuits.
+- *Not done:* the assistant's new-file suggestions can still write over a file of the same
+  name.
 
 ## Gotchas
 
