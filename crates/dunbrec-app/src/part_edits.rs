@@ -1,11 +1,15 @@
 //! Adding and removing parts on the assistant's suggestion.
 //!
-//! The assistant lists parts with the net each pin joins, in pin order:
+//! The assistant lists parts with the net each pin joins, in pin order. A
+//! part with many pins may instead name just the pins it uses, and a pin of
+//! a part already there may stand for its net (`U1.D13`):
 //!
 //! ````text
 //! ```dunbrec-add
 //! R5 resistor 10k VOUT 0
 //! Q2 npn 2N3904 C1 B1 0
+//! R6 resistor 220 U1.D13 LEDA
+//! DS1 7seg-cathode red a=SA b=SB COM=0
 //! ```
 //!
 //! ```dunbrec-remove
@@ -31,16 +35,17 @@ use std::collections::{HashMap, HashSet};
 
 use dunbrec_core::units::{format_value, parse_eng};
 use dunbrec_core::{
-    ComponentId, ComponentKind as K, DEFAULT_LOGIC_DELAY, GateOp, ModelKind, ModelLibrary, Netlist,
-    NodeId, OPAMP_PARTS, Point, Polarity, Rotation, Schematic, Waveform, build_netlist,
+    CD4066_DEFAULT_R_ON, CommonPin, ComponentId, ComponentKind as K, DEFAULT_LOGIC_DELAY,
+    DEFAULT_MCU_CLOCK, GateOp, LedColour, ModelKind, ModelLibrary, Netlist, NodeId, OPAMP_PARTS,
+    Point, Polarity, Rotation, Schematic, SwitchForm, Waveform, build_netlist,
 };
-use dunbrec_io::layout::{self, Part, STUB, is_ground, outward};
+use dunbrec_io::layout::{self, MANY_PINS, Part, STUB, UNJOINED, is_ground, pin_direction};
 use dunbrec_io::tidy;
 
 use crate::canvas::NodeMap;
 use crate::library::{
-    self, GENERIC_DIODE, GENERIC_NMOS, GENERIC_NPN, GENERIC_PMOS, GENERIC_PNP, SWITCH_R_OFF,
-    SWITCH_R_ON,
+    self, GENERIC_DIODE, GENERIC_NMOS, GENERIC_NPN, GENERIC_PMOS, GENERIC_PNP, GENERIC_ZENER,
+    SWITCH_R_OFF, SWITCH_R_ON,
 };
 
 /// Fence tag of a block that adds parts.
@@ -50,6 +55,8 @@ pub const REMOVE_TAG: &str = "dunbrec-remove";
 
 /// Rows between the bottom of the existing drawing and the new parts.
 const GAP: i32 = 12;
+/// Rows left clear between it and the top of new parts that reach far up.
+const CLEARANCE: i32 = 4;
 
 /// A part to add.
 #[derive(Debug, Clone, PartialEq)]
@@ -90,13 +97,18 @@ pub fn parse_add(body: &str) -> Result<Vec<NewPart>, String> {
         }
         let (kind, summary) = build_kind(&words[1].to_ascii_lowercase(), words[2])
             .map_err(|e| format!("{designator}: {e}"))?;
-        let nets: Vec<String> = words[3..].iter().map(|n| n.to_string()).collect();
+        let pins = kind.pins();
+        let named = pins.len() > MANY_PINS && words[3..].iter().any(|n| n.contains('='));
+        let nets = if named {
+            named_nets(designator, &kind, &words[3..])?
+        } else {
+            words[3..].iter().map(|n| n.to_string()).collect()
+        };
         if let Some(bad) = nets.iter().find(|n| n.contains('=')) {
             return Err(format!(
                 "{designator}: write the nets in pin order, without “{bad}”."
             ));
         }
-        let pins = kind.pins();
         if nets.len() != pins.len() {
             let names: Vec<&str> = pins.iter().map(|p| p.name).collect();
             return Err(format!(
@@ -118,6 +130,35 @@ pub fn parse_add(body: &str) -> Result<Vec<NewPart>, String> {
         return Err("The block has no parts in it.".into());
     }
     Ok(parts)
+}
+
+/// The nets of a part's pins from `PIN=NET` words: pins not named are left
+/// unjoined.
+fn named_nets(designator: &str, kind: &K, words: &[&str]) -> Result<Vec<String>, String> {
+    let pins = kind.pins();
+    let mut nets = vec![UNJOINED.to_string(); pins.len()];
+    for word in words {
+        let Some((name, net)) = word.split_once('=').filter(|(_, net)| !net.is_empty()) else {
+            return Err(format!(
+                "{designator}: name every pin used as PIN=NET, or none of them (“{word}”)."
+            ));
+        };
+        let at = pins
+            .iter()
+            .position(|p| p.name.eq_ignore_ascii_case(name))
+            .ok_or_else(|| {
+                let names: Vec<&str> = pins.iter().map(|p| p.name).collect();
+                format!(
+                    "{designator} has no pin called {name}; its pins are {}.",
+                    names.join(" ")
+                )
+            })?;
+        if nets[at] != UNJOINED {
+            return Err(format!("{designator}: pin {name} is given twice."));
+        }
+        nets[at] = net.to_string();
+    }
+    Ok(nets)
 }
 
 /// Read the lines of a `dunbrec-remove` block: one designator per line.
@@ -151,7 +192,24 @@ const KINDS: &[(&str, &str, &str)] = &[
     ("vsource", "5", "DC volts"),
     ("vsine", "0.1@1k", "sine source: peak volts@hertz"),
     ("isource", "1m", "DC amps"),
-    ("diode", "generic", "generic, or a model such as 1N4148"),
+    ("vpulse", "0:5@1k", "pulse source: low:high@hertz"),
+    ("vcvs", "10", "voltage gain"),
+    ("vccs", "1m", "transconductance in siemens"),
+    ("ccvs", "1k", "transresistance in ohms"),
+    ("cccs", "10", "current gain"),
+    ("spdt", "rest", "rest or thrown"),
+    ("dpst", "rest", "rest or thrown"),
+    ("dpdt", "rest", "rest or thrown"),
+    (
+        "button",
+        "open",
+        "how the push button is when not pressed: open or closed",
+    ),
+    (
+        "diode",
+        "generic",
+        "generic, zener (5.1 V), or a model such as 1N4148",
+    ),
     ("npn", "generic", "generic, or 2N3904"),
     ("pnp", "generic", "generic, or 2N3906"),
     ("nmos", "generic", "generic"),
@@ -170,7 +228,22 @@ const KINDS: &[(&str, &str, &str)] = &[
     ("clock", "1k", "frequency in hertz"),
     ("logicswitch", "low", "low or high"),
     ("logicled", "default", "the word default"),
+    ("cd4066", "default", "the word default"),
+    ("led", "red", COLOURS),
+    ("ledbar", "red", COLOURS),
+    ("7seg-cathode", "red", COLOURS),
+    ("7seg-anode", "red", COLOURS),
+    ("4digit-cathode", "red", COLOURS),
+    ("4digit-anode", "red", COLOURS),
+    (
+        "atmega328p",
+        "none",
+        "none, or the name of a program file the circuit already has",
+    ),
 ];
+
+/// What the value of a LED or display is.
+const COLOURS: &str = "the colour: red, yellow, green, blue or white";
 
 /// The kinds, values and pin orders, one per line, for the assistant.
 pub fn help() -> String {
@@ -179,8 +252,13 @@ pub fn help() -> String {
         .filter_map(|(word, example, meaning)| {
             let (kind, _) = build_kind(word, example).ok()?;
             let pins: Vec<&str> = kind.pins().iter().map(|p| p.name).collect();
+            let how = if pins.len() > MANY_PINS {
+                "name the pins used, as PIN=NET, from"
+            } else {
+                "pins in order:"
+            };
             Some(format!(
-                "- {word}: value is {meaning}; pins in order: {}",
+                "- {word}: value is {meaning}; {how} {}",
                 pins.join(" ")
             ))
         })
@@ -189,6 +267,12 @@ pub fn help() -> String {
 }
 
 fn build_kind(word: &str, value: &str) -> Result<(K, String), String> {
+    // "zener default" means the same as "diode zener".
+    let value = if word == "zener" && value.eq_ignore_ascii_case("default") {
+        "zener"
+    } else {
+        value
+    };
     let number = || parse_eng(value).map_err(|e| e.to_string());
     let positive = || {
         number().and_then(|v| {
@@ -209,6 +293,14 @@ fn build_kind(word: &str, value: &str) -> Result<(K, String), String> {
         "ind" => "inductor",
         "pot" => "potentiometer",
         "bjt" | "npn_bjt" => "npn",
+        "pulse" | "square" => "vpulse",
+        "pushbutton" => "button",
+        "zener" => "diode",
+        "arduino" | "mcu" | "microcontroller" => "atmega328p",
+        "7seg_cathode" | "7segment-cathode" | "7seg-cc" => "7seg-cathode",
+        "7seg_anode" | "7segment-anode" | "7seg-ca" => "7seg-anode",
+        "4digit_cathode" | "4digit-cc" => "4digit-cathode",
+        "4digit_anode" | "4digit-ca" => "4digit-anode",
         other => other,
     };
     Ok(match word {
@@ -311,6 +403,11 @@ fn build_kind(word: &str, value: &str) -> Result<(K, String), String> {
             )
         }
         "diode" => {
+            let value = if value.eq_ignore_ascii_case("zener") {
+                GENERIC_ZENER
+            } else {
+                value
+            };
             let model = model_name(value, ModelKind::Diode, GENERIC_DIODE, |m| K::Diode {
                 model: m,
             })?;
@@ -429,6 +526,128 @@ fn build_kind(word: &str, value: &str) -> Result<(K, String), String> {
             )
         }
         "logicled" => (K::LogicLed, "logic LED".to_string()),
+        "vpulse" => pulse_source(value)?,
+        "vcvs" => {
+            let gain = number()?;
+            (
+                K::Vcvs { gain },
+                format!("voltage-controlled voltage source ×{gain}"),
+            )
+        }
+        "vccs" => {
+            let g = number()?;
+            (
+                K::Vccs {
+                    transconductance: g,
+                },
+                format!("voltage-controlled current source {}", format_value(g, "S")),
+            )
+        }
+        "ccvs" => {
+            let r = number()?;
+            (
+                K::Ccvs { transresistance: r },
+                format!("current-controlled voltage source {}", format_value(r, "Ω")),
+            )
+        }
+        "cccs" => {
+            let gain = number()?;
+            (
+                K::Cccs { gain },
+                format!("current-controlled current source ×{gain}"),
+            )
+        }
+        "spdt" | "dpst" | "dpdt" => {
+            let form = match word {
+                "spdt" => SwitchForm::Spdt,
+                "dpst" => SwitchForm::Dpst,
+                _ => SwitchForm::Dpdt,
+            };
+            let thrown = match value.to_ascii_lowercase().as_str() {
+                "rest" => false,
+                "thrown" => true,
+                _ => return Err("the switch is either rest or thrown.".into()),
+            };
+            (
+                K::MultiSwitch {
+                    form,
+                    thrown,
+                    r_on: SWITCH_R_ON,
+                    r_off: SWITCH_R_OFF,
+                },
+                format!("{} switch", form.name()),
+            )
+        }
+        "button" => {
+            let closed = match value.to_ascii_lowercase().as_str() {
+                "closed" => true,
+                "open" => false,
+                _ => return Err("a push button rests either open or closed.".into()),
+            };
+            (
+                K::Switch {
+                    closed,
+                    r_on: SWITCH_R_ON,
+                    r_off: SWITCH_R_OFF,
+                    momentary: true,
+                },
+                format!(
+                    "push button, normally {}",
+                    if closed { "closed" } else { "open" }
+                ),
+            )
+        }
+        "cd4066" => (
+            K::Cd4066 {
+                r_on: CD4066_DEFAULT_R_ON,
+            },
+            "CD4066 analog switch".to_string(),
+        ),
+        "led" => {
+            let colour = led_colour(value)?;
+            (K::Led { colour }, format!("{} LED", colour.name()))
+        }
+        "ledbar" => {
+            let colour = led_colour(value)?;
+            (
+                K::LedBar { colour },
+                format!("{} 10-segment LED bar", colour.name()),
+            )
+        }
+        "7seg-cathode" | "7seg-anode" | "4digit-cathode" | "4digit-anode" => {
+            let colour = led_colour(value)?;
+            let common = if word.ends_with("cathode") {
+                CommonPin::Cathode
+            } else {
+                CommonPin::Anode
+            };
+            let (kind, what) = if word.starts_with('7') {
+                (K::SevenSegment { colour, common }, "7-segment display")
+            } else {
+                (K::FourDigit { colour, common }, "4-digit display")
+            };
+            (kind, format!("{} {what}, {}", colour.name(), common.name()))
+        }
+        "atmega328p" => {
+            let firmware = if value.eq_ignore_ascii_case("none") {
+                String::new()
+            } else {
+                value.to_string()
+            };
+            let program = if firmware.is_empty() {
+                "no program yet"
+            } else {
+                value
+            };
+            let summary = format!("ATmega328P microcontroller, {program}");
+            (
+                K::Mcu {
+                    firmware,
+                    clock: DEFAULT_MCU_CLOCK,
+                },
+                summary,
+            )
+        }
         other => {
             let words: Vec<&str> = KINDS.iter().map(|k| k.0).collect();
             return Err(format!(
@@ -437,6 +656,51 @@ fn build_kind(word: &str, value: &str) -> Result<(K, String), String> {
             ));
         }
     })
+}
+
+/// The colour of a LED: its name, or the word `default` for red.
+fn led_colour(value: &str) -> Result<LedColour, String> {
+    if value.eq_ignore_ascii_case("default") {
+        return Ok(LedColour::Red);
+    }
+    LedColour::ALL
+        .into_iter()
+        .find(|c| c.name().eq_ignore_ascii_case(value))
+        .ok_or_else(|| "the colour is red, yellow, green, blue or white.".into())
+}
+
+/// A square-wave voltage source from `low:high@frequency`.
+fn pulse_source(value: &str) -> Result<(K, String), String> {
+    let form = "write the value as low:high@frequency, such as 0:5@1k.";
+    let (levels, frequency) = value.split_once('@').ok_or(form)?;
+    let (low, high) = levels.split_once(':').ok_or(form)?;
+    let number = |text: &str| parse_eng(text).map_err(|e| e.to_string());
+    let (low, high, frequency) = (number(low)?, number(high)?, number(frequency)?);
+    if !(low.is_finite() && high.is_finite() && frequency > 0.0 && frequency.is_finite()) {
+        return Err("the levels must be numbers and the frequency above zero.".into());
+    }
+    let period = 1.0 / frequency;
+    // Edges of a microsecond, shorter for a very fast one.
+    let edge = (period / 100.0).min(1e-6);
+    Ok((
+        K::VoltageSource {
+            waveform: Waveform::Pulse {
+                v1: low,
+                v2: high,
+                delay: 0.0,
+                rise: edge,
+                fall: edge,
+                width: period / 2.0 - edge,
+                period,
+            },
+        },
+        format!(
+            "pulse source {} to {} at {}",
+            format_value(low, "V"),
+            format_value(high, "V"),
+            format_value(frequency, "Hz")
+        ),
+    ))
 }
 
 /// The delay of a logic part: the word `default`, or seconds.
@@ -522,10 +786,38 @@ pub fn add_parts(s: &mut Schematic, parts: &[NewPart]) -> Result<Vec<String>, St
         }
     }
 
+    for p in parts {
+        if let K::Mcu { firmware, .. } = &p.kind
+            && !firmware.is_empty()
+            && !s.sources.contains_key(firmware)
+        {
+            let have: Vec<&str> = s.sources.keys().map(String::as_str).collect();
+            let have = if have.is_empty() {
+                "none".to_string()
+            } else {
+                format!("none, or one of {}", have.join(", "))
+            };
+            return Err(format!(
+                "{}: there is no program file called {firmware}; use {have}.",
+                p.designator
+            ));
+        }
+    }
+
     let before = build_netlist(s);
+    // A pin of a part already there stands for the net it is on, and a pin
+    // of another new part for the net that one is given.
+    let mut parts = parts.to_vec();
+    join_new_pins(&mut parts);
+    for net in parts.iter_mut().flat_map(|p| &mut p.nets) {
+        if let Some(name) = net_of_pin(&before, net) {
+            *net = name;
+        }
+    }
+    let parts = &parts[..];
     let mut nets: HashMap<String, Net> = HashMap::new();
     for net in parts.iter().flat_map(|p| &p.nets) {
-        if !is_ground(net) {
+        if !is_ground(net) && net != UNJOINED {
             nets.entry(net.clone())
                 .or_insert_with(|| classify(&before, net));
         }
@@ -550,6 +842,59 @@ pub fn add_parts(s: &mut Schematic, parts: &[NewPart]) -> Result<Vec<String>, St
     Ok(notes)
 }
 
+/// The part and pin that `net` refers to, if it reads `DESIGNATOR.PIN` for
+/// one of the new parts.
+fn new_pin(parts: &[NewPart], net: &str) -> Option<(usize, usize)> {
+    let (designator, pin) = net.split_once('.')?;
+    let part = parts
+        .iter()
+        .position(|p| p.designator.eq_ignore_ascii_case(designator))?;
+    let pins = parts[part].kind.pins();
+    let pin = pins.iter().position(|p| p.name.eq_ignore_ascii_case(pin))?;
+    Some((part, pin))
+}
+
+/// Where a new part's net names a pin of another new part, put both on one
+/// net: the one that pin was given, or a new one if it was given none.
+fn join_new_pins(parts: &mut [NewPart]) {
+    for i in 0..parts.len() {
+        for j in 0..parts[i].nets.len() {
+            let Some((part, pin)) = new_pin(parts, &parts[i].nets[j]) else {
+                continue;
+            };
+            let given = &parts[part].nets[pin];
+            if given == UNJOINED || new_pin(parts, given).is_some() {
+                let p = &parts[part];
+                parts[part].nets[pin] = format!("{}_{}", p.designator, p.kind.pins()[pin].name);
+            }
+            parts[i].nets[j] = parts[part].nets[pin].clone();
+        }
+    }
+}
+
+/// The name of the net that pin `PIN` of the part `DESIGNATOR` is on, if
+/// `net` reads `DESIGNATOR.PIN` and is not itself the name of a net.
+fn net_of_pin(before: &Netlist, net: &str) -> Option<String> {
+    if before
+        .nodes
+        .iter()
+        .any(|n| n.name.eq_ignore_ascii_case(net))
+    {
+        return None;
+    }
+    let (designator, pin) = net.split_once('.')?;
+    let element = before
+        .elements
+        .iter()
+        .find(|e| e.designator.eq_ignore_ascii_case(designator))?;
+    let at = element
+        .kind
+        .pins()
+        .iter()
+        .position(|p| p.name.eq_ignore_ascii_case(pin))?;
+    Some(before.nodes[element.nodes[at].0].name.clone())
+}
+
 /// Draw the parts in free space below the drawing, each pin on a stub that
 /// ends in a net label (or a ground symbol).
 fn place_with_labels(
@@ -568,7 +913,7 @@ fn place_with_labels(
     let mut label_of: HashMap<String, String> = HashMap::new();
     let mut used: HashSet<String> = s.labels.iter().map(|l| l.name.clone()).collect();
     for net in parts.iter().flat_map(|p| &p.nets) {
-        if is_ground(net) || label_of.contains_key(net) {
+        if is_ground(net) || net == UNJOINED || label_of.contains_key(net) {
             continue;
         }
         let label = match nets.get(net) {
@@ -626,10 +971,10 @@ fn place_with_labels(
         let Some(c) = s.component(a.component) else {
             continue;
         };
-        let Some((_, at)) = c.pin_positions().nth(a.pin) else {
+        let Some((def, at)) = c.pin_positions().nth(a.pin) else {
             continue;
         };
-        let away = outward(Point::new(at.x - c.position.x, at.y - c.position.y));
+        let away = pin_direction(c, def.offset);
         let end = Point::new(at.x + away.x * STUB, at.y + away.y * STUB);
         s.add_wire(at, end);
         s.add_label(a.label.clone(), end);
@@ -653,7 +998,14 @@ fn place_with_labels(
 /// Copy a drawing made on its own into `s`, in the free space below what is
 /// already drawn.
 fn paste(s: &mut Schematic, placed: &Schematic) {
-    let (dx, dy) = free_space_below(s);
+    let (dx, mut dy) = free_space_below(s);
+    // A large part reaches well above and beside where it is placed.
+    if let (Some(floor), Some(ceiling)) = (
+        points_of(s).map(|p| p.y).max(),
+        points_of(placed).map(|p| p.y).min(),
+    ) {
+        dy = dy.max(floor + CLEARANCE - ceiling);
+    }
     let shift = |p: Point| Point::new(p.x + dx, p.y + dy);
     for c in &placed.components {
         let id = s.add_component_named(c.kind.clone(), c.designator.clone(), shift(c.position));
@@ -716,6 +1068,16 @@ fn place_tidy(
         names.join(", ")
     ));
     true
+}
+
+/// Every point a drawing reaches: its pins, wire ends and labels.
+fn points_of(s: &Schematic) -> impl Iterator<Item = Point> + '_ {
+    let pins = s
+        .components
+        .iter()
+        .flat_map(|c| c.pin_positions().map(|(_, at)| at).collect::<Vec<_>>());
+    pins.chain(s.wires.iter().flat_map(|w| [w.a, w.b]))
+        .chain(s.labels.iter().map(|l| l.position))
 }
 
 /// Where the labelled parts start: under everything that is drawn, at its left.
@@ -937,7 +1299,10 @@ fn try_wire(
     nets: &HashMap<String, Net>,
     part: &NewPart,
 ) -> Option<String> {
-    if part.kind.pins().len() != 2 || part.nets[0].eq_ignore_ascii_case(&part.nets[1]) {
+    if part.kind.pins().len() != 2
+        || part.nets[0].eq_ignore_ascii_case(&part.nets[1])
+        || part.nets.iter().any(|n| n == UNJOINED)
+    {
         return None;
     }
     let mut candidates_of: Vec<Vec<Point>> = Vec::new();
@@ -1120,6 +1485,20 @@ fn verify(
             return Err(format!("{} did not appear in the circuit.", p.designator));
         };
         for (net, &node) in p.nets.iter().zip(&e.nodes) {
+            if net == UNJOINED {
+                let pins = after.elements.iter().flat_map(|e| &e.nodes);
+                let alone = !node.is_ground()
+                    && !after.nodes[node.0].labelled
+                    && pins.filter(|&&n| n == node).count() == 1;
+                if !alone {
+                    return Err(format!(
+                        "An unused pin of {} would be joined to something; nothing was \
+                         changed.",
+                        p.designator
+                    ));
+                }
+                continue;
+            }
             let wanted = if is_ground(net) {
                 Some(NodeId::GROUND)
             } else {
@@ -1144,6 +1523,22 @@ pub fn check_add(s: &Schematic, parts: &[NewPart]) -> Result<Vec<String>, String
     add_parts(&mut s.clone(), parts)
 }
 
+/// What each pin of a new part joins, for the card.
+pub fn connections(part: &NewPart) -> String {
+    if part.nets.iter().all(|n| n != UNJOINED) {
+        return part.nets.join(", ");
+    }
+    let used: Vec<String> = part
+        .kind
+        .pins()
+        .iter()
+        .zip(&part.nets)
+        .filter(|(_, net)| *net != UNJOINED)
+        .map(|(pin, net)| format!("{} {net}", pin.name))
+        .collect();
+    used.join(", ")
+}
+
 /// What a part is, for the card.
 pub fn describe(s: &Schematic, designator: &str) -> Option<String> {
     let c = find(s, designator)?;
@@ -1162,7 +1557,7 @@ pub fn describe(s: &Schematic, designator: &str) -> Option<String> {
         K::Potentiometer { resistance, .. } => {
             format!("potentiometer {}", format_value(*resistance, "Ω"))
         }
-        _ => "part".to_string(),
+        other => crate::properties::kind_name(other).to_string(),
     };
     Some(format!("{} ({what})", c.designator))
 }
@@ -1503,6 +1898,217 @@ C1 capacitor 10u INPUT BASE
         assert_eq!(node_of(&s, "Vin", 0), "INPUT");
         assert_eq!(node_of(&s, "Vin", 1), "0");
         assert!(parse_add("Vin vsine 5 INPUT 0").is_err());
+    }
+
+    #[test]
+    fn every_part_in_the_palette_can_be_added() {
+        use std::mem::discriminant;
+        // The same sort of part, whatever its values.
+        let same = |a: &K, b: &K| {
+            discriminant(a) == discriminant(b)
+                && match (a, b) {
+                    (K::Bjt { polarity: a, .. }, K::Bjt { polarity: b, .. }) => a == b,
+                    (K::Mosfet { polarity: a, .. }, K::Mosfet { polarity: b, .. }) => a == b,
+                    (K::MultiSwitch { form: a, .. }, K::MultiSwitch { form: b, .. }) => a == b,
+                    (K::Switch { momentary: a, .. }, K::Switch { momentary: b, .. }) => a == b,
+                    (K::Gate { op: a, .. }, K::Gate { op: b, .. }) => a == b,
+                    (K::SevenSegment { common: a, .. }, K::SevenSegment { common: b, .. })
+                    | (K::FourDigit { common: a, .. }, K::FourDigit { common: b, .. }) => a == b,
+                    (K::VoltageSource { waveform: a }, K::VoltageSource { waveform: b }) => {
+                        discriminant(a) == discriminant(b)
+                    }
+                    _ => true,
+                }
+        };
+        let can: Vec<K> = KINDS
+            .iter()
+            .map(|(word, example, _)| build_kind(word, example).unwrap().0)
+            .collect();
+        for entry in library::palette() {
+            let kind = (entry.make)();
+            // Ground is net 0, and a junction only joins wires.
+            if matches!(kind, K::Ground | K::Junction) {
+                continue;
+            }
+            assert!(
+                can.iter().any(|k| same(k, &kind)),
+                "the assistant cannot add {}",
+                entry.name
+            );
+        }
+    }
+
+    #[test]
+    fn the_values_of_the_new_kinds_are_checked() {
+        let p = parse_add(
+            "V2 pulse 0:5@2k a 0\nD2 zener default a 0\nD3 diode zener b 0\n\
+             LED1 led Green a 0\nS2 button closed a b\nS3 dpdt thrown a b c d e f",
+        )
+        .unwrap();
+        assert!(matches!(
+            p[0].kind,
+            K::VoltageSource { waveform: Waveform::Pulse { v2, period, width, .. } }
+                if v2 == 5.0 && (period - 500e-6).abs() < 1e-12 && width < period / 2.0
+        ));
+        assert!(
+            p[1..3]
+                .iter()
+                .all(|d| matches!(&d.kind, K::Diode { model } if model == GENERIC_ZENER))
+        );
+        assert!(matches!(
+            p[3].kind,
+            K::Led {
+                colour: LedColour::Green
+            }
+        ));
+        for bad in [
+            "V2 vpulse 5@1k a 0",
+            "V2 vpulse 0:5@0 a 0",
+            "LED1 led purple a 0",
+            "S3 spdt open a b c",
+            "S2 button maybe a b",
+        ] {
+            assert!(parse_add(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_part_with_many_pins_may_name_only_those_it_uses() {
+        let p = parse_add("DS1 7seg-cathode red b=SB c=SC com=0").unwrap();
+        assert_eq!(p[0].nets, ["-", "SB", "SC", "-", "-", "-", "-", "-", "0"]);
+        assert_eq!(connections(&p[0]), "b SB, c SC, COM 0");
+        assert!(p[0].summary.contains("common cathode"), "{}", p[0].summary);
+        for (bad, needle) in [
+            ("DS1 7seg-cathode red b=SB q=SC", "no pin called q"),
+            ("DS1 7seg-cathode red b=SB SC", "every pin"),
+            ("DS1 7seg-cathode red b=SB B=SC", "twice"),
+            ("DS1 7seg-cathode red b= c=SC", "every pin"),
+            // Parts with few pins name them all, in order.
+            ("R1 resistor 1k p=A n=B", "pin order"),
+        ] {
+            let e = parse_add(bad).unwrap_err();
+            assert!(e.contains(needle), "{bad}: {e}");
+        }
+    }
+
+    #[test]
+    fn an_led_is_wired_to_a_pin_of_a_chip_that_is_already_there() {
+        let mut s = Schematic::new();
+        s.add_component(
+            K::Mcu {
+                firmware: String::new(),
+                clock: DEFAULT_MCU_CLOCK,
+            },
+            Point::new(0, 0),
+        );
+        // D1 sits in a row of pins, with others above and below it.
+        let parts = parse_add(
+            "R1 resistor 220 U1.D1 LA\nLED1 led red LA 0\nR2 resistor 220 u1.d13 LB\n\
+             LED2 led green LB 0",
+        )
+        .unwrap();
+        add_parts(&mut s, &parts).unwrap();
+        let n = build_netlist(&s);
+        let chip = n.element("U1").unwrap();
+        let pin = |name: &str| {
+            let at = chip.kind.pins().iter().position(|p| p.name == name);
+            chip.nodes[at.unwrap()]
+        };
+        assert_eq!(n.element("R1").unwrap().nodes[0], pin("D1"));
+        assert_eq!(n.element("R2").unwrap().nodes[0], pin("D13"));
+        assert_ne!(pin("D1"), pin("D13"));
+        assert!(n.diagnostics.is_empty(), "{:?}", n.diagnostics);
+    }
+
+    #[test]
+    fn a_chip_and_a_four_digit_display_are_added_to_a_circuit() {
+        let mut s = divider();
+        let before = build_netlist(&s);
+        let segments: String = ["a", "b", "c", "d", "e", "f", "g"]
+            .iter()
+            .enumerate()
+            .map(|(k, seg)| format!("R{} resistor 220 P{k} {seg}_net\n", k + 20))
+            .collect();
+        let chip_pins: String = (0..7).map(|k| format!(" D{k}=P{k}")).collect();
+        let display_pins: String = ["a", "b", "c", "d", "e", "f", "g"]
+            .iter()
+            .map(|seg| format!(" {seg}={seg}_net"))
+            .collect();
+        let text = format!(
+            "U1 atmega328p none{chip_pins} D8=0\n{segments}\
+             DS1 4digit-cathode red{display_pins} D1=0 D2=0 D3=0 D4=0"
+        );
+        let parts = parse_add(&text).unwrap();
+        add_parts(&mut s, &parts).unwrap();
+        let n = build_netlist(&s);
+        let (chip, display) = (n.element("U1").unwrap(), n.element("DS1").unwrap());
+        for k in 0..7 {
+            let r = n.element(&format!("R{}", k + 20)).unwrap();
+            assert_eq!(r.nodes, [chip.nodes[k], display.nodes[k]], "segment {k}");
+        }
+        // Nothing is drawn over anything else.
+        let areas: Vec<(&str, egui::Rect)> = s
+            .components
+            .iter()
+            .filter(|c| !matches!(c.kind, K::Ground))
+            .map(|c| (c.designator.as_str(), crate::symbols::bounds(c).shrink(0.1)))
+            .collect();
+        for (i, (a, area)) in areas.iter().enumerate() {
+            for (b, other) in &areas[i + 1..] {
+                assert!(!area.intersects(*other), "{a} lies over {b}");
+            }
+        }
+        // The unused pins stayed alone, so nothing is said of them, and the
+        // circuit that was there is untouched.
+        assert!(n.diagnostics.is_empty(), "{:?}", n.diagnostics);
+        for e in &before.elements {
+            let now = n.element(&e.designator).unwrap();
+            for (a, b) in e.nodes.iter().zip(&now.nodes) {
+                assert_eq!(before.nodes[a.0].name, n.nodes[b.0].name);
+            }
+        }
+    }
+
+    #[test]
+    fn a_pin_of_another_new_part_stands_for_its_net() {
+        let mut s = Schematic::new();
+        // D13 is named only from the resistor's side, D2 from both sides, and
+        // the chip's D3 is given a net that the other resistor refers to.
+        let parts = parse_add(
+            "U1 atmega328p none D2=U1.D2 D3=SIG\nR1 resistor 220 U1.D13 0\n\
+             R2 resistor 220 u1.d2 0\nR3 resistor 220 U1.D3 0",
+        )
+        .unwrap();
+        add_parts(&mut s, &parts).unwrap();
+        let n = build_netlist(&s);
+        let chip = n.element("U1").unwrap();
+        for (resistor, pin) in [("R1", "D13"), ("R2", "D2"), ("R3", "D3")] {
+            let at = chip.kind.pins().iter().position(|p| p.name == pin);
+            let node = chip.nodes[at.unwrap()];
+            assert_eq!(n.element(resistor).unwrap().nodes[0], node, "{resistor}");
+        }
+        assert!(n.diagnostics.is_empty(), "{:?}", n.diagnostics);
+    }
+
+    #[test]
+    fn a_chip_can_only_run_a_program_the_circuit_has() {
+        let parts = parse_add("U1 atmega328p main.ino D13=a").unwrap();
+        let mut s = Schematic::new();
+        let e = add_parts(&mut s.clone(), &parts).unwrap_err();
+        assert!(e.contains("no program file called main.ino"), "{e}");
+        s.sources.insert(
+            "main.ino".into(),
+            dunbrec_core::SourceFile {
+                language: dunbrec_core::SourceLanguage::Cpp,
+                text: "void setup() {}\n".into(),
+            },
+        );
+        add_parts(&mut s, &parts).unwrap();
+        assert!(
+            s.components
+                .iter()
+                .any(|c| matches!(&c.kind, K::Mcu { firmware, .. } if firmware == "main.ino"))
+        );
     }
 
     #[test]

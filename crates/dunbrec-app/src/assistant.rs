@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 
 use dunbrec_core::units::format_value;
-use dunbrec_core::{Netlist, Schematic};
+use dunbrec_core::{ComponentKind, Netlist, Schematic};
 use egui::{Align, Color32, FontId, Layout, RichText, ScrollArea, TextEdit, Ui};
 
 use crate::ai::{self, AiSettings, Chat, ChatMessage, Event, Request, Role};
@@ -65,7 +65,7 @@ C3 capacitor 100n VOUT 0
 Q2 npn 2N3904 NODEC NODEB 0
 V2 vsource 9 VCC 0
 ```
-Every part needs one net per pin, with none left out: a source has two (V2 above is + then -, \
+Except for parts with many pins (below), every part needs one net per pin, with none left out: a source has two (V2 above is + then -, \
 so ground is written as 0 for its second pin). For example, a complete common-emitter stage:
 ```dunbrec-add
 V1 vsource 9 VCC 0
@@ -78,10 +78,25 @@ Q1 npn 2N3904 COL BASE EMIT
 ```
 Kinds, what the value means, and the order of the pins (list the nets in that order):
 {PARTS}
-Choose designators that are not already in use. Controlled sources, the CD4066 and \
-microcontrollers cannot be added this way, nor can discrete LEDs, so describe those in \
-words. A two-pin part between nets that already exist is drawn beside them with real \
-wires; any other part goes below the drawing, joined by net labels.
+Choose designators that are not already in use. A two-pin part between nets that already \
+exist is drawn beside them with real wires; any other part goes below the drawing, joined \
+by net labels.
+
+To join a pin of a part already in the circuit, whether or not its net has a name, write \
+DESIGNATOR.PIN as the net, such as U1.D13. A part with many pins names only the pins it \
+uses, as PIN=NET, and leaves the rest unconnected:
+```dunbrec-add
+R1 resistor 220 U1.D13 LEDA
+LED1 led red LEDA 0
+DS1 7seg-cathode red a=SEGA b=SEGB COM=0
+R2 resistor 220 U1.D2 SEGA
+R3 resistor 220 U1.D3 SEGB
+```
+Every LED, and every segment of a display, needs its own resistor in series (about 220 Ω \
+from 5 V, 150 Ω for blue or white). The ATmega328P is powered at 5 V without any wiring. \
+A new one has no program unless its value names a file the circuit already has: to give it \
+one, ask the user to choose or create a program in the chip's properties first. Controlled \
+sources take their two output pins and then their two control pins.
 
 4. To remove parts, write a fenced block tagged dunbrec-remove with one designator per \
 line. Wires the user drew to a part stay where they are.
@@ -156,19 +171,18 @@ pub fn build_system_prompt(
     );
 
     out.push_str("## Circuit\n\n");
+    // SPICE has other names for LEDs and displays, and none for logic parts
+    // or chips: those circuits are listed part by part.
+    let has_leds = netlist
+        .elements
+        .iter()
+        .any(|e| matches!(e.kind, ComponentKind::Led { .. }) || e.kind.led_segments().is_some());
     if schematic.components.is_empty() {
         out.push_str("(empty schematic)\n");
     } else {
         match dunbrec_io::spice_export::export(schematic, title, &[]) {
-            Ok(spice) => out.push_str(&limited(&spice, CONTEXT_LIMIT / 2)),
-            Err(_) => {
-                out.push_str("(Could not be exported as SPICE; parts only:)\n");
-                for c in &schematic.components {
-                    let kind = format!("{:?}", c.kind);
-                    let kind: String = kind.chars().take(80).collect();
-                    out.push_str(&format!("{} {kind}\n", c.designator));
-                }
-            }
+            Ok(spice) if !has_leds => out.push_str(&limited(&spice, CONTEXT_LIMIT / 2)),
+            _ => out.push_str(&limited(&parts_list(netlist), CONTEXT_LIMIT / 2)),
         }
     }
 
@@ -191,6 +205,36 @@ pub fn build_system_prompt(
     for (name, file) in &schematic.sources {
         out.push_str(&format!("\n## Firmware: {name} ({:?})\n\n", file.language));
         out.push_str(&limited(&file.text, CONTEXT_LIMIT / 2));
+    }
+    out
+}
+
+/// Each part with what it is, and the net on each of its pins that is joined
+/// to anything.
+fn parts_list(netlist: &Netlist) -> String {
+    let mut pins_on = vec![0; netlist.nodes.len()];
+    for node in netlist.elements.iter().flat_map(|e| &e.nodes) {
+        pins_on[node.0] += 1;
+    }
+    let mut out = String::from(
+        "Parts, each as designator, kind and value, then PIN=NET for every connected pin \
+         (net 0 is ground; pins not listed are unconnected):\n",
+    );
+    for e in &netlist.elements {
+        let kind = crate::properties::kind_name(&e.kind);
+        let value = crate::canvas::value_text(&e.kind);
+        out.push_str(&format!("{}, {kind}", e.designator));
+        if !value.is_empty() {
+            out.push_str(&format!(", {value}"));
+        }
+        out.push(':');
+        for (pin, node) in e.kind.pins().iter().zip(&e.nodes) {
+            let net = &netlist.nodes[node.0];
+            if node.is_ground() || net.labelled || pins_on[node.0] > 1 {
+                out.push_str(&format!(" {}={}", pin.name, net.name));
+            }
+        }
+        out.push('\n');
     }
     out
 }
@@ -617,7 +661,12 @@ fn preview(ui: &mut Ui, edit: &Edit, schematic: &Schematic) -> bool {
             for p in parts {
                 ui.colored_label(
                     GOOD,
-                    format!("+ {}: {}  ({})", p.designator, p.summary, p.nets.join(", ")),
+                    format!(
+                        "+ {}: {}  ({})",
+                        p.designator,
+                        p.summary,
+                        part_edits::connections(p)
+                    ),
                 );
             }
             match part_edits::check_add(schematic, parts) {
@@ -743,6 +792,55 @@ fn split_blocks(text: &str) -> Vec<Block<'_>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_examples_given_to_the_model_can_be_read() {
+        let opening = format!(
+            "```{}
+",
+            part_edits::ADD_TAG
+        );
+        let blocks: Vec<&str> = INSTRUCTIONS
+            .split(&opening)
+            .skip(1)
+            .map(|rest| rest.split("```").next().unwrap())
+            .collect();
+        assert_eq!(blocks.len(), 3);
+        for block in blocks {
+            part_edits::parse_add(block).unwrap_or_else(|e| {
+                panic!(
+                    "{e}
+{block}"
+                )
+            });
+        }
+    }
+
+    #[test]
+    fn circuits_with_leds_or_chips_are_listed_with_their_connections() {
+        let mut s = Schematic::new();
+        let parts = part_edits::parse_add(
+            "U1 atmega328p none D13=LA\nR1 resistor 220 LA LB\nLED1 led red LB 0",
+        )
+        .unwrap();
+        part_edits::add_parts(&mut s, &parts).unwrap();
+        let netlist = dunbrec_core::build_netlist(&s);
+        let prompt = build_system_prompt("t", &s, &netlist, &Readings::default());
+        let circuit = prompt.split("## Circuit").nth(1).unwrap();
+        // The designators are those suggestions must use, not SPICE's.
+        for line in [
+            "U1, Microcontroller (ATmega328P), no firmware",
+            "D13=LA",
+            "R1, Resistor, 220 Ω: p=LA n=LB",
+            "LED1, LED, red: A=LB K=0",
+        ] {
+            assert!(circuit.contains(line), "{line}: {circuit}");
+        }
+        assert!(
+            !circuit.contains("DLED1") && !circuit.contains("D12="),
+            "{circuit}"
+        );
+    }
 
     #[test]
     fn code_fences_are_split_from_prose() {

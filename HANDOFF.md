@@ -8,9 +8,9 @@ high level, one line on what it is written in, no steps and no other technical d
 **no user guide**, by the user's decision: the project is too young and changes too much to keep
 one up to date.
 
-*Last updated: 2026-11-26, version 0.6.0 in progress: four LED displays (single LED, 10-segment
-bar, one- and four-digit 7-segment), and every chip's program is now a visible source file.
-Version 0.5.0 is released and published. Start at "0.6.0" below.*
+*Last updated: 2026-11-26, version 0.6.0 in progress: four LED displays, every chip's program is
+now a visible source file, and the assistant can add every part. Version 0.5.0 is released and
+published. Start at "0.6.0" below.*
 
 ## Status
 
@@ -44,7 +44,7 @@ the draft is a separate step, done when the user asks (`gh release edit v<versio
 | 0.5.0 | Projects screen (nothing else shown without a project); assistant draws new circuits with real wires and can add sine sources; no circuit open until one is opened; a central area that never collapses; closable schematic tab. See "0.5.0" below |
 | 0.4.0 | Settings dialog; Assistant (Ollama or Claude); pop-out instruments; text size; every confirmation a message box; Code panel tabs; project behaviour changes. See "0.4.0" below |
 
-Health at handoff: `cargo test --workspace` 536 passed, 0 failed (2 ignored: a real Recycle Bin check and an
+Health at handoff: `cargo test --workspace` 546 passed, 0 failed (2 ignored: a real Recycle Bin check and an
 emulator speed
 benchmark); `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --check`
 clean. Toolchain: Rust 1.99 (edition 2024, MSRV 1.90), Windows 11.
@@ -176,9 +176,9 @@ Key mechanisms worth knowing before changing the engine:
 3. **UI verification of phase 11 in the running app:** done. The readme screenshots show an
    Arduino sketch running with the serial monitor.
 4. **Assistant (0.4.0).** Not yet done: adding parts with more than two pins is drawn on labels
-   only (no real wires); rewiring (moving a pin to another net) is not a suggestion; controlled
-   sources, the CD4066, discrete LEDs and microcontrollers cannot be added; the logic analyser's
-   data is not in its context; it has not been run against a real model for long, so the prompt
+   only (no real wires; in 0.6.0 a new circuit of small parts is still drawn tidily); rewiring
+   (moving a pin to another net) is not a suggestion; it cannot create a program file for a chip,
+   only replace one the circuit has; the logic analyser's data is not in its context; it has not been run against a real model for long, so the prompt
    may need tuning (small local models are weak at circuit diagnosis). None of the 0.4.0 screens
    was checked by anything but the user looking at them and tests of the logic underneath.
 5. **More chips.**
@@ -271,8 +271,8 @@ How the assistant works (the rules worth keeping):
   **Every addition is verified** against the netlist (each new pin on the requested net; no
   existing net joined or split) or nothing changes. Removal deletes the part and the stubs or
   ground drawn for it; wires the user drew stay.
-- **Parts it cannot add:** controlled sources, CD4066, microcontrollers and LEDs (the LED part
-  came in 0.6.0; the assistant's prompt still says it cannot add discrete LEDs).
+- **Parts it can add:** every one in the palette since 0.6.0 (see "0.6.0"); a test fails if a
+  new palette part has no kind word.
 
 Other 0.4.0 behaviour:
 
@@ -429,11 +429,29 @@ the demos look dead: blink changed every 12 s). `sync_speed` tells a running sim
 
 ## 0.6.0 (in progress)
 
-**Where things stand.** All committed, and each piece tried by the user, who is happy with it:
-the single LED, the source-file changes below, the bar display, the one- and four-digit 7-segment
-displays, and the faster LED calculation. The branch is still only on this computer. Next in the
-agreed plan is the 14 or 16 segment display; which of the two has not been agreed (14 is
-recommended).
+**Where things stand.** Committed, each tried by the user, who is happy with it: the single LED,
+the source-file changes below, the bar display, the one- and four-digit 7-segment displays, and
+the faster LED calculation. The branch is still only on this computer. The LED display work is
+finished: the user decided on 2026-11-26 to skip the 14 or 16 segment display. Committed after
+that, with no word yet on how it does with a real model: the assistant adds every part (see "The
+assistant adds every part"). Releasing 0.6.0 has not been asked for.
+
+**The assistant adds every part** (asked for by the user).
+
+- New kind words in `part_edits::KINDS`: `vpulse` (`low:high@frequency`), the controlled sources,
+  `spdt` / `dpst` / `dpdt`, `button`, `cd4066`, `led`, `ledbar`, `7seg-cathode` / `-anode`,
+  `4digit-cathode` / `-anode` and `atmega328p` (value `none` or a source file the circuit has).
+  A zener is `diode zener`.
+- A part with more than `layout::MANY_PINS` (8) pins may name only the pins it uses (`COM=0`);
+  the rest are `layout::UNJOINED` (`-`), and `verify` checks they stayed unjoined.
+- `U1.D13` as a net means that pin's net, for a part already there (`net_of_pin`) or one in the
+  same block (`join_new_pins`).
+- Drawing: large parts get their own room in `layout`, their stubs lead away from the side the
+  pin is on (`pin_direction`), pasted parts clear the drawing above, and `tidy` leaves them to
+  the labelled layout.
+- A circuit with LEDs, displays or anything SPICE cannot hold is described to the model by
+  `assistant::parts_list` (designator, kind, value, `PIN=NET`), not SPICE, whose names differ.
+- Not run against a real model: the prompt may need tuning.
 
 **What a chip runs is always a file the user can see** (the user found it confusing that a demo
 ran with no source file; the table of changes was agreed).
@@ -457,7 +475,7 @@ ran with no source file; the table of changes was agreed).
 user try each: (1) single LED, *done*; (2) 10-segment bar display, each LED with its own two
 pins, *done*; (3) one-digit 7-segment with decimal point,
 common cathode or common anode, *done*; (4) four-digit 7-segment sharing its segment pins, *done*;
-(5) 14 or 16 segment.
+(5) 14 or 16 segment, *skipped by the user* (do not propose it again).
 
 - *Electrically real* (the user's choice over a logic indicator): needs a series resistor, shines by
   current. The Logic LED stays for quick checks.
@@ -466,8 +484,7 @@ common cathode or common anode, *done*; (4) four-digit 7-segment sharing its seg
   20 ms of simulated time at real speed, less in slow motion.
 - `ComponentKind::Led { colour }`; `LedColour::model` is the diode model (no library entry), also
   written by the SPICE export. Drawing is `Painter::led_light` and `too_much_current` in
-  `canvas.rs`; the palette group is "Displays". The assistant cannot add LEDs yet, and the curve
-  tracer does not list them.
+  `canvas.rs`; the palette group is "Displays". The curve tracer does not list LEDs.
 - *Bar display:* `ComponentKind::LedBar { colour }`, designator `DS`, one colour for all ten,
   anodes `A1`–`A10` on the left and cathodes `K1`–`K10` on the right, segment 1 at the top.
 - *How a display works* (reuse this for the 7-segment parts):

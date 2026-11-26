@@ -24,7 +24,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 
 use dunbrec_core::{ComponentKind, ModelLibrary, Point, Rotation, Schematic};
 
-use crate::layout::{Part, STUB, ground_rotation, is_ground, outward};
+use crate::layout::{MANY_PINS, Part, STUB, UNJOINED, ground_rotation, is_ground, outward};
 
 /// Clear columns between neighbouring columns.
 const GAP: i32 = 6;
@@ -327,7 +327,9 @@ fn body_cells(pins: &[Point]) -> Vec<Point> {
 
 /// Draw `parts` with wires, or `None` if they cannot be laid out that way.
 pub fn tidy(parts: &[Part], models: ModelLibrary) -> Option<Schematic> {
-    if parts.is_empty() {
+    // Large parts, and pins left alone, are for the labelled layout.
+    let beyond = |p: &Part| p.kind.pins().len() > MANY_PINS || p.nets.iter().any(|n| n == UNJOINED);
+    if parts.is_empty() || parts.iter().any(beyond) {
         return None;
     }
     let n = parts.len();

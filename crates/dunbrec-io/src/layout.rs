@@ -10,7 +10,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use dunbrec_core::{ComponentKind, ModelLibrary, Point, Rotation, Schematic};
+use dunbrec_core::{Component, ComponentKind, ModelLibrary, Point, Rotation, Schematic};
 
 /// One part to place.
 #[derive(Debug, Clone, PartialEq)]
@@ -18,12 +18,18 @@ pub struct Part {
     pub designator: String,
     pub kind: ComponentKind,
     /// Net name of each pin, in [`ComponentKind::pins`] order. `"0"` (or
-    /// `"gnd"`, any case) is ground.
+    /// `"gnd"`, any case) is ground, and [`UNJOINED`] a pin left alone.
     pub nets: Vec<String>,
     /// Where the source drawing put the part, if it had one.
     pub position: Option<Point>,
     pub rotation: Rotation,
 }
+
+/// In place of a net name: the pin is joined to nothing.
+pub const UNJOINED: &str = "-";
+/// A part with more pins than this is large: it is given its own room, and
+/// its stubs lead away from the side of the part each pin is on.
+pub const MANY_PINS: usize = 8;
 
 /// Grid spacing between automatically placed parts.
 const SPACING_X: i32 = 14;
@@ -41,7 +47,7 @@ fn connection_order(parts: &[Part]) -> Vec<usize> {
     let mut by_net: HashMap<&str, Vec<usize>> = HashMap::new();
     for (i, p) in parts.iter().enumerate() {
         for net in &p.nets {
-            if !is_ground(net) {
+            if !is_ground(net) && net != UNJOINED {
                 by_net.entry(net).or_default().push(i);
             }
         }
@@ -76,6 +82,60 @@ pub fn outward(offset: Point) -> Point {
     }
 }
 
+/// The way a stub leads from the pin of `c` whose offset in the part is
+/// `offset`, as the part is turned.
+pub fn pin_direction(c: &Component, offset: Point) -> Point {
+    let pins = c.kind.pins();
+    let turn = |p: Point| c.transform(p) - c.position;
+    if pins.len() <= MANY_PINS {
+        return outward(turn(offset));
+    }
+    // A large part has rows of pins: those down a side lead sideways, even
+    // the ones further from the middle than the side is.
+    let left = pins.iter().map(|p| p.offset.x).min().unwrap_or(0);
+    let right = pins.iter().map(|p| p.offset.x).max().unwrap_or(0);
+    turn(if offset.x == left {
+        Point::new(-1, 0)
+    } else if offset.x == right {
+        Point::new(1, 0)
+    } else {
+        Point::new(0, offset.y.signum())
+    })
+}
+
+/// Where each column (or row) of the grid goes, given the room each part in
+/// `slots` needs in that direction and which column (or row) it is in.
+fn spread(slots: &[(usize, i32)], spacing: i32) -> Vec<i32> {
+    let count = slots.iter().map(|s| s.0 + 1).max().unwrap_or(0);
+    let mut room = vec![spacing; count];
+    for &(at, needed) in slots {
+        room[at] = room[at].max(needed);
+    }
+    let mut places = Vec::with_capacity(count);
+    let mut place = 0;
+    for (i, &r) in room.iter().enumerate() {
+        if i > 0 {
+            place += (room[i - 1] + r) / 2;
+        }
+        places.push(place);
+    }
+    places
+}
+
+/// The room a part needs, across and down.
+fn room(kind: &ComponentKind) -> (i32, i32) {
+    let pins = kind.pins();
+    if pins.len() <= MANY_PINS {
+        return (SPACING_X, SPACING_Y);
+    }
+    let span = |of: fn(Point) -> i32| {
+        let all = pins.iter().map(|p| of(p.offset));
+        all.clone().max().unwrap_or(0) - all.min().unwrap_or(0)
+    };
+    // The stubs at both ends, and the labels beyond them.
+    (span(|p| p.x) + 2 * STUB + 12, span(|p| p.y) + 2 * STUB + 6)
+}
+
 /// Rotation that points a ground symbol (drawn downwards) along `dir`.
 pub fn ground_rotation(dir: Point) -> Rotation {
     match (dir.x, dir.y) {
@@ -91,21 +151,34 @@ pub fn layout(parts: &[Part], models: ModelLibrary) -> Schematic {
     s.models = models;
     let columns = ((parts.len() as f64 * 1.5).sqrt().ceil() as usize).max(1);
 
-    for (slot, &i) in connection_order(parts).iter().enumerate() {
+    let order = connection_order(parts);
+    let rooms = || {
+        order
+            .iter()
+            .enumerate()
+            .map(|(slot, &i)| (slot % columns, slot / columns, room(&parts[i].kind)))
+    };
+    let across: Vec<(usize, i32)> = rooms().map(|(col, _, r)| (col, r.0)).collect();
+    let down: Vec<(usize, i32)> = rooms().map(|(_, row, r)| (row, r.1)).collect();
+    let (xs, ys) = (spread(&across, SPACING_X), spread(&down, SPACING_Y));
+
+    for (slot, &i) in order.iter().enumerate() {
         let part = &parts[i];
-        let position = part.position.unwrap_or_else(|| {
-            let (col, row) = (slot % columns, slot / columns);
-            Point::new(col as i32 * SPACING_X, row as i32 * SPACING_Y)
-        });
+        let position = part
+            .position
+            .unwrap_or_else(|| Point::new(xs[slot % columns], ys[slot / columns]));
         let id = s.add_component_named(part.kind.clone(), part.designator.clone(), position);
         let c = s.component_mut(id).expect("just added");
         c.rotation = part.rotation;
         let pins: Vec<(Point, Point)> = c
             .pin_positions()
-            .map(|(def, at)| (at, outward(part.rotation.apply(def.offset))))
+            .map(|(def, at)| (at, pin_direction(c, def.offset)))
             .collect();
 
         for ((at, dir), net) in pins.into_iter().zip(&part.nets) {
+            if net == UNJOINED {
+                continue;
+            }
             let end = Point::new(at.x + dir.x * STUB, at.y + dir.y * STUB);
             s.add_wire(at, end);
             if is_ground(net) {
@@ -181,6 +254,54 @@ mod tests {
             .map(|c| c.position)
             .collect();
         assert_eq!(positions.len(), 4);
+    }
+
+    #[test]
+    fn large_parts_get_room_and_stubs_that_join_nothing_else() {
+        use dunbrec_core::{CommonPin, LedColour};
+        let colour = LedColour::Red;
+        let common = CommonPin::Cathode;
+        let kinds = [
+            ComponentKind::Mcu {
+                firmware: String::new(),
+                clock: 16e6,
+            },
+            ComponentKind::LedBar { colour },
+            ComponentKind::SevenSegment { colour, common },
+            ComponentKind::FourDigit { colour, common },
+            ComponentKind::Cd4066 { r_on: 100.0 },
+        ];
+        // Every pin on a net of its own, so any two that touched would show,
+        // but for the first pin of each part, which is left alone.
+        let parts: Vec<Part> = kinds
+            .iter()
+            .enumerate()
+            .map(|(i, kind)| Part {
+                designator: format!("P{i}"),
+                kind: kind.clone(),
+                nets: (0..kind.pins().len())
+                    .map(|n| match n {
+                        0 => UNJOINED.to_string(),
+                        _ => format!("n{i}_{n}"),
+                    })
+                    .collect(),
+                position: None,
+                rotation: Rotation::R0,
+            })
+            .collect();
+        let s = layout(&parts, ModelLibrary::new());
+        let n = build_netlist(&s);
+        for p in &parts {
+            let e = n.element(&p.designator).unwrap();
+            for (pin, (net, node)) in p.nets.iter().zip(&e.nodes).enumerate() {
+                let node = &n.nodes[node.0];
+                if net == UNJOINED {
+                    assert!(!node.labelled, "{} pin {pin}", p.designator);
+                } else {
+                    assert_eq!(&node.name, net, "{} pin {pin}", p.designator);
+                }
+            }
+        }
     }
 
     #[test]
