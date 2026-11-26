@@ -3,7 +3,7 @@
 State of the project for whoever picks it up next. User-facing documentation is in
 [README.md](README.md); this file covers status, decisions and open work.
 
-*Last updated: 2026-11-26, version 0.5.0 in progress (0.4.0 released: assistant, settings, message boxes, project behaviour). Next task: the multi-document editor, designed in [docs/multi-document-editor.md](docs/multi-document-editor.md), stage 1 done.*
+*Last updated: 2026-11-26, version 0.5.0 in progress (0.4.0 released: assistant, settings, message boxes, project behaviour). Next task: the multi-document editor, designed in [docs/multi-document-editor.md](docs/multi-document-editor.md): both rows of tabs built, not yet tried by hand.*
 
 ## Status
 
@@ -31,7 +31,7 @@ drafts the GitHub release (see `.github/workflows/release.yml`).
 | 0.5.0 (in progress) | Projects screen (nothing else shown without a project); assistant draws new circuits with real wires and can add sine sources; no circuit open until one is opened; a central area that never collapses; closable schematic tab. See "0.5.0" below |
 | 0.4.0 | Settings dialog; Assistant (Ollama or Claude); pop-out instruments; text size; every confirmation a message box; Code panel tabs; project behaviour changes. See "0.4.0" below |
 
-Health at handoff: `cargo test --workspace` 441 passed, 0 failed (1 ignored: an emulator speed
+Health at handoff: `cargo test --workspace` 455 passed, 0 failed (1 ignored: an emulator speed
 benchmark); `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --check`
 clean. Toolchain: Rust 1.99 (edition 2024, MSRV 1.90), Windows 11.
 
@@ -331,19 +331,41 @@ a sketch, starts a build. The compiled-in `builtin:` programs (`programs.rs`) re
 chips, the examples and older circuits; *Edit code* on such a chip makes a copy. Keep a demo's
 two sources and its compiled-in program behaving alike (tests in `demos.rs`).
 
+**Scrolling the schematic.** The wheel scrolls (Shift: sideways, which egui does itself), Ctrl or
+a pinch zooms, middle-drag and the two scroll bars move the view (`Canvas::scroll_bars`; the bars
+cover `scroll_extent`: the drawing plus half a screen, and what is in view).
+
+**Run builds sketches first.** `start_sim_with` finds unbuilt ones (`unbuilt_sketches`,
+`dunbrec_sim::unbuilt_sketch`) and sets `run_after_build`; `continue_run` builds them one by one
+through the circuit's `CodeEditor`, then starts, or shows the failing file and a message.
+
 **Speed "Auto"** (`Bench::run_speed`) is real time for a circuit with a microcontroller while the
 oscilloscope and logic analyser are closed, otherwise four scope screens per second (which made
 the demos look dead: blink changed every 12 s). `sync_speed` tells a running simulation.
 
-**Still single-document.** One circuit at a time. The next task is the multi-document editor: see
-[docs/multi-document-editor.md](docs/multi-document-editor.md) (an `OpenCircuit` struct per open
-circuit; two rows of tabs, circuits above the active circuit's schematic and source files; code is
-tied to the microcontroller that runs it, shared between chips of one circuit but never between
-circuits; only the active circuit simulates; one unsaved-changes prompt for all). Decisions agreed 2026-11-26; the stage 0 trial showed the two rows work in egui_dock
-(findings in the design). Stage 1 is done: per-circuit state is in `OpenCircuit`
-(`open_circuit.rs`), still exactly one circuit. The demo copies and the speed change have been
-tested headlessly, not yet tried by hand. Next:
-stage 2, several circuit tabs.
+**Several circuits, two rows of tabs** (design and decisions:
+[docs/multi-document-editor.md](docs/multi-document-editor.md)).
+
+- *Top row:* each open circuit is `Pane::Circuit(id)` in the central area, which the invisible
+  `Pane::Workspace` tab marks permanently. `dock::sync_documents` keeps the tabs matching the open
+  circuits and puts a dragged-away one back; the app passes `AllowedSplits::None` while a circuit
+  tab is being dragged. `Pane::Schematic` is now an alias of `Workspace` (old layouts), and the
+  Code panel is gone.
+- *Second row:* each `OpenCircuit` has a `DockState<DocTab>` (schematic and source files), drawn by
+  a nested `DockArea` (`DocViewer` in `app.rs`). `hidden` holds closed file tabs. `code_ui.rs`
+  draws one file (`CodeEditor::show_file`); builds are polled every frame.
+- *Active circuit:* `circuits` is never empty (a blank, unshown one when none is open, with
+  `circuit_open` false), so code that reads "the document" always has one. `switch_to` stops the
+  simulation, swaps the instruments, debugger, serial monitor and assistant (`Tools`) between the
+  app and the circuits, keeps which windows are shown and the speed, and carries the clipboard.
+  `add_circuit` and `close_circuit_at` are the only ways circuits come and go.
+- *Unsaved changes:* `at_risk(&Pending)` lists them; one gets `dialog::unsaved_changes`, several
+  `dialog::unsaved_list`.
+- *No shared source files:* `shared_sources` is checked when a circuit is opened (offering copies,
+  `open_with_copies`) and when it is saved elsewhere. It only knows about *open* circuits. The
+  assistant's new-file suggestions are not checked.
+- *Not done:* the Project panel's circuit / chip / file tree and "Not used" list, refusing a file
+  that a closed circuit uses, Ctrl+Tab and a window list.
 
 ## Gotchas
 

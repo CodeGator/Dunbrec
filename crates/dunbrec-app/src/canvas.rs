@@ -237,8 +237,20 @@ pub fn node_tag_positions(s: &Schematic, netlist: &Netlist) -> Vec<TagPlace> {
     out
 }
 
+/// A scroll bar's thumb being dragged.
+#[derive(Clone, Copy)]
+struct ScrollDrag {
+    axis: usize,
+    /// How far along the thumb it was taken hold of, in points.
+    grab: f32,
+    /// What the bars covered when the drag began; kept for the whole drag so
+    /// that the thumb stays under the pointer.
+    extent: Rect,
+}
+
 pub struct Canvas {
     pub camera: Camera,
+    scrolling: Option<ScrollDrag>,
     pub tool: Tool,
     pub selection: BTreeSet<Item>,
     wire_start: Option<Point>,
@@ -261,6 +273,7 @@ impl Default for Canvas {
     fn default() -> Self {
         Self {
             camera: Camera::default(),
+            scrolling: None,
             tool: Tool::Select,
             selection: BTreeSet::new(),
             wire_start: None,
@@ -338,6 +351,30 @@ pub fn segment_distance(p: Pos2, a: Pos2, b: Pos2) -> f32 {
 }
 
 /// Approximate extent of a net label (in grid units).
+/// Width of the schematic's scroll bars.
+const SCROLLBAR: f32 = 14.0;
+/// The shortest a scroll bar's thumb gets, so it can be taken hold of.
+const MIN_THUMB: f32 = 28.0;
+
+/// The area the drawing takes up, in grid units; `None` if there is nothing.
+pub fn drawing_bounds(s: &Schematic) -> Option<Rect> {
+    let parts = s.components.iter().map(symbols::bounds);
+    let wires = s
+        .wires
+        .iter()
+        .map(|w| Rect::from_two_pos(to_pos(w.a), to_pos(w.b)));
+    let labels = s.labels.iter().map(|l| label_rect(l.position, &l.name));
+    parts.chain(wires).chain(labels).reduce(Rect::union)
+}
+
+/// What the scroll bars cover, in grid units: the drawing with half a screen
+/// of room around it, so that there is always space to add to it at the edges,
+/// and whatever is in view now.
+fn scroll_extent(drawing: Option<Rect>, visible: Rect) -> Rect {
+    let drawing = drawing.unwrap_or_else(|| Rect::from_min_size(visible.center(), Vec2::ZERO));
+    drawing.expand2(visible.size() / 2.0).union(visible)
+}
+
 fn label_rect(position: Point, name: &str) -> Rect {
     let p = to_pos(position);
     Rect::from_min_max(
@@ -987,6 +1024,102 @@ impl Canvas {
         self.label_request.is_some()
     }
 
+    /// Draw the scroll bars of the drawing shown in `view`, in the strips of
+    /// `area` beside and below it, and move the view as they are used.
+    fn scroll_bars(&mut self, ui: &mut Ui, area: Rect, view: Rect, s: &Schematic) {
+        let corner = Rect::from_min_max(view.max, area.max);
+        let tracks = [
+            Rect::from_min_max(
+                pos2(view.left(), view.bottom()),
+                pos2(view.right(), area.bottom()),
+            ),
+            Rect::from_min_max(
+                pos2(view.right(), view.top()),
+                pos2(area.right(), view.bottom()),
+            ),
+        ];
+        ui.painter()
+            .rect_filled(corner, 0.0, ui.visuals().extreme_bg_color);
+        for (axis, track) in tracks.into_iter().enumerate() {
+            let visible = Rect::from_min_max(
+                self.camera.to_grid(view.min, view.min),
+                self.camera.to_grid(view.min, view.max),
+            );
+            let held = self.scrolling.filter(|d| d.axis == axis);
+            let extent =
+                held.map_or_else(|| scroll_extent(drawing_bounds(s), visible), |d| d.extent);
+            // Along this axis, in grid units.
+            let (start, length) = (extent.min[axis], extent.size()[axis]);
+            let (from, shown) = (visible.min[axis], visible.size()[axis]);
+            let room = (length - shown).max(0.0);
+            // And on the track, in points.
+            let along = track.size()[axis];
+            let size = (along * shown / length.max(f32::EPSILON))
+                .max(MIN_THUMB)
+                .min(along);
+            let travel = along - size;
+            let part = if room > 0.0 {
+                ((from - start) / room).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let mut thumb = track;
+            thumb.min[axis] = track.min[axis] + part * travel;
+            thumb.max[axis] = thumb.min[axis] + size;
+
+            let id = ui.id().with(("schematic scroll", axis));
+            let response = ui.interact(track, id, Sense::click_and_drag());
+            if response.drag_started_by(PointerButton::Primary)
+                && let Some(press) = ui.input(|i| i.pointer.press_origin())
+                && thumb.contains(press)
+            {
+                self.scrolling = Some(ScrollDrag {
+                    axis,
+                    grab: press[axis] - thumb.min[axis],
+                    extent,
+                });
+            }
+            let mut to = None;
+            if let Some(held) = self.scrolling.filter(|d| d.axis == axis)
+                && let Some(pointer) = response.interact_pointer_pos()
+                && travel > 0.0
+            {
+                let part = (pointer[axis] - held.grab - track.min[axis]) / travel;
+                to = Some(start + part.clamp(0.0, 1.0) * room);
+            } else if response.clicked()
+                && let Some(click) = response.interact_pointer_pos()
+                && !thumb.contains(click)
+            {
+                // A click beside the thumb moves most of a screen that way.
+                let step = if click[axis] < thumb.min[axis] {
+                    -shown
+                } else {
+                    shown
+                };
+                to = Some((from + 0.9 * step).clamp(start, start + room));
+            }
+            if let Some(to) = to {
+                self.camera.offset[axis] = -to * self.camera.scale;
+            }
+            if response.drag_stopped() {
+                self.scrolling = None;
+            }
+
+            let visuals = ui.visuals();
+            let strength = if response.dragged() {
+                0.85
+            } else if response.hovered() {
+                0.65
+            } else {
+                0.45
+            };
+            let color = visuals.text_color().gamma_multiply(strength);
+            ui.painter()
+                .rect_filled(track, 0.0, visuals.extreme_bg_color);
+            ui.painter().rect_filled(thumb.shrink(2.0), 4.0, color);
+        }
+    }
+
     /// Show the canvas, handle input, and edit `doc`.
     pub fn show(
         &mut self,
@@ -997,9 +1130,14 @@ impl Canvas {
         markers: &[Marker],
         lit: &std::collections::HashSet<ComponentId>,
     ) {
-        let (response, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
-        let rect = response.rect;
+        // The drawing, with a scroll bar to its right and one below.
+        let (area, _) = ui.allocate_exact_size(ui.available_size(), Sense::hover());
+        let rect = Rect::from_min_max(area.min, (area.max - Vec2::splat(SCROLLBAR)).max(area.min));
+        let response = ui.interact(rect, ui.id().with("schematic"), Sense::click_and_drag());
+        let painter = ui.painter_at(rect);
         let origin = rect.min;
+        // First, so that what is drawn is where the bars have taken it.
+        self.scroll_bars(ui, area, rect, doc.schematic());
         let colors = Palette::for_ui(ui);
         let pointer = response.hover_pos().or(response.interact_pointer_pos());
         let grid_pointer = pointer.map(|p| self.camera.to_grid(origin, p));
@@ -1012,15 +1150,16 @@ impl Canvas {
             .and_then(|_| ui.input(|i| i.pointer.latest_pos()))
             .map(|p| snap(self.camera.to_grid(origin, p)));
 
-        // ---- navigation: zoom with the wheel, pan with middle drag ----
+        // ---- navigation: the wheel scrolls (sideways with Shift) and zooms
+        // with Ctrl, as does a pinch; the middle button drags the drawing ----
         if response.hovered() {
             let (scroll, zoom) = ui.input(|i| (i.smooth_scroll_delta, i.zoom_delta()));
-            if let Some(p) = pointer {
-                let factor = zoom * (scroll.y * 0.0025).exp();
-                if (factor - 1.0).abs() > 1e-4 {
-                    self.camera.zoom_at(origin, p, factor);
-                }
+            if let Some(p) = pointer
+                && (zoom - 1.0).abs() > 1e-4
+            {
+                self.camera.zoom_at(origin, p, zoom);
             }
+            self.camera.offset += scroll;
         }
         if response.dragged_by(PointerButton::Middle) {
             self.camera.offset += response.drag_delta();
@@ -1748,6 +1887,190 @@ impl Canvas {
 mod tests {
     use super::*;
     use crate::examples::voltage_divider;
+
+    /// A canvas filling a headless window, driven by made-up events.
+    struct Rig {
+        ctx: egui::Context,
+        canvas: Canvas,
+        doc: Document,
+        netlist: Netlist,
+        time: f64,
+    }
+
+    impl Rig {
+        const WINDOW: Vec2 = vec2(800.0, 600.0);
+
+        fn new(schematic: Schematic) -> Self {
+            let netlist = dunbrec_core::build_netlist(&schematic);
+            let mut rig = Rig {
+                ctx: egui::Context::default(),
+                canvas: Canvas::default(),
+                doc: Document::new(schematic, None),
+                netlist,
+                time: 0.0,
+            };
+            rig.settle();
+            rig
+        }
+
+        fn frame(&mut self, modifiers: egui::Modifiers, events: Vec<egui::Event>) {
+            self.time += 0.1;
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Self::WINDOW)),
+                time: Some(self.time),
+                modifiers,
+                events,
+                ..Default::default()
+            };
+            let (canvas, doc, netlist) = (&mut self.canvas, &mut self.doc, &self.netlist);
+            let _ = self.ctx.run(input, |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| {
+                        canvas.show(ui, doc, netlist, &[], &[], &Default::default());
+                    });
+            });
+        }
+
+        fn settle(&mut self) {
+            for _ in 0..30 {
+                self.frame(egui::Modifiers::NONE, vec![]);
+            }
+        }
+
+        /// Turn the wheel (towards the user is negative) over the drawing.
+        fn wheel(&mut self, lines: f32, modifiers: egui::Modifiers) {
+            let at = pos2(300.0, 300.0);
+            self.frame(modifiers, vec![egui::Event::PointerMoved(at)]);
+            self.frame(
+                modifiers,
+                vec![egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Line,
+                    delta: vec2(0.0, lines),
+                    modifiers,
+                }],
+            );
+            for _ in 0..30 {
+                self.frame(modifiers, vec![]);
+            }
+        }
+
+        fn button(&mut self, at: Pos2, pressed: bool) {
+            self.frame(
+                egui::Modifiers::NONE,
+                vec![egui::Event::PointerButton {
+                    pos: at,
+                    button: PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+        }
+
+        fn drag(&mut self, from: Pos2, to: Pos2) {
+            let moved = |p| vec![egui::Event::PointerMoved(p)];
+            self.frame(egui::Modifiers::NONE, moved(from));
+            self.button(from, true);
+            for i in 1..=10 {
+                let at = from + (to - from) * (i as f32 / 10.0);
+                self.frame(egui::Modifiers::NONE, moved(at));
+            }
+            self.button(to, false);
+            self.settle();
+        }
+
+        /// The part of the schematic in view, in grid units.
+        fn visible(&self) -> Rect {
+            let c = self.canvas.camera;
+            let size = Self::WINDOW - Vec2::splat(SCROLLBAR);
+            Rect::from_min_max(
+                c.to_grid(Pos2::ZERO, Pos2::ZERO),
+                c.to_grid(Pos2::ZERO, Pos2::ZERO + size),
+            )
+        }
+    }
+
+    #[test]
+    fn the_wheel_scrolls_and_zooms_with_ctrl() {
+        let mut rig = Rig::new(voltage_divider());
+        let start = rig.canvas.camera;
+        rig.wheel(-2.0, egui::Modifiers::NONE);
+        let down = rig.canvas.camera;
+        assert_eq!(down.scale, start.scale);
+        assert!(down.offset.y < start.offset.y, "further down the drawing");
+        assert_eq!(down.offset.x, start.offset.x);
+        rig.wheel(-2.0, egui::Modifiers::SHIFT);
+        let right = rig.canvas.camera;
+        assert!(right.offset.x < down.offset.x, "further to the right");
+        assert_eq!((right.scale, right.offset.y), (down.scale, down.offset.y));
+        // Zooming keeps what is under the pointer where it is.
+        let ctrl = egui::Modifiers {
+            ctrl: true,
+            command: true,
+            ..Default::default()
+        };
+        let at = pos2(300.0, 300.0);
+        let under = right.to_grid(Pos2::ZERO, at);
+        rig.wheel(2.0, ctrl);
+        let zoomed = rig.canvas.camera;
+        assert!(zoomed.scale > right.scale);
+        assert!(zoomed.to_grid(Pos2::ZERO, at).distance(under) < 0.01);
+    }
+
+    #[test]
+    fn the_scroll_bars_move_the_view_over_the_whole_drawing() {
+        let mut s = Schematic::new();
+        // A drawing far wider and taller than the window.
+        s.add_wire(Point::new(0, 0), Point::new(200, 0));
+        s.add_wire(Point::new(0, 0), Point::new(0, 150));
+        let mut rig = Rig::new(s);
+        let drawing = drawing_bounds(rig.doc.schematic()).unwrap();
+        let start = rig.visible();
+        let extent = scroll_extent(Some(drawing), start);
+        assert!(extent.contains_rect(drawing.expand(1.0)));
+        // The bottom bar's thumb, dragged to the far end, shows the right
+        // edge of the drawing; up and down is left alone.
+        let along = rig.canvas.camera;
+        let width = Rig::WINDOW.x - SCROLLBAR;
+        let thumb_x = (start.left() - extent.left()) / extent.width() * width + 10.0;
+        let y = Rig::WINDOW.y - SCROLLBAR / 2.0;
+        rig.drag(pos2(thumb_x, y), pos2(Rig::WINDOW.x - 1.0, y));
+        let end = rig.visible();
+        assert!(end.right() >= drawing.right(), "{end:?}");
+        assert_eq!(rig.canvas.camera.offset.y, along.offset.y);
+        assert_eq!(rig.canvas.camera.scale, along.scale);
+        assert!(rig.canvas.scrolling.is_none(), "let go");
+        // A click above the right bar's thumb pages up, one below it down.
+        let x = Rig::WINDOW.x - SCROLLBAR / 2.0;
+        let before = rig.visible().top();
+        let bottom = pos2(x, Rig::WINDOW.y - SCROLLBAR - 2.0);
+        rig.frame(
+            egui::Modifiers::NONE,
+            vec![egui::Event::PointerMoved(bottom)],
+        );
+        rig.button(bottom, true);
+        rig.button(bottom, false);
+        rig.settle();
+        let paged = rig.visible().top();
+        assert!(paged > before, "{before} then {paged}");
+        let top = pos2(x, 2.0);
+        rig.frame(egui::Modifiers::NONE, vec![egui::Event::PointerMoved(top)]);
+        rig.button(top, true);
+        rig.button(top, false);
+        rig.settle();
+        assert!(rig.visible().top() < paged);
+        // The bars edit nothing.
+        assert!(!rig.doc.is_dirty() && rig.canvas.selection.is_empty());
+    }
+
+    #[test]
+    fn an_empty_schematic_has_nothing_to_scroll_to() {
+        assert_eq!(drawing_bounds(&Schematic::new()), None);
+        let visible = Rect::from_min_size(pos2(-3.0, 2.0), vec2(40.0, 30.0));
+        assert_eq!(scroll_extent(None, visible), visible);
+        let rig = Rig::new(Schematic::new());
+        assert!(rig.canvas.scrolling.is_none());
+    }
 
     #[test]
     fn unconnected_crossings_get_a_hop_and_connected_ones_do_not() {

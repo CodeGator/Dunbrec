@@ -1,7 +1,7 @@
 // Fade: raises and lowers the average voltage on a pin, using PWM.
 // To see it, connect the oscilloscope to the pin chosen below: the pulses
 // grow wider, then narrower.
-// Press Build in the Code panel after every change, then Run.
+// After a change, just press Run: Dunbrec builds the sketch first.
 
 // ----------------------------------------------------------------------
 // Settings: change these.

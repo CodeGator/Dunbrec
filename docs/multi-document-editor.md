@@ -1,6 +1,6 @@
 # Multi-document editor (design)
 
-Status: **stage 1 done** (2026-11-26); stages 2 to 5 to do. Written 2026-11-24;
+Status: **stages 1, 2 and 4 done** (2026-11-26, both rows of tabs); 3 and 5 to do. Written 2026-11-24;
 decisions settled with the user 2026-11-26.
 
 ## Goal
@@ -242,15 +242,22 @@ another circuit stops a running simulation like a click does.
 
 0. **Try the two rows** in egui_dock (section 2). *Done: works.*
 1. **Refactor to `OpenCircuit`**, one circuit, no visible change. *Done.*
-2. **Several circuit tabs**: open adds a tab, tabs switch `active`, per-tab close
+2. *Done.* **Several circuit tabs**: open adds a tab, tabs switch `active`, per-tab close
    and unsaved prompt, dirty dot, project close with a list, stop the simulation
    on switching. Replace `Pane::Schematic`.
 3. **Code and chips**: "Edit code" and new files on the chip, the no-sharing
    rule, the circuit/chip/file tree and "Not used" in the Project panel.
-4. **Second row**: source files as tabs, retire the single Code panel and its
+4. *Done, before stage 3 (agreed: names for circuits without names for files
+   would only half answer the confusion).* **Second row**: source files as tabs, retire the single Code panel and its
    picker.
 5. **Polish**: Ctrl+Tab, window list, close-all variants, maybe reopen the last
    documents when a project opens.
+
+Built differently from section 1: rather than `active: Option<usize>`, the app
+keeps a blank, unshown circuit when none is open. The clipboard is carried over on
+switching, and instruments, debugger, serial monitor and assistant are kept per
+circuit. The no-sharing rule is enforced between *open* circuits (on opening and
+on saving elsewhere); the rest of section 3 is still to do.
 
 ## Risks and notes
 

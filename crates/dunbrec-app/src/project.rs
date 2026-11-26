@@ -13,7 +13,7 @@
 //! schematic's own folder, with `/` separators (`main.asm`, `fw/blink.ino`).
 //! A microcontroller's firmware field holds that path, and while the schematic
 //! is open the file's text sits in [`Schematic::sources`] under the same
-//! name, where the Code panel, the debugger and the simulator find it. The
+//! name, where the editor, the debugger and the simulator find it. The
 //! `.dbr` file does not store those texts (see [`for_saving`]); saving writes
 //! them to their files ([`write_sources`]). Sources kept inside a schematic
 //! by older versions (`source:<name>`) still work, and [`extract_embedded`]
@@ -914,7 +914,7 @@ pub fn rename(
     project: &mut Project,
     from: &Path,
     to: &Path,
-    open: Option<&Path>,
+    open: &[PathBuf],
 ) -> Result<Renamed, String> {
     ensure_free(to)?;
     if let Some(parent) = to.parent() {
@@ -925,7 +925,7 @@ pub fn rename(
     let (from_n, to_n) = (normalize(from), normalize(to));
     let mut out = Renamed::default();
     for dbr_new in project.schematics() {
-        if open.is_some_and(|o| path_eq(o, &dbr_new)) {
+        if open.iter().any(|o| path_eq(o, &dbr_new)) {
             continue;
         }
         // Where this schematic was before the rename (it moves with a
@@ -1547,7 +1547,7 @@ loop: rjmp loop
             &mut project,
             &root.join("main.asm"),
             &root.join("blink.asm"),
-            Some(&top),
+            std::slice::from_ref(&top),
         )
         .unwrap();
         assert!(root.join("blink.asm").is_file() && !root.join("main.asm").exists());
@@ -1631,7 +1631,7 @@ loop: rjmp loop
             ])
             .unwrap();
 
-        let r = rename(&mut project, &root.join("fw"), &root.join("firmware"), None).unwrap();
+        let r = rename(&mut project, &root.join("fw"), &root.join("firmware"), &[]).unwrap();
         assert_eq!(r.rewritten, std::slice::from_ref(&outside));
         assert_eq!(
             firmware_of(&dunbrec_io::dbr::load(&outside).unwrap()),
@@ -1651,7 +1651,7 @@ loop: rjmp loop
                 &mut project,
                 &root.join("a.dbr"),
                 &root.join("firmware"),
-                None
+                &[]
             )
             .is_err()
         );

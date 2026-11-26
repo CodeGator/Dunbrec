@@ -1,6 +1,6 @@
 // Blink: turns a light on and off.
 // To see it, connect a logic LED to the pin chosen below.
-// Press Build in the Code panel after every change, then Run.
+// After a change, just press Run: Dunbrec builds the sketch first.
 
 // ----------------------------------------------------------------------
 // Settings: change these.

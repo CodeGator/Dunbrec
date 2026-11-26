@@ -43,7 +43,8 @@ a click on a pin starts a wire from it while a drag from it still moves the part
 corner or free end to reshape it, with guide lines showing where a segment becomes straight), L adds
 net labels — labels with the same name are connected. Drag to move (attached wires follow),
 drag empty space to box-select, Del deletes, Ctrl+C / X / V / D copy, cut, paste and
-duplicate, Ctrl+Z / Y undo and redo. Wheel zooms, middle-drag pans. Values accept engineering
+duplicate, Ctrl+Z / Y undo and redo. The wheel scrolls the schematic (sideways with Shift) and zooms with Ctrl, as a touchpad
+pinch does; middle-drag and the scroll bars move the drawing too. Values accept engineering
 notation (`4k7`, `10u`, `2.2M`). Help → Keyboard shortcuts lists everything.
 
 **Crossing wires.** Wires that cross are *not* connected, and are drawn with a small hop in the
@@ -137,12 +138,25 @@ and the file is reloaded each time the simulation starts, so rebuild and press R
 meet the circuit like the real chip: outputs drive through about 25 Ω, pull-ups are 35 kΩ,
 inputs switch at 3.0 V rising and 1.5 V falling, and the ADC samples the net's voltage.
 
+**Circuits and their files.** Any number of circuits can be open at once, each with a tab along
+the top of the central area, named after it, with a dot while it has unsaved changes. Under it, the
+active circuit has its own row of tabs: **Schematic**, then one for each of its source files,
+named after the chips that run it (`U1: blink.ino`). Drag a file's tab beside the schematic to see
+both; closing a file's tab only stops showing it (open it again with *Edit code* on the chip, or
+from the Project panel). Opening a circuit that is open goes to its tab, and parts copied in one
+circuit can be pasted into another. The side panels, instruments and assistant belong to the active
+circuit: probes, plots and the conversation stay with the circuit they are about. Only the active
+circuit simulates, so going to another stops the run. Closing a tab (✕, a middle click or Ctrl+W)
+asks about that circuit's unsaved changes; closing the project or quitting asks once about all of
+them. Two circuits cannot use the same source file: opening one that does offers to open it with
+its own copy.
+
 **Demo programs.** `blink`, `fade` and `pot-pwm-serial` come in AVR assembly and as Arduino
 sketches. Pick one under *Demo* in a microcontroller's properties and Dunbrec makes your own copy,
 a file beside the circuit (`blink.ino`, `blink.asm`, then `blink2…`, never over an existing
-file), lists it in the project, points the chip at it and opens it in the Code panel. The pin and
-timing settings are at the top of each file. Assembly is built when you press Run; a sketch is
-built when you make it, and after a change you press **Build**. A new chip, and the example
+file), lists it in the project, points the chip at it and shows its tab. The pin and
+timing settings are at the top of each file. Run builds what has changed before the simulation
+starts. A new chip, and the example
 circuits (File → Open example → Arduino blink, Arduino PWM fade, or Arduino pot, PWM and serial),
 run a copy built into Dunbrec, which needs no toolchain and has no file: *Edit code* on the chip
 makes one.
@@ -168,49 +182,47 @@ file and a first circuit, `Circuit 1`, beside it. *Open project…* (and *Open r
 opens a `.dbrproj` (double-clicking one does too, once installed). No project is open when the app
 starts. A project can be taken off the recent list (✕ beside it) or the whole list cleared.
 Every change to a project is saved to its file at once, so there is no project Save. *Close
-project*, and opening a different project, also close the open circuit if the project lists it,
-along with its source tabs, asking about unsaved changes first; a circuit that is not part of
-the project stays open.
+project*, and opening a different project, close every open circuit, asking about unsaved changes
+first.
 
 The **Project** panel (View → Panels; it opens beside the palette) shows the project's name and
 the files it lists, in folders as they are on disk. Circuits are listed by name, sources with
-their extension. Double-click a circuit to open it, or a source file to open it in the Code
-panel. Right-click the project's name, a folder or empty space to add: a new circuit, assembly
+their extension. Double-click a circuit to open it in a tab, or a source file to show its tab
+under the circuit that uses it (or else the active circuit). Right-click the project's name, a folder or empty space to add: a new circuit, assembly
 file, Arduino sketch or folder (made on disk and listed), or *Add existing file…* for files that
 are already there (the ＋ Add button does the same). Right-click a file or folder to rename it
 (circuits that use a renamed source are updated, a folder rename included), to **Remove from
-project** (the file stays on disk), or to **Delete from disk**, which asks first and, if the
-circuit you are editing is in it, asks about its unsaved changes and then closes it. Names for
+project** (the file stays on disk), or to **Delete from disk**, which asks first and, if open
+circuits are in it, asks about their unsaved changes and then closes them. Names for
 new files and renames are asked for in a message box. A listed file that has gone from the disk
-shows in red with a ⚠. New source files made from the Code panel are listed in the project too
-(for a saved circuit at once, otherwise when the circuit is first saved). Coming back to the window re-reads the project file and takes up
-edits made to the sources in other programs, unless the open schematic has unsaved changes.
+shows in red with a ⚠. Source files made from a chip's properties are listed in the project
+too. Coming back to the window re-reads the project file and takes up
+edits made to the sources in other programs, except in a circuit with unsaved changes.
 Schematics saved by older versions keep their sources inside the `.dbr`; the panel offers *Move
 to files in this folder* for those.
 
-**Writing firmware in assembly.** View → Panels → *Code* opens an editor tab beside the
-schematic for AVR assembly. Each source file of the open circuit is a tab along the top of the
-panel (✕ or a middle click closes a tab, which only stops showing the file; Ctrl+Z brings it
-back), and each file keeps its own cursor and scroll position when you switch. A source is a
-file beside the schematic (`main.asm`, or in a subfolder `fw/main.asm`); the schematic itself
-stores only the name. Create one with *＋ New…* (or *Source file → New assembly file…* in a
-microcontroller's properties, which also points the part at it; or from the Project panel). For
-a circuit that has been saved, the new file is made on disk at once, as the Project panel does,
-and listed in the project if the circuit belongs to one; for an Untitled circuit it is written
-beside the circuit when you first save it, and a line under the tabs says which. The first one
-starts as a blink program for D13. The dialect is Atmel's: `ldi r16, 0xFF`,
-`sbi PORTB, PB5`, labels, `.equ`, `.def`, `.org`, `.db`, `.dw`, expressions with `low()` and
-`high()`, and the register, bit and vector names from `m328Pdef.inc`. Text is coloured as you
+**Writing firmware in assembly.** Each source file of a circuit has a tab beside its schematic,
+and keeps its own cursor and scroll position. A source is a file beside the circuit (`main.asm`, or
+in a subfolder `fw/main.asm`); the circuit file stores only the name. Make one with *Source file →
+New assembly file…* in a microcontroller's properties (which also points the chip at it), from a
+demo program, or with File → *New* or the Project panel. For a saved circuit the file is made on
+disk at once and listed in the project if the circuit is; for an unsaved one it is written beside
+the circuit when you first save it, and a line above the text says so. The first one starts as a
+blink program for D13. The dialect is Atmel's: `ldi r16, 0xFF`, `sbi PORTB, PB5`, labels, `.equ`,
+`.def`, `.org`, `.db`, `.dw`, expressions with `low()` and `high()`, and the register, bit and
+vector names from `m328Pdef.inc`. Text is coloured as you
 type and built on every change: mistakes are underlined, listed under the editor (click one to
 jump to it), and reported by line when the circuit runs. The part's firmware reads the
 file's path, relative to the schematic (`main.asm`; older files say `source:<name>`). Click a line number to set or clear a breakpoint on it (red dot; an arrow marks the current instruction while the circuit is paused), and the debugger listing shows the source line beside each instruction.
 Macros, `.include` and data or EEPROM segments are not supported yet.
 
-**Writing Arduino C++.** *New…* in the Code panel can also create an Arduino C++ sketch. Sketches
+**Writing Arduino C++.** File → *New* (or the Project panel's *New*) can also create an Arduino
+C++ sketch, and the demo programs include sketches. Sketches
 are built by the Arduino command-line tool, which Dunbrec finds but does not include: install it
 (`winget install ArduinoSA.CLI` on Windows), then run `arduino-cli core install arduino:avr`.
-Press **Build**; compile errors are underlined on their lines and listed under the editor. The
-circuit runs the last build of exactly the text in the file, so build again after a change.
+**Run** builds a sketch that has changed since it was last built and starts the simulation only if
+it builds; **Build** on the file's tab checks it without running. Compile errors are underlined on
+their lines and listed under the editor. Builds are not kept after Dunbrec closes.
 
 **Assistant.** View → Panels → *Assistant* opens a chat beside the properties panel. First choose
 a model in File → Settings… → Assistant:

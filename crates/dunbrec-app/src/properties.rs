@@ -24,12 +24,15 @@ pub struct Properties {
     /// Set while a slider is being dragged: changes apply live, and only
     /// the first frame of the drag records an undo step.
     continuous: bool,
-    /// A source file the user asked to edit; the app opens the Code panel
-    /// on it and clears this.
+    /// A source file the user asked to edit; the app shows its tab and
+    /// clears this.
     pub open_code: Option<String>,
     /// A demo program the user asked to have a copy of; the app makes the
     /// file and clears this.
     pub demo: Option<DemoRequest>,
+    /// A microcontroller the user asked to give a new assembly file; the app
+    /// makes it and clears this.
+    pub new_file: Option<ComponentId>,
 }
 
 /// A microcontroller asking for its own copy of a demo program.
@@ -129,9 +132,6 @@ impl Properties {
                 }
 
                 let mut k = c.kind.clone();
-                // Set when "New assembly file…" is picked: the file to add
-                // along with the firmware change.
-                let mut new_source: Option<String> = None;
                 let changed = match &mut k {
                     ComponentKind::Ground | ComponentKind::Junction => false,
                     ComponentKind::Resistor { resistance } => {
@@ -378,15 +378,7 @@ impl Properties {
                                 }
                                 if ui.selectable_label(false, "New assembly file…").clicked()
                                 {
-                                    let name = crate::code_ui::unused_file_name(
-                                        &schematic.sources,
-                                        "main",
-                                        "asm",
-                                    );
-                                    *firmware = source_reference(&name);
-                                    self.open_code = Some(name.clone());
-                                    new_source = Some(name);
-                                    changed = true;
+                                    self.new_file = Some(id);
                                 }
                             });
                         ui.end_row();
@@ -394,7 +386,7 @@ impl Properties {
                             ui.label("");
                             if ui
                                 .button("Edit code")
-                                .on_hover_text("Open this source file in the Code panel")
+                                .on_hover_text("Show this source file's tab")
                                 .clicked()
                             {
                                 self.open_code = Some(name);
@@ -427,9 +419,9 @@ impl Properties {
                         ui.vertical(|ui| {
                             ui.set_max_width(CONTROL_WIDTH);
                             let help = "A source file is a file beside this circuit. Assembly \
-                                        (.asm) is built each time the simulation starts, a \
-                                        sketch (.ino) when you press Build. For a program \
-                                        compiled elsewhere: Arduino IDE, Sketch → Export \
+                                        (.asm) and sketches (.ino) are built when you press \
+                                        Run, sketches only if changed. For a program \
+                                        compiled elsewhere: Arduino IDE, Sketch > Export \
                                         Compiled Binary, then pick the .hex without \
                                         \"with_bootloader\".";
                             ui.add(egui::Label::new(RichText::new(help).small().weak()).wrap());
@@ -439,19 +431,7 @@ impl Properties {
                     }
                 };
                 if changed {
-                    edit = match new_source {
-                        Some(name) => {
-                            let kind = k.clone();
-                            Some(Box::new(move |s: &mut Schematic| {
-                                let file = crate::code_ui::new_file(&s.sources, &name);
-                                s.sources.entry(name).or_insert(file);
-                                if let Some(c) = s.component_mut(id) {
-                                    c.kind = kind;
-                                }
-                            }))
-                        }
-                        None => set_kind(k),
-                    };
+                    edit = set_kind(k);
                 }
             });
 

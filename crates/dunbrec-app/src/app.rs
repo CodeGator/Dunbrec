@@ -8,7 +8,7 @@ use dunbrec_core::{
 use dunbrec_sim::Sample;
 use egui::{Color32, Key, KeyboardShortcut, Modifiers, RichText, ViewportCommand};
 use egui_dock::tab_viewer::OnCloseResponse;
-use egui_dock::{DockArea, DockState, TabViewer};
+use egui_dock::{AllowedSplits, DockArea, DockState, TabViewer};
 
 use crate::analyses_ui::{Analyses, Inputs};
 use crate::canvas::{Annotation, Canvas, Item, Marker, PartDrag, Tool};
@@ -18,10 +18,10 @@ use crate::dialog::{self, Dialog, Message, Unsaved};
 use crate::dock::{self, LAYOUT_KEY, Pane};
 use crate::document::Document;
 use crate::examples::examples;
-use crate::instruments_ui::{Bench, MeterSignal, Signals};
+use crate::instruments_ui::{Bench, MeterSignal, Signals, Speed};
 use crate::library::{PaletteEntry, palette_groups};
 use crate::live::{Command, Event, LiveSim};
-use crate::open_circuit::{DcResults, OpenCircuit};
+use crate::open_circuit::{DcResults, DocTab, NewFile, OpenCircuit, source_title};
 use crate::project::{self, Project};
 use crate::project_ui::{self, ProjectPanel};
 use crate::properties::{DemoRequest, Properties};
@@ -62,7 +62,10 @@ const SHORTCUTS: &[(&str, &str)] = &[
         "Hold a push button",
         "Press it for as long as the mouse is down",
     ),
-    ("Mouse wheel / middle drag", "Zoom / pan"),
+    ("Mouse wheel", "Scroll the schematic up and down"),
+    ("Shift + wheel", "Scroll it left and right"),
+    ("Ctrl + wheel", "Zoom (so does a pinch on a touchpad)"),
+    ("Middle drag", "Move the drawing"),
 ];
 
 /// Which project to go to when the user changes projects.
@@ -74,7 +77,7 @@ enum ProjectTarget {
     Create(PathBuf),
 }
 
-/// Something that would discard unsaved changes, waiting for confirmation.
+/// Something that may discard unsaved changes, waiting for confirmation.
 #[derive(Debug, Clone, PartialEq)]
 enum Pending {
     Open,
@@ -82,11 +85,11 @@ enum Pending {
     Example(usize),
     ImportSpice,
     ImportKicad,
-    /// Close the project, and with it the circuit that belongs to it.
+    /// Close the project, and with it every open circuit.
     CloseProject,
-    /// Close the circuit (the project stays open).
-    CloseCircuit,
-    /// Leave the open project (and its circuit) for another one.
+    /// Close one circuit, by its id (the project stays open).
+    CloseCircuit(u32),
+    /// Leave the open project (and its circuits) for another one.
     SwitchProject(ProjectTarget),
     Quit,
 }
@@ -95,17 +98,48 @@ enum Pending {
 #[derive(Debug, Clone)]
 struct DeleteAsk {
     path: PathBuf,
-    /// The open circuit is inside it and has unsaved changes: the user is
-    /// asked about losing those first.
+    /// Open circuits inside it have unsaved changes: the user is asked about
+    /// losing those first.
     discard_first: bool,
 }
 
+/// A circuit waiting to be opened because it names source files that an open
+/// circuit has: two circuits cannot share a file.
+struct SharedAsk {
+    path: PathBuf,
+    /// The circuit as read, with its source files.
+    schematic: Schematic,
+    /// Source files that could not be read.
+    problems: Vec<String>,
+    /// Each shared file, and the name of the open circuit that has it.
+    shared: Vec<(String, String)>,
+}
+
+/// Which instrument windows are on screen, and the speed chosen: these stay
+/// as they are when the user moves to another circuit.
+#[derive(Clone, Copy)]
+struct Shown {
+    instruments: [bool; 9],
+    speed: Speed,
+}
+
 pub struct DunbrecApp {
-    /// The open circuits. For now there is always exactly one; whether it is
-    /// shown is `circuit_open`.
+    /// The open circuits, each a tab. Never empty: with none open it holds a
+    /// blank one that is not shown, and `circuit_open` is false.
     circuits: Vec<OpenCircuit>,
     /// Which of `circuits` the panels show and the commands act on.
     active: usize,
+    /// The id the next circuit to be opened gets.
+    next_id: u32,
+    /// Where the circuit tabs were drawn, to notice one being dragged.
+    circuit_tab_rects: Vec<(u32, egui::Rect)>,
+    /// The mouse button is down on a circuit tab.
+    dragging_circuit: bool,
+    /// Where the active circuit's own tabs were drawn, for tests to click.
+    #[cfg(test)]
+    file_tab_rects: Vec<(DocTab, egui::Rect)>,
+    /// A circuit that shares a source file, waiting for the user's answer.
+    shared_ask: Option<SharedAsk>,
     live_dc: bool,
     show_voltages: bool,
     pending: Option<Pending>,
@@ -135,6 +169,9 @@ pub struct DunbrecApp {
     // ---- live simulation and instruments ----
     bench: Bench,
     live: Option<LiveSim>,
+    /// Run was pressed and sketches are being built first; whether the
+    /// simulation is then to start paused.
+    run_after_build: Option<bool>,
     /// Simulated seconds per real second the simulation was last told to run.
     live_speed: f64,
     /// Document generation the running simulation reflects.
@@ -187,6 +224,25 @@ fn has_mcu(netlist: &Netlist) -> bool {
         .elements
         .iter()
         .any(|e| matches!(e.kind, dunbrec_core::ComponentKind::Mcu { .. }))
+}
+
+/// The sketches the microcontrollers of `netlist` run that have to be built
+/// first: each one's name and text.
+fn unbuilt_sketches(netlist: &Netlist, dir: Option<&std::path::Path>) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = netlist
+        .elements
+        .iter()
+        .filter_map(|e| match &e.kind {
+            dunbrec_core::ComponentKind::Mcu { firmware, .. } => {
+                dunbrec_sim::unbuilt_sketch(firmware, dir, &netlist.sources)
+            }
+            _ => None,
+        })
+        .collect();
+    // Chips may share a file.
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// Feed one simulation sample to the instruments.
@@ -266,6 +322,7 @@ impl DunbrecApp {
             signals: ((u64::MAX, 0), Signals::default()),
             bench: Bench::default(),
             live: None,
+            run_after_build: None,
             live_speed: 0.0,
             live_generation: 0,
             live_time: 0.0,
@@ -275,6 +332,12 @@ impl DunbrecApp {
             latest: None,
             circuits: vec![OpenCircuit::new(doc)],
             active: 0,
+            next_id: 1,
+            circuit_tab_rects: Vec::new(),
+            dragging_circuit: false,
+            #[cfg(test)]
+            file_tab_rects: Vec::new(),
+            shared_ask: None,
             live_dc: true,
             show_voltages: true,
             pending: None,
@@ -317,12 +380,54 @@ impl DunbrecApp {
 
     // ------------------------------------------------------- files ---
 
-    fn request(&mut self, action: Pending) {
-        if self.active().doc.is_dirty() {
-            self.pending = Some(action);
+    fn index_of(&self, id: u32) -> Option<usize> {
+        self.open_ids().iter().position(|&open| open == id)
+    }
+
+    /// The ids of the open circuits, in the order they are held.
+    fn open_ids(&self) -> Vec<u32> {
+        if self.circuit_open {
+            self.circuits.iter().map(|c| c.id).collect()
         } else {
-            self.perform(action);
+            Vec::new()
         }
+    }
+
+    /// The open circuits that have unsaved changes.
+    fn dirty_circuits(&self) -> Vec<usize> {
+        (0..self.open_ids().len())
+            .filter(|&i| self.circuits[i].doc.is_dirty())
+            .collect()
+    }
+
+    /// The circuits whose unsaved changes `action` would throw away. Opening
+    /// something adds a tab, so it throws nothing away.
+    fn at_risk(&self, action: &Pending) -> Vec<usize> {
+        match action {
+            Pending::CloseCircuit(id) => self
+                .index_of(*id)
+                .filter(|&i| self.circuits[i].doc.is_dirty())
+                .into_iter()
+                .collect(),
+            Pending::CloseProject | Pending::SwitchProject(_) | Pending::Quit => {
+                self.dirty_circuits()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn request(&mut self, action: Pending) {
+        if self.at_risk(&action).is_empty() {
+            self.perform(action);
+            return;
+        }
+        // The circuit asked about is the one to look at.
+        if let Pending::CloseCircuit(id) = action
+            && let Some(index) = self.index_of(id)
+        {
+            self.switch_to(index);
+        }
+        self.pending = Some(action);
     }
 
     fn perform(&mut self, action: Pending) {
@@ -338,12 +443,18 @@ impl DunbrecApp {
             Pending::OpenPath(path) => self.open_path(path),
             Pending::Example(i) => {
                 if let Some(ex) = examples().get(i) {
-                    self.replace(Document::new((ex.build)(), None));
+                    let mut circuit = OpenCircuit::new(Document::new((ex.build)(), None));
+                    circuit.title = Some(ex.name.to_string());
+                    self.add_circuit(circuit);
                 }
             }
             Pending::ImportSpice | Pending::ImportKicad => self.import(action),
             Pending::CloseProject => self.close_project(),
-            Pending::CloseCircuit => self.close_circuit(),
+            Pending::CloseCircuit(id) => {
+                if let Some(index) = self.index_of(id) {
+                    self.close_circuit_at(index);
+                }
+            }
             Pending::SwitchProject(to) => {
                 self.close_project();
                 self.go_to_project(to);
@@ -398,7 +509,9 @@ impl DunbrecApp {
                 let mut doc = Document::new(schematic, None);
                 // A fresh import is unsaved work.
                 doc.checkpoint();
-                self.replace(doc);
+                let mut circuit = OpenCircuit::new(doc);
+                circuit.title = path.file_stem().map(|s| s.to_string_lossy().into_owned());
+                self.add_circuit(circuit);
                 let name = path
                     .file_name()
                     .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
@@ -443,7 +556,7 @@ impl DunbrecApp {
         if path.extension().is_none() {
             path.set_extension("cir");
         }
-        let title = self.active().doc.display_name();
+        let title = self.active().name();
         let result = dunbrec_io::spice_export::export(self.active().doc.schematic(), &title, &[])
             .map_err(|_| "Fix the problems listed under Checks first.".to_string())
             .and_then(|text| std::fs::write(&path, text).map_err(|e| e.to_string()));
@@ -452,20 +565,36 @@ impl DunbrecApp {
         }
     }
 
+    /// Open the circuit file at `path` in a tab, or go to its tab if it is
+    /// open already.
     fn open_path(&mut self, path: PathBuf) {
+        if let Some(index) = self.circuit_with_file(&path) {
+            self.switch_to(index);
+            return;
+        }
         match dunbrec_io::dbr::load(&path) {
-            Ok(mut s) => {
+            Ok(mut schematic) => {
                 self.settings.remember(&path);
                 // The firmware source files it uses live beside it.
                 let problems = path
                     .parent()
-                    .map(|dir| project::hydrate(&mut s, dir))
+                    .map(|dir| project::hydrate(&mut schematic, dir))
                     .unwrap_or_default();
-                let mut d = Document::new(s, None);
-                d.mark_saved(path);
-                self.replace(d);
-                if !problems.is_empty() {
-                    self.message = Some(source_problems(&problems));
+                let shared = path
+                    .parent()
+                    .map(|dir| self.shared_sources(&schematic, dir, None))
+                    .unwrap_or_default();
+                if shared.is_empty() {
+                    let mut doc = Document::new(schematic, None);
+                    doc.mark_saved(path);
+                    self.add_opened(doc, &problems);
+                } else {
+                    self.shared_ask = Some(SharedAsk {
+                        path,
+                        schematic,
+                        problems,
+                        shared,
+                    });
                 }
             }
             Err(e) => {
@@ -475,41 +604,315 @@ impl DunbrecApp {
         }
     }
 
-    fn replace(&mut self, doc: Document) {
+    /// Add a circuit read from its file, saying what could not be read.
+    fn add_opened(&mut self, doc: Document, problems: &[String]) {
+        self.add_circuit(OpenCircuit::new(doc));
+        if !problems.is_empty() {
+            self.message = Some(source_problems(problems));
+        }
+    }
+
+    /// The open circuit whose file is `path`.
+    fn circuit_with_file(&self, path: &std::path::Path) -> Option<usize> {
+        let wanted = project::normalize(path);
+        (0..self.open_ids().len()).find(|&i| {
+            self.circuits[i]
+                .doc
+                .path()
+                .is_some_and(|p| project::path_eq(&project::normalize(p), &wanted))
+        })
+    }
+
+    /// The source files of `schematic`, in the folder `dir`, that an open
+    /// circuit (other than `except`) already has, each with that circuit's
+    /// name.
+    fn shared_sources(
+        &self,
+        schematic: &Schematic,
+        dir: &std::path::Path,
+        except: Option<usize>,
+    ) -> Vec<(String, String)> {
+        let open = self.open_ids().len();
+        schematic
+            .sources
+            .keys()
+            .filter(|name| project::is_file_source(name))
+            .filter_map(|name| {
+                let full = dir.join(name);
+                (0..open)
+                    .filter(|&i| Some(i) != except)
+                    .find(|&i| self.circuits[i].source_at(&full).is_some())
+                    .map(|i| (name.clone(), self.circuits[i].name()))
+            })
+            .collect()
+    }
+
+    /// Open a waiting circuit with a copy of its own of each shared file. It
+    /// has unsaved changes: saving it keeps the new names.
+    fn open_with_copies(&mut self, ask: SharedAsk) {
+        let SharedAsk {
+            path,
+            schematic: mut own,
+            problems,
+            shared,
+        } = ask;
+        let Some(dir) = path.parent().map(|d| d.to_path_buf()) else {
+            return;
+        };
+        let mut made = Vec::new();
+        for (name, _) in &shared {
+            let (Some(file), Some((base, extension))) =
+                (own.sources.get(name).cloned(), name.rsplit_once('.'))
+            else {
+                continue;
+            };
+            let taken = |n: &str| own.sources.keys().any(|k| k.eq_ignore_ascii_case(n));
+            let copy = match project::new_source_copy(&dir, base, extension, &file.text, taken) {
+                Ok(copy) => copy,
+                Err(e) => {
+                    self.message = Some(Message::error("Could not copy the source file", e));
+                    return;
+                }
+            };
+            for c in &mut own.components {
+                if let dunbrec_core::ComponentKind::Mcu { firmware, .. } = &mut c.kind
+                    && firmware.trim() == name
+                {
+                    firmware.clone_from(&copy);
+                }
+            }
+            own.sources.remove(name);
+            own.sources.insert(copy.clone(), file);
+            made.push(dir.join(copy));
+        }
+        self.list_in_project(&path, &made);
+        let mut doc = Document::new(own, None);
+        doc.mark_saved(path);
+        // Not an edit to undo (that would share the files again), but the
+        // circuit file does not have the new names yet.
+        doc.mark_unsaved();
+        self.add_opened(doc, &problems);
+    }
+
+    /// List `files` in the project, if it lists the circuit they belong to.
+    fn list_in_project(&mut self, circuit: &std::path::Path, files: &[PathBuf]) {
+        if let Some(project) = self.project.as_mut()
+            && !files.is_empty()
+            && project.contains(circuit)
+        {
+            if let Err(e) = project.add_files(files) {
+                self.message = Some(Message::error("Could not update the project file", e));
+            }
+            project.refresh();
+        }
+    }
+
+    // ------------------------------------------------- open circuits ---
+
+    /// Open `circuit` in a tab of its own and make it the active one.
+    fn add_circuit(&mut self, mut circuit: OpenCircuit) {
+        circuit.id = self.next_id;
+        self.next_id += 1;
+        if self.circuit_open {
+            self.circuits.push(circuit);
+            self.switch_to(self.circuits.len() - 1);
+            return;
+        }
+        self.leave_active();
+        circuit.canvas.clipboard = self.active().canvas.clipboard.clone();
+        self.circuits = vec![circuit];
+        self.active = 0;
         self.circuit_open = true;
+        self.reset_tools();
+        self.show_active_tab();
+    }
+
+    /// Make another open circuit the active one. A running simulation stops:
+    /// only the active circuit runs.
+    fn switch_to(&mut self, index: usize) {
+        if index != self.active && index < self.circuits.len() {
+            let shown = self.shown_tools();
+            self.leave_active();
+            // What was copied can be pasted into the other circuit.
+            let clipboard = self.active().canvas.clipboard.clone();
+            self.swap_tools(self.active);
+            self.active = index;
+            self.swap_tools(index);
+            self.show_tools(shown);
+            if clipboard.is_some() {
+                let canvas = &mut self.active_mut().canvas;
+                canvas.clipboard = clipboard;
+                canvas.paste_count = 0;
+            }
+        }
+        self.show_active_tab();
+    }
+
+    /// Close an open circuit. Its unsaved changes are lost: ask first (see
+    /// [`request`](Self::request)).
+    fn close_circuit_at(&mut self, index: usize) {
+        let open = self.open_ids().len();
+        if index >= open {
+            return;
+        }
+        if open == 1 {
+            self.leave_active();
+            let mut blank = OpenCircuit::default();
+            blank.canvas.clipboard = self.active().canvas.clipboard.clone();
+            self.circuits = vec![blank];
+            self.active = 0;
+            self.circuit_open = false;
+            self.reset_tools();
+        } else {
+            if index == self.active {
+                self.switch_to(if index + 1 < open {
+                    index + 1
+                } else {
+                    index - 1
+                });
+            }
+            self.circuits.remove(index);
+            if self.active > index {
+                self.active -= 1;
+            }
+        }
+        self.show_active_tab();
+    }
+
+    fn close_all_circuits(&mut self) {
+        while self.circuit_open {
+            self.close_circuit_at(self.active);
+        }
+    }
+
+    /// Put the active circuit's tab in front, adding or removing circuit tabs
+    /// as needed.
+    fn show_active_tab(&mut self) {
+        let ids = self.open_ids();
+        dock::sync_documents(&mut self.dock, &ids);
+        if self.circuit_open {
+            let id = self.active().id;
+            dock::bring_to_front(&mut self.dock, Pane::Circuit(id));
+        }
+    }
+
+    /// Stop what belongs to the active circuit being the active one: the
+    /// simulation, what was said about it, and a tool in use.
+    fn leave_active(&mut self) {
         self.stop_sim();
+        self.live_error = None;
+        self.probe_hint = None;
+        self.debug_loaded = None;
+        self.label_name.clear();
+        self.active_mut().canvas.cancel();
+    }
+
+    /// Exchange the application's instruments with those a circuit holds.
+    fn swap_tools(&mut self, index: usize) {
+        let tools = &mut self.circuits[index].tools;
+        std::mem::swap(&mut self.bench, &mut tools.bench);
+        std::mem::swap(&mut self.analyses, &mut tools.analyses);
+        std::mem::swap(&mut self.serial, &mut tools.serial);
+        std::mem::swap(&mut self.debugger, &mut tools.debugger);
+        std::mem::swap(&mut self.assistant, &mut tools.assistant);
+    }
+
+    /// Fresh instruments, for the first circuit to be opened or none.
+    fn reset_tools(&mut self) {
         self.bench = Bench::default();
-        self.active_mut().replace_document(doc);
-        // A circuit that is opened is shown, not the Code tab beside it.
-        dock::bring_to_front(&mut self.dock, Pane::Schematic);
+        self.analyses = Analyses::default();
+        self.serial = SerialMonitor::default();
+        self.debugger = Debugger::default();
+        self.assistant = Default::default();
     }
 
-    /// Close the circuit: nothing is open, and the schematic is not shown.
-    fn close_circuit(&mut self) {
-        self.replace(Document::default());
-        self.circuit_open = false;
+    /// The switches of the instrument windows.
+    fn instrument_switches(&mut self) -> [&mut bool; 9] {
+        [
+            &mut self.bench.show_scope,
+            &mut self.bench.show_meter,
+            &mut self.bench.show_logic,
+            &mut self.analyses.show_fgen,
+            &mut self.analyses.show_bode,
+            &mut self.analyses.show_transfer,
+            &mut self.analyses.show_tracer,
+            &mut self.serial.show,
+            &mut self.debugger.show,
+        ]
     }
 
+    fn shown_tools(&mut self) -> Shown {
+        let speed = self.bench.speed;
+        Shown {
+            instruments: self.instrument_switches().map(|on| *on),
+            speed,
+        }
+    }
+
+    fn show_tools(&mut self, shown: Shown) {
+        self.bench.speed = shown.speed;
+        for (switch, on) in self
+            .instrument_switches()
+            .into_iter()
+            .zip(shown.instruments)
+        {
+            *switch = on;
+        }
+    }
+
+    /// Save the active circuit, asking where if it has no file yet or `ask`.
     fn save(&mut self, ask: bool) -> bool {
-        let path = match (ask, self.active().doc.path()) {
+        self.save_circuit(self.active, ask)
+    }
+
+    fn save_circuit(&mut self, index: usize, ask: bool) -> bool {
+        let path = match (ask, self.circuits[index].doc.path()) {
             (false, Some(p)) => Some(p.to_path_buf()),
-            _ => rfd::FileDialog::new()
-                .add_filter("Dunbrec schematic", &["dbr"])
-                .set_file_name(format!(
-                    "{}.dbr",
-                    self.active().doc.display_name().trim_end_matches(".dbr")
-                ))
-                .save_file(),
+            _ => {
+                // Show which circuit is being named.
+                self.switch_to(index);
+                rfd::FileDialog::new()
+                    .add_filter("Dunbrec schematic", &["dbr"])
+                    .set_file_name(format!("{}.dbr", self.circuits[index].name()))
+                    .save_file()
+            }
         };
         let Some(mut path) = path else { return false };
         if path.extension().is_none() {
             path.set_extension("dbr");
         }
+        if self
+            .circuit_with_file(&path)
+            .is_some_and(|other| other != index)
+        {
+            self.message = Some(Message::info(
+                "That circuit is open",
+                "Another tab has that circuit file open. Close it first, or choose another \
+                 name.",
+            ));
+            return false;
+        }
+        // Its source files are written beside it, which must not write over
+        // those of another open circuit.
+        if let Some(dir) = path.parent()
+            && let Some((name, owner)) = self
+                .shared_sources(self.circuits[index].doc.schematic(), dir, Some(index))
+                .first()
+        {
+            self.message = Some(Message::info(
+                "That would share a source file",
+                format!(
+                    "“{name}” in that folder belongs to {owner}, which is open. Save this \
+                     circuit in another folder, or close {owner} first."
+                ),
+            ));
+            return false;
+        }
         // Firmware source files are saved as files beside the schematic, and
         // the schematic itself keeps only the names.
         let mut written = Vec::new();
         if let Some(dir) = path.parent() {
-            match project::write_sources(self.active().doc.schematic(), dir) {
+            match project::write_sources(self.circuits[index].doc.schematic(), dir) {
                 Ok(names) => written = names.into_iter().map(|n| dir.join(n)).collect(),
                 Err(e) => {
                     self.message = Some(Message::error("Could not save the source files", e));
@@ -517,10 +920,13 @@ impl DunbrecApp {
                 }
             }
         }
-        match dunbrec_io::dbr::save(&project::for_saving(self.active().doc.schematic()), &path) {
+        match dunbrec_io::dbr::save(
+            &project::for_saving(self.circuits[index].doc.schematic()),
+            &path,
+        ) {
             Ok(()) => {
                 self.settings.remember(&path);
-                self.active_mut().doc.mark_saved(path.clone());
+                self.circuits[index].doc.mark_saved(path.clone());
                 // New source files of a schematic in the project are the project's.
                 if let Some(p) = &mut self.project {
                     if p.contains(&path) && !written.is_empty() {
@@ -551,15 +957,14 @@ impl DunbrecApp {
         }
     }
 
-    /// Close the project. The circuit that is open goes too if the project
-    /// lists it (and with it the source files shown in the Code panel), so
-    /// nothing stays open that belonged to the project.
+    /// Close the project, and with it every open circuit (the user was asked
+    /// about unsaved changes first): with no project open only the Projects
+    /// screen is shown.
     fn close_project(&mut self) {
         self.project = None;
         self.name_prompt = None;
-        // With no project open only the Projects screen is shown, so the
-        // circuit goes too (the user was asked about unsaved changes first).
-        self.close_circuit();
+        self.shared_ask = None;
+        self.close_all_circuits();
     }
 
     fn show_project(&mut self, project: Project) {
@@ -669,14 +1074,18 @@ impl DunbrecApp {
         }
     }
 
-    /// Go to another project. The circuit of the project that is open now
-    /// goes too, so nothing of the old project stays open; if it has
-    /// unsaved changes the user is asked about them first.
+    /// Go to another project. The circuits that are open go with the project
+    /// that is open now; if any has unsaved changes the user is asked about
+    /// them first.
     fn switch_project(&mut self, to: ProjectTarget) {
         let target = match &to {
             ProjectTarget::Open(file) | ProjectTarget::Create(file) => file,
         };
-        if leaves_circuit(self.project.as_ref(), self.active().doc.path(), target) {
+        let leaving = self
+            .project
+            .as_ref()
+            .is_some_and(|p| !project::path_eq(&p.file, target));
+        if leaving {
             self.request(Pending::SwitchProject(to));
         } else {
             self.go_to_project(to);
@@ -754,7 +1163,10 @@ impl DunbrecApp {
             }
             C::AskRename(path) => self.name_prompt = Some(project_ui::NamePrompt::rename(&path)),
             C::AskDelete(path) => {
-                let discard_first = self.active().doc.is_dirty() && self.open_circuit_is_in(&path);
+                let discard_first = self
+                    .circuits_in(&path)
+                    .iter()
+                    .any(|&i| self.circuits[i].doc.is_dirty());
                 self.confirm_delete = Some(DeleteAsk {
                     path,
                     discard_first,
@@ -784,15 +1196,30 @@ impl DunbrecApp {
         }
     }
 
-    /// Show the source file at `path` in the Code panel, opening it in the
-    /// current schematic if it is not open already.
+    /// Show the source file at `path`: in the circuit that has it, or else
+    /// in the active circuit.
     fn open_source(&mut self, path: &std::path::Path) {
+        let owner = (0..self.open_ids().len())
+            .find_map(|i| self.circuits[i].source_at(path).map(|name| (i, name)));
+        if let Some((index, name)) = owner {
+            self.switch_to(index);
+            self.active_mut().show_source(&name);
+            return;
+        }
+        if !self.circuit_open {
+            self.message = Some(Message::info(
+                "Open a circuit first",
+                "A source file belongs to a circuit. Open the circuit it is for, then open \
+                 the file again.",
+            ));
+            return;
+        }
         let Some(dir) = self.firmware_dir() else {
             self.message = Some(Message::info(
-                "Save the schematic first",
-                "A source file belongs to a schematic and is found by its place relative to \
-                 it. Save this schematic (Ctrl+S), preferably in the project folder, and \
-                 then open the file again.",
+                "Save the circuit first",
+                "A source file is found by its place relative to its circuit. Save this \
+                 circuit (Ctrl+S), preferably in the project folder, and then open the file \
+                 again.",
             ));
             return;
         };
@@ -801,60 +1228,66 @@ impl DunbrecApp {
             self.message = Some(Message::error("Could not open the source file", e));
             return;
         }
-        dock::open(&mut self.dock, Pane::Code);
-        if let Some(at) = self.dock.find_tab(&Pane::Code) {
-            self.dock.set_active_tab(at);
-        }
-        self.active_mut().code.select(&name);
+        self.active_mut().show_source(&name);
     }
 
     fn rename_in_project(&mut self, from: &std::path::Path, to: &std::path::Path) {
-        let open = self.active().doc.path().map(|p| p.to_path_buf());
+        let open: Vec<PathBuf> = (0..self.open_ids().len())
+            .filter_map(|i| self.circuits[i].doc.path().map(|p| p.to_path_buf()))
+            .collect();
         let Some(project) = self.project.as_mut() else {
             return;
         };
-        if let Err(e) = project::rename(project, from, to, open.as_deref()) {
+        if let Err(e) = project::rename(project, from, to, &open) {
             self.message = Some(Message::error("Could not rename it", e));
             return;
         }
-        // The open schematic follows in memory: its own file may have moved,
-        // and its references to the renamed file change.
-        if let Some(open) = open {
+        // The open circuits follow in memory: their own files may have moved,
+        // and their references to the renamed file change.
+        for index in 0..self.open_ids().len() {
+            let Some(old) = self.circuits[index].doc.path().map(|p| p.to_path_buf()) else {
+                continue;
+            };
             let none = std::path::Path::new("");
-            let old_dir = open.parent().unwrap_or(none).to_path_buf();
-            let new_open = match project::strip_prefix_ci(&open, from) {
+            let old_dir = old.parent().unwrap_or(none).to_path_buf();
+            let new = match project::strip_prefix_ci(&old, from) {
                 Some(rest) if rest.as_os_str().is_empty() => to.to_path_buf(),
                 Some(rest) => to.join(rest),
-                None => open.clone(),
+                None => old.clone(),
             };
-            let new_dir = new_open.parent().unwrap_or(none).to_path_buf();
-            let mut probe = self.active().doc.schematic().clone();
+            let new_dir = new.parent().unwrap_or(none).to_path_buf();
+            let doc = &mut self.circuits[index].doc;
+            let mut probe = doc.schematic().clone();
             if project::rewrite_refs(&mut probe, &old_dir, &new_dir, from, to) > 0 {
-                self.active_mut().doc.edit(|s| {
+                doc.edit(|s| {
                     project::rewrite_refs(s, &old_dir, &new_dir, from, to);
                 });
             }
-            if new_open != open {
-                self.settings.forget(&open);
-                self.settings.remember(&new_open);
-                self.active_mut().doc.set_path(new_open);
+            if new != old {
+                doc.set_path(new.clone());
+                self.settings.forget(&old);
+                self.settings.remember(&new);
             }
         }
         self.refresh_project();
     }
 
-    /// Whether the open circuit's file is `path` or inside the folder `path`.
-    fn open_circuit_is_in(&self, path: &std::path::Path) -> bool {
-        let gone = project::normalize(path);
-        self.active()
-            .doc
-            .path()
-            .is_some_and(|p| project::starts_with_ci(p, &gone))
+    /// The open circuits whose file is `path` or inside the folder `path`.
+    fn circuits_in(&self, path: &std::path::Path) -> Vec<usize> {
+        let folder = project::normalize(path);
+        (0..self.open_ids().len())
+            .filter(|&i| {
+                self.circuits[i]
+                    .doc
+                    .path()
+                    .is_some_and(|p| project::starts_with_ci(p, &folder))
+            })
+            .collect()
     }
 
     /// The questions before a file or folder is deleted from the disk: first,
-    /// if the open circuit is in it and has unsaved changes, whether to lose
-    /// those; then whether to delete.
+    /// if open circuits in it have unsaved changes, whether to lose those;
+    /// then whether to delete.
     fn confirm_delete_dialog(&mut self, ctx: &egui::Context, ask: DeleteAsk) {
         let name = ask
             .path
@@ -862,7 +1295,18 @@ impl DunbrecApp {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
         if ask.discard_first {
-            match dialog::unsaved_changes(ctx, &self.active().doc.display_name(), false) {
+            let names: Vec<String> = self
+                .circuits_in(&ask.path)
+                .into_iter()
+                .filter(|&i| self.circuits[i].doc.is_dirty())
+                .map(|i| self.circuits[i].name())
+                .collect();
+            let answer = match names.as_slice() {
+                [] => Some(Unsaved::Discard),
+                [name] => dialog::unsaved_changes(ctx, name, false),
+                many => dialog::unsaved_list(ctx, many, false),
+            };
+            match answer {
                 Some(Unsaved::Discard) => {
                     self.confirm_delete = Some(DeleteAsk {
                         discard_first: false,
@@ -911,32 +1355,37 @@ impl DunbrecApp {
             self.message = Some(Message::error("Could not delete it", e));
             return;
         }
-        // A circuit that was deleted cannot be edited or simulated: it is closed.
-        if self.open_circuit_is_in(path) {
-            self.close_circuit();
-        } else if let Some(dir) = self.firmware_dir() {
-            // Drop open source files that were deleted with it.
-            let gone = project::normalize(path);
-            let dead: Vec<String> = self
-                .active()
-                .doc
-                .schematic()
-                .sources
-                .keys()
-                .filter(|n| project::is_file_source(n))
-                .filter(|n| project::starts_with_ci(&dir.join(n), &gone))
-                .cloned()
+        // A circuit that was deleted cannot be edited or simulated: it is
+        // closed.
+        let doomed: Vec<u32> = self
+            .circuits_in(path)
+            .into_iter()
+            .map(|i| self.circuits[i].id)
+            .collect();
+        for id in doomed {
+            if let Some(index) = self.index_of(id) {
+                self.close_circuit_at(index);
+            }
+        }
+        // Drop open source files that were deleted.
+        let gone = project::normalize(path);
+        for circuit in &mut self.circuits {
+            let dead: Vec<String> = circuit
+                .source_paths()
+                .into_iter()
+                .filter(|(_, full)| project::starts_with_ci(full, &gone))
+                .map(|(name, _)| name)
                 .collect();
             for name in dead {
-                self.active_mut().doc.schematic_mut().sources.remove(&name);
+                circuit.doc.schematic_mut().sources.remove(&name);
             }
         }
         self.refresh_project();
     }
 
     /// Rescan the project folder, and take up edits made to the open
-    /// schematic's source files elsewhere (unless it has unsaved changes,
-    /// which win).
+    /// circuits' source files elsewhere (except in a circuit with unsaved
+    /// changes, which win).
     fn refresh_project(&mut self) {
         if let Some(p) = &mut self.project
             && let Err(e) = p.reload()
@@ -945,11 +1394,12 @@ impl DunbrecApp {
             p.refresh();
             self.message = Some(Message::error("Could not read the project file", e));
         }
-        if !self.active().doc.is_dirty()
-            && let Some(dir) = self.firmware_dir()
-        {
-            let changed = project::sync_from_disk(self.active_mut().doc.schematic_mut(), &dir);
-            if !changed.is_empty() {
+        for (index, circuit) in self.circuits.iter_mut().enumerate() {
+            if !circuit.doc.is_dirty()
+                && let Some(dir) = circuit.firmware_dir()
+                && !project::sync_from_disk(circuit.doc.schematic_mut(), &dir).is_empty()
+                && index == self.active
+            {
                 // The debugger lists the new text.
                 self.debug_loaded = None;
             }
@@ -1022,7 +1472,8 @@ impl DunbrecApp {
             return;
         }
         if pressed(cmd(Key::W)) {
-            self.request(Pending::CloseCircuit);
+            let id = self.active().id;
+            self.request(Pending::CloseCircuit(id));
         }
         if pressed(cmd_shift(Key::Z)) || pressed(cmd(Key::Y)) {
             self.active_mut().doc.redo();
@@ -1133,6 +1584,17 @@ impl DunbrecApp {
             self.live_error = Some("Fix the problems listed under Checks first.".into());
             return;
         }
+        // Sketches that have changed are built first; the simulation starts
+        // once they all have (see `continue_run`).
+        let sketches = unbuilt_sketches(&netlist, self.firmware_dir().as_deref());
+        if !sketches.is_empty() {
+            for (name, _) in &sketches {
+                self.active_mut().code.forget_failure(name);
+            }
+            self.live_error = None;
+            self.run_after_build = Some(paused);
+            return;
+        }
         self.bench.clear_readings();
         let speed = self.bench.run_speed(has_mcu(&netlist));
         self.live_speed = speed;
@@ -1175,7 +1637,50 @@ impl DunbrecApp {
         }
     }
 
+    /// While a run waits for sketches: build the next one, start the
+    /// simulation once all are built, or give up on one that fails.
+    fn continue_run(&mut self, ctx: &egui::Context) {
+        let Some(paused) = self.run_after_build else {
+            return;
+        };
+        let dir = self.firmware_dir();
+        let sketches = unbuilt_sketches(&self.active().netlist.1, dir.as_deref());
+        let Some((name, text)) = sketches.first() else {
+            self.start_sim_with(paused);
+            ctx.request_repaint();
+            return;
+        };
+        let code = &mut self.circuits[self.active].code;
+        if code.is_building() {
+            return;
+        }
+        let failed = sketches
+            .iter()
+            .find_map(|(name, text)| Some((name, code.build_failure(name, text)?)));
+        match failed {
+            Some((name, why)) => {
+                self.run_after_build = None;
+                self.live_error = Some(format!("Not started: {name} did not build.\n{why}"));
+                // Its tab lists the errors.
+                self.active_mut().show_source(name);
+                self.message = Some(
+                    Message::error(
+                        "The simulation was not started",
+                        format!(
+                            "“{name}” did not build. Its tab shows what is wrong: correct \
+                             it and press Run again."
+                        ),
+                    )
+                    .with_detail(why),
+                );
+            }
+            None => code.build_sketch(ctx, name, text),
+        }
+        ctx.request_repaint();
+    }
+
     fn stop_sim(&mut self) {
+        self.run_after_build = None;
         self.live = None;
         self.latest = None;
         self.debugger.sim_stopped();
@@ -1183,6 +1688,9 @@ impl DunbrecApp {
 
     /// Run, or pause/resume a running simulation.
     fn toggle_run(&mut self) {
+        if self.run_after_build.is_some() {
+            return;
+        }
         match &mut self.live {
             None => self.start_sim(),
             Some(live) if live.paused => live.send(Command::Resume),
@@ -1321,6 +1829,17 @@ impl DunbrecApp {
                     ui.disable();
                 }
                 match &self.live {
+                    None if self.run_after_build.is_some() => {
+                        ui.spinner();
+                        ui.label("Building…");
+                        if ui
+                            .button("⏹ Stop")
+                            .on_hover_text("Do not start the simulation")
+                            .clicked()
+                        {
+                            self.stop_sim();
+                        }
+                    }
                     None => {
                         if ui.button("▶ Run").on_hover_text("Start the live simulation (Space)").clicked() {
                             self.start_sim();
@@ -1467,7 +1986,7 @@ impl DunbrecApp {
         }
 
         // The debugger lists the firmware of the circuit as it is now.
-        if (self.debugger.show || dock::is_open(&self.dock, Pane::Code))
+        if (self.debugger.show || !circuit.doc.schematic().sources.is_empty())
             && self.debug_loaded != Some(circuit.netlist.0)
         {
             let dir = circuit.firmware_dir();
@@ -1549,16 +2068,39 @@ impl DunbrecApp {
         out
     }
 
-    /// Draw the dockable panels: schematic, palette, properties, checks and
-    /// values.
+    /// Draw the dockable panels, with the open circuits in the middle.
     fn dock_area(&mut self, ctx: &egui::Context) {
-        // The central area holds the schematic while a circuit is open, and
-        // nothing (but stays) when none is.
-        dock::sync_documents(&mut self.dock, self.circuit_open);
+        // A press on a circuit's tab (as drawn last frame) may become a drag
+        // of it.
+        let pressed = ctx.input(|i| {
+            i.pointer
+                .primary_pressed()
+                .then(|| i.pointer.interact_pos())
+                .flatten()
+        });
+        if let Some(at) = pressed {
+            self.dragging_circuit = self.circuit_tab_rects.iter().any(|(_, r)| r.contains(at));
+        }
+        self.circuit_tab_rects.clear();
+        #[cfg(test)]
+        self.file_tab_rects.clear();
+        let ids = self.open_ids();
+        if dock::sync_documents(&mut self.dock, &ids) {
+            self.show_active_tab();
+        }
+        if self.circuit_open {
+            self.active_mut().sync_tabs();
+        }
+        let names: Vec<(u32, String, bool)> = self
+            .circuits
+            .iter()
+            .map(|c| (c.id, c.name(), c.doc.is_dirty()))
+            .collect();
+        let active_id = self.active().id;
         let running = self.live.is_some();
         let lit = self.lit_leds();
         let markers = self.bench.markers(self.active().doc.schematic());
-        let title = self.active().doc.display_name();
+        let title = self.active().name();
         let generation = self.active().doc.generation();
         let live_is_current = running && self.live_generation == generation;
         let sections = if dock::is_open(&self.dock, Pane::Assistant) {
@@ -1572,9 +2114,12 @@ impl DunbrecApp {
             canvas,
             properties,
             code,
+            tabs,
+            hidden,
             netlist,
             node_map,
             dc,
+            ..
         } = &mut self.circuits[self.active];
         let (netlist, dc) = (&netlist.1, &*dc);
         // Live values while simulating, otherwise the DC point.
@@ -1605,7 +2150,7 @@ impl DunbrecApp {
             _ => &[],
         };
         let mut project_command = None;
-        let mut close_circuit = false;
+        let mut closing = Vec::new();
         let mut open_settings = false;
         let readings = || {
             assistant_readings(
@@ -1619,6 +2164,14 @@ impl DunbrecApp {
             )
         };
         let mut viewer = PaneViewer {
+            circuits: &names,
+            active_id,
+            tabs,
+            hidden,
+            closing: &mut closing,
+            tab_rects: &mut self.circuit_tab_rects,
+            #[cfg(test)]
+            file_tab_rects: &mut self.file_tab_rects,
             doc,
             canvas,
             properties,
@@ -1642,87 +2195,97 @@ impl DunbrecApp {
             ai: &self.settings.ai,
             title: &title,
             open_settings: &mut open_settings,
-            close_circuit: &mut close_circuit,
+            accent: ctx.style().visuals.selection,
+        };
+        // There is one active circuit, so circuits are not put side by side.
+        let splits = if self.dragging_circuit {
+            AllowedSplits::None
+        } else {
+            AllowedSplits::All
         };
         DockArea::new(&mut self.dock)
             .style(egui_dock::Style::from_egui(ctx.style().as_ref()))
+            .allowed_splits(splits)
             .show(ctx, &mut viewer);
+        if ctx.input(|i| !i.pointer.any_down() && !i.pointer.any_released()) {
+            self.dragging_circuit = false;
+        }
+        // A circuit dragged elsewhere goes back; otherwise the tab the user
+        // brought to the front is the active circuit.
+        let ids = self.open_ids();
+        if dock::sync_documents(&mut self.dock, &ids) {
+            self.show_active_tab();
+        } else if let Some(index) = dock::front_circuit(&self.dock).and_then(|id| self.index_of(id))
+            && index != self.active
+        {
+            self.switch_to(index);
+            ctx.request_repaint();
+        }
         if let Some(command) = project_command {
             self.run_project_command(command);
         }
-        if close_circuit {
-            self.request(Pending::CloseCircuit);
-        }
-        // Source files the Code panel made on disk belong to the project the
-        // circuit is in.
-        let created = self.active_mut().code.take_created();
-        if !created.is_empty()
-            && let (Some(circuit), Some(project)) =
-                (self.circuits[self.active].doc.path(), self.project.as_mut())
-            && project.contains(circuit)
-        {
-            if let Err(e) = project.add_files(&created) {
-                self.message = Some(Message::error("Could not update the project file", e));
+        for id in closing {
+            if self.pending.is_none() {
+                self.request(Pending::CloseCircuit(id));
             }
-            project.refresh();
-        }
-        if let Some(problem) = self.active_mut().code.take_problem() {
-            self.message = Some(Message::error("Could not create the file", problem));
         }
         if open_settings {
             self.settings_dialog.open();
         }
-        // "Edit code" on a microcontroller's source file opens it in the
-        // editor.
+        // "Edit code" on a microcontroller's source file shows its tab.
         if let Some(name) = self.active_mut().properties.open_code.take() {
-            self.show_code(&name);
+            self.active_mut().show_source(&name);
         }
         if let Some(request) = self.active_mut().properties.demo.take() {
             self.use_demo(ctx, request);
         }
+        if let Some(chip) = self.active_mut().properties.new_file.take() {
+            let text = if self.active().doc.schematic().sources.is_empty() {
+                crate::code_ui::STARTER
+            } else {
+                "; New assembly file\n"
+            };
+            let made = self
+                .active_mut()
+                .add_source(chip, "main", SourceLanguage::Asm, text);
+            self.take_new_file(made);
+        }
     }
 
-    /// Bring the Code panel to the front on the source `name`.
-    fn show_code(&mut self, name: &str) {
-        dock::open(&mut self.dock, Pane::Code);
-        dock::bring_to_front(&mut self.dock, Pane::Code);
-        self.active_mut().code.select(name);
-    }
-
-    /// Make a microcontroller its own copy of a demo program, list the file
-    /// in the project, and show it. A sketch is built straight away, so that
-    /// it can be run.
+    /// Make a microcontroller its own copy of a demo program. A sketch is
+    /// built straight away, so that it can be run.
     fn use_demo(&mut self, ctx: &egui::Context, request: DemoRequest) {
         let sketch = request.language == SourceLanguage::Cpp;
         // A sketch cannot run until it is built.
         if sketch {
             self.stop_sim();
         }
-        let file = match self.active_mut().add_demo(request) {
-            Ok(file) => file,
-            Err(e) => {
-                self.message = Some(Message::error("Could not create the file", e));
-                return;
-            }
-        };
-        if let Some(path) = &file.path
-            && let Some(project) = self.project.as_mut()
-            && self.circuits[self.active]
-                .doc
-                .path()
-                .is_some_and(|c| project.contains(c))
+        let made = self.active_mut().add_demo(request);
+        if let Some(file) = self.take_new_file(made)
+            && sketch
         {
-            if let Err(e) = project.add_files(std::slice::from_ref(path)) {
-                self.message = Some(Message::error("Could not update the project file", e));
-            }
-            project.refresh();
-        }
-        self.show_code(&file.name);
-        if sketch {
             self.active_mut()
                 .code
                 .build_sketch(ctx, &file.name, &file.text);
         }
+    }
+
+    /// List a source file just made for the active circuit in the project, or
+    /// say why there is none.
+    fn take_new_file(&mut self, made: Result<NewFile, String>) -> Option<NewFile> {
+        let file = match made {
+            Ok(file) => file,
+            Err(e) => {
+                self.message = Some(Message::error("Could not create the file", e));
+                return None;
+            }
+        };
+        if let Some(path) = &file.path
+            && let Some(circuit) = self.active().doc.path().map(|p| p.to_path_buf())
+        {
+            self.list_in_project(&circuit, std::slice::from_ref(path));
+        }
+        Some(file)
     }
 
     // ---------------------------------------------------------- UI ---
@@ -1818,7 +2381,8 @@ impl DunbrecApp {
                         .on_hover_text("Close the circuit; the project stays open")
                         .clicked()
                     {
-                        self.request(Pending::CloseCircuit);
+                        let id = self.active().id;
+                        self.request(Pending::CloseCircuit(id));
                         ui.close();
                     }
                     if ui
@@ -2007,8 +2571,20 @@ impl DunbrecApp {
 
     fn dialogs(&mut self, ctx: &egui::Context) {
         if let Some(action) = self.pending.clone() {
-            match dialog::unsaved_changes(ctx, &self.active().doc.display_name(), true) {
-                Some(Unsaved::Save) if self.save(false) => {
+            let at_risk = self.at_risk(&action);
+            let answer = match at_risk.as_slice() {
+                // Nothing left to lose.
+                [] => Some(Unsaved::Discard),
+                [one] => dialog::unsaved_changes(ctx, &self.circuits[*one].name(), true),
+                many => {
+                    let names: Vec<String> =
+                        many.iter().map(|&i| self.circuits[i].name()).collect();
+                    dialog::unsaved_list(ctx, &names, true)
+                }
+            };
+            match answer {
+                // A save that is cancelled or fails leaves the question up.
+                Some(Unsaved::Save) if at_risk.iter().all(|&i| self.save_circuit(i, false)) => {
                     self.pending = None;
                     self.perform(action);
                 }
@@ -2018,6 +2594,44 @@ impl DunbrecApp {
                 }
                 Some(Unsaved::KeepEditing) => self.pending = None,
                 _ => {}
+            }
+        }
+
+        if let Some(ask) = &self.shared_ask {
+            let name = ask
+                .path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let answer = Dialog {
+                id: "shared_source",
+                kind: dialog::Kind::Question,
+                title: "Shared source file",
+                buttons: &["Make a copy", "Cancel"],
+                default: 0,
+                cancel: Some(1),
+            }
+            .show(ctx, |ui| {
+                for (file, owner) in &ask.shared {
+                    dialog::paragraph(
+                        ui,
+                        &format!("“{file}” is already used by {owner}, which is open."),
+                    );
+                }
+                ui.add_space(6.0);
+                dialog::paragraph(
+                    ui,
+                    &format!(
+                        "Circuits cannot share a source file. Open {name} with a copy of its \
+                         own?"
+                    ),
+                );
+            });
+            if let Some(choice) = answer
+                && let Some(ask) = self.shared_ask.take()
+                && choice == 0
+            {
+                self.open_with_copies(ask);
             }
         }
 
@@ -2108,26 +2722,11 @@ impl DunbrecApp {
                 ui.label(RichText::new(hint).weak());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(format!("{:.0}%", self.active().canvas.camera.scale / 14.0 * 100.0));
-                    ui.label(RichText::new("Wheel: zoom · middle-drag: pan").weak());
+                    ui.label(RichText::new("Wheel: scroll · Ctrl+wheel: zoom").weak());
                 });
             });
         });
     }
-}
-
-/// Whether `circuit`, the file of the open circuit, is one the project lists.
-fn circuit_belongs_to(project: Option<&Project>, circuit: Option<&std::path::Path>) -> bool {
-    matches!((project, circuit), (Some(p), Some(c)) if p.contains(c))
-}
-
-/// Whether going to the project file `target` leaves the open circuit
-/// behind: it belongs to the project that is open, which is a different one.
-fn leaves_circuit(
-    open: Option<&Project>,
-    circuit: Option<&std::path::Path>,
-    target: &std::path::Path,
-) -> bool {
-    circuit_belongs_to(open, circuit) && open.is_some_and(|p| !project::path_eq(&p.file, target))
 }
 
 /// What the circuit is doing, for the assistant: the running simulation if
@@ -2446,6 +3045,17 @@ fn source_problems(problems: &[String]) -> Message {
 /// What the dock needs to draw each panel: the parts of the app they show
 /// or edit, borrowed for one frame.
 struct PaneViewer<'a> {
+    /// Every open circuit's id, name and whether it has unsaved changes.
+    circuits: &'a [(u32, String, bool)],
+    /// The active circuit, whose parts follow.
+    active_id: u32,
+    tabs: &'a mut DockState<DocTab>,
+    hidden: &'a mut std::collections::BTreeSet<String>,
+    /// Circuits whose tabs the user closed this frame.
+    closing: &'a mut Vec<u32>,
+    tab_rects: &'a mut Vec<(u32, egui::Rect)>,
+    #[cfg(test)]
+    file_tab_rects: &'a mut Vec<(DocTab, egui::Rect)>,
     doc: &'a mut Document,
     canvas: &'a mut Canvas,
     properties: &'a mut Properties,
@@ -2471,27 +3081,60 @@ struct PaneViewer<'a> {
     ai: &'a crate::ai::AiSettings,
     title: &'a str,
     open_settings: &'a mut bool,
-    /// The user closed the schematic's tab: the circuit is to be closed.
-    close_circuit: &'a mut bool,
+    /// The colours of the active circuit's tab.
+    accent: egui::style::Selection,
 }
 
 impl TabViewer for PaneViewer<'_> {
     type Tab = Pane;
 
     fn title(&mut self, tab: &mut Pane) -> egui::WidgetText {
-        tab.title().into()
+        let Pane::Circuit(id) = *tab else {
+            return tab.title().into();
+        };
+        match self.circuits.iter().find(|c| c.0 == id) {
+            Some((_, name, dirty)) => {
+                let dot = if *dirty { " •" } else { "" };
+                RichText::new(format!("{name}{dot}")).strong().into()
+            }
+            None => "".into(),
+        }
+    }
+
+    // Not from the title, which changes with unsaved changes.
+    fn id(&mut self, tab: &mut Pane) -> egui::Id {
+        egui::Id::new(("pane", *tab))
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Pane) {
         match *tab {
-            Pane::Schematic => self.canvas.show(
-                ui,
-                self.doc,
-                self.netlist,
-                self.annotations,
-                self.markers,
-                self.lit,
-            ),
+            // Another circuit than the active one is in front only for the
+            // frame in which the user picks it.
+            Pane::Circuit(id) if id != self.active_id => {}
+            Pane::Circuit(id) => {
+                let mut style = egui_dock::Style::from_egui(ui.style());
+                style.main_surface_border_stroke = egui::Stroke::NONE;
+                let mut documents = DocViewer {
+                    doc: &mut *self.doc,
+                    canvas: &mut *self.canvas,
+                    code: &mut *self.code,
+                    debugger: &mut *self.debugger,
+                    live: &mut *self.live,
+                    hidden: &mut *self.hidden,
+                    netlist: self.netlist,
+                    annotations: self.annotations,
+                    markers: self.markers,
+                    lit: self.lit,
+                    #[cfg(test)]
+                    tab_rects: &mut *self.file_tab_rects,
+                };
+                DockArea::new(&mut *self.tabs)
+                    .id(egui::Id::new(("circuit-dock", id)))
+                    .style(style)
+                    .show_leaf_close_all_buttons(false)
+                    .show_leaf_collapse_buttons(false)
+                    .show_inside(ui, &mut documents);
+            }
             Pane::Palette => palette_ui(ui, self.canvas, self.palette_search),
             Pane::Properties => {
                 let selection: Vec<Item> = self.canvas.selection.iter().copied().collect();
@@ -2501,7 +3144,6 @@ impl TabViewer for PaneViewer<'_> {
             }
             Pane::Checks => checks_ui(ui, self.netlist, self.doc.schematic()),
             Pane::Values => values_ui(ui, self.netlist, self.running, self.latest, self.dc),
-            Pane::Code => self.code.show(ui, self.doc, self.debugger, self.live),
             Pane::Project => {
                 let embedded = if self.doc.path().is_some() {
                     project::embedded_count(self.doc.schematic())
@@ -2547,15 +3189,21 @@ impl TabViewer for PaneViewer<'_> {
         tab.floats()
     }
 
-    /// Closing the schematic's tab (its close button, a middle click, or the
+    /// Closing a circuit's tab (its close button, a middle click, or the
     /// tab's menu) closes the circuit, after the question about unsaved
     /// changes; the tab itself is taken out by the circuit closing.
     fn on_close(&mut self, tab: &mut Pane) -> OnCloseResponse {
-        if *tab == Pane::Schematic {
-            *self.close_circuit = true;
+        if let Pane::Circuit(id) = *tab {
+            self.closing.push(id);
             OnCloseResponse::Ignore
         } else {
             OnCloseResponse::Close
+        }
+    }
+
+    fn on_tab_button(&mut self, tab: &mut Pane, response: &egui::Response) {
+        if let Pane::Circuit(id) = *tab {
+            self.tab_rects.push((id, response.rect));
         }
     }
 
@@ -2564,16 +3212,25 @@ impl TabViewer for PaneViewer<'_> {
         [false, false]
     }
 
-    /// The schematic fills its tab to the edge.
+    /// A circuit fills its tab to the edge, and the one in front stands out.
     fn tab_style_override(
         &self,
         tab: &Pane,
         global: &egui_dock::TabStyle,
     ) -> Option<egui_dock::TabStyle> {
         match tab {
-            Pane::Schematic => {
+            Pane::Circuit(_) => {
                 let mut style = global.clone();
                 style.tab_body.inner_margin = egui::Margin::ZERO;
+                for s in [
+                    &mut style.active,
+                    &mut style.focused,
+                    &mut style.active_with_kb_focus,
+                    &mut style.focused_with_kb_focus,
+                ] {
+                    s.bg_fill = self.accent.bg_fill;
+                    s.text_color = self.accent.stroke.color;
+                }
                 Some(style)
             }
             // The empty central area: its tab is not drawn.
@@ -2600,6 +3257,95 @@ impl TabViewer for PaneViewer<'_> {
     }
 }
 
+/// What a circuit's own row of tabs draws: its schematic and source files.
+struct DocViewer<'a> {
+    doc: &'a mut Document,
+    canvas: &'a mut Canvas,
+    code: &'a mut CodeEditor,
+    debugger: &'a mut Debugger,
+    live: &'a mut Option<LiveSim>,
+    /// Source files whose tabs are closed.
+    hidden: &'a mut std::collections::BTreeSet<String>,
+    netlist: &'a Netlist,
+    annotations: &'a [Annotation],
+    markers: &'a [Marker],
+    lit: &'a std::collections::HashSet<dunbrec_core::ComponentId>,
+    #[cfg(test)]
+    tab_rects: &'a mut Vec<(DocTab, egui::Rect)>,
+}
+
+impl TabViewer for DocViewer<'_> {
+    type Tab = DocTab;
+
+    fn title(&mut self, tab: &mut DocTab) -> egui::WidgetText {
+        match tab {
+            DocTab::Schematic => "Schematic".into(),
+            DocTab::Source(name) => source_title(self.doc.schematic(), name).into(),
+        }
+    }
+
+    // Not from the title, which changes with the chips that run a file.
+    fn id(&mut self, tab: &mut DocTab) -> egui::Id {
+        egui::Id::new(("document", &*tab))
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, tab: &mut DocTab) {
+        match tab {
+            DocTab::Schematic => self.canvas.show(
+                ui,
+                self.doc,
+                self.netlist,
+                self.annotations,
+                self.markers,
+                self.lit,
+            ),
+            DocTab::Source(name) => {
+                self.code
+                    .show_file(ui, self.doc, self.debugger, self.live, name);
+            }
+        }
+    }
+
+    fn is_closeable(&self, tab: &DocTab) -> bool {
+        *tab != DocTab::Schematic
+    }
+
+    /// Closing a file's tab only stops showing it: it stays with the circuit,
+    /// and is saved with it.
+    fn on_close(&mut self, tab: &mut DocTab) -> OnCloseResponse {
+        if let DocTab::Source(name) = tab {
+            self.hidden.insert(name.clone());
+        }
+        OnCloseResponse::Close
+    }
+
+    #[cfg(test)]
+    fn on_tab_button(&mut self, tab: &mut DocTab, response: &egui::Response) {
+        self.tab_rects.push((tab.clone(), response.rect));
+    }
+
+    fn allowed_in_windows(&self, _tab: &mut DocTab) -> bool {
+        false
+    }
+
+    fn scroll_bars(&self, _tab: &DocTab) -> [bool; 2] {
+        [false, false]
+    }
+
+    /// The schematic fills its tab to the edge.
+    fn tab_style_override(
+        &self,
+        tab: &DocTab,
+        global: &egui_dock::TabStyle,
+    ) -> Option<egui_dock::TabStyle> {
+        (*tab == DocTab::Schematic).then(|| {
+            let mut style = global.clone();
+            style.tab_body.inner_margin = egui::Margin::ZERO;
+            style
+        })
+    }
+}
+
 impl eframe::App for DunbrecApp {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, STORAGE_KEY, &self.settings);
@@ -2610,7 +3356,7 @@ impl eframe::App for DunbrecApp {
         // Closing with unsaved changes asks first.
         if ctx.input(|i| i.viewport().close_requested())
             && !self.allow_close
-            && self.active().doc.is_dirty()
+            && !self.dirty_circuits().is_empty()
         {
             ctx.send_viewport_cmd(ViewportCommand::CancelClose);
             self.pending = Some(Pending::Quit);
@@ -2646,9 +3392,14 @@ impl eframe::App for DunbrecApp {
             return;
         }
 
+        // A sketch is ready to run once built, whether or not it is in view.
+        for circuit in &mut self.circuits {
+            circuit.code.poll_build(ctx);
+        }
         self.shortcuts(ctx);
         let live_dc = self.live_dc;
         self.active_mut().refresh_netlist(live_dc);
+        self.continue_run(ctx);
         self.refresh_signals();
         self.sync_live();
         if self.live.as_ref().is_some_and(|l| !l.paused) {
@@ -2658,7 +3409,7 @@ impl eframe::App for DunbrecApp {
         let title = if self.circuit_open {
             format!(
                 "{}{} — Dunbrec",
-                self.active().doc.display_name(),
+                self.active().name(),
                 if self.active().doc.is_dirty() {
                     " •"
                 } else {
@@ -2704,49 +3455,6 @@ impl eframe::App for DunbrecApp {
 mod tests {
     use super::*;
     use crate::library::palette;
-
-    #[test]
-    fn only_a_circuit_the_project_lists_goes_with_it() {
-        let dir = std::env::temp_dir().join(format!("dunbrec-close-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let (project, circuit) = Project::create(&dir.join("P")).unwrap();
-        assert!(circuit_belongs_to(Some(&project), Some(&circuit)));
-        // A circuit somewhere else, an unsaved one, or no project at all.
-        assert!(!circuit_belongs_to(
-            Some(&project),
-            Some(&dir.join("other.dbr"))
-        ));
-        assert!(!circuit_belongs_to(Some(&project), None));
-        assert!(!circuit_belongs_to(None, Some(&circuit)));
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn changing_project_leaves_the_circuit_only_for_a_different_project() {
-        let dir = std::env::temp_dir().join(format!("dunbrec-switch-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let (project, circuit) = Project::create(&dir.join("A")).unwrap();
-        let other = dir.join("B.dbrproj");
-        // Another project: the open circuit of A is left behind.
-        assert!(leaves_circuit(Some(&project), Some(&circuit), &other));
-        // The same project again keeps it.
-        assert!(!leaves_circuit(
-            Some(&project),
-            Some(&circuit),
-            &project.file
-        ));
-        // A circuit that is not A's, an unsaved one, or no project: nothing to leave.
-        assert!(!leaves_circuit(
-            Some(&project),
-            Some(&dir.join("x.dbr")),
-            &other
-        ));
-        assert!(!leaves_circuit(Some(&project), None, &other));
-        assert!(!leaves_circuit(None, Some(&circuit), &other));
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
 
     #[test]
     fn the_j_key_picks_the_same_tool_as_the_palette_junction() {
@@ -2811,16 +3519,88 @@ mod tests {
                 .unwrap_or_else(|| panic!("nothing labelled {label:?} is shown"))
                 .1
                 .center();
+            self.click_at(at, egui::PointerButton::Primary);
+        }
+
+        fn button(at: egui::Pos2, button: egui::PointerButton, pressed: bool) -> egui::Event {
+            egui::Event::PointerButton {
+                pos: at,
+                button,
+                pressed,
+                modifiers: Modifiers::NONE,
+            }
+        }
+
+        fn click_at(&mut self, at: egui::Pos2, button: egui::PointerButton) {
             self.frame(vec![egui::Event::PointerMoved(at)]);
             for pressed in [true, false] {
-                self.frame(vec![egui::Event::PointerButton {
-                    pos: at,
-                    button: egui::PointerButton::Primary,
-                    pressed,
-                    modifiers: Modifiers::NONE,
-                }]);
+                self.frame(vec![Self::button(at, button, pressed)]);
             }
             self.settle();
+        }
+
+        fn drag(&mut self, from: egui::Pos2, to: egui::Pos2) {
+            let primary = egui::PointerButton::Primary;
+            self.frame(vec![egui::Event::PointerMoved(from)]);
+            self.frame(vec![Self::button(from, primary, true)]);
+            for i in 1..=20 {
+                let at = from + (to - from) * (i as f32 / 20.0);
+                self.frame(vec![egui::Event::PointerMoved(at)]);
+            }
+            for _ in 0..8 {
+                self.frame(vec![egui::Event::PointerMoved(to)]);
+            }
+            self.frame(vec![Self::button(to, primary, false)]);
+            self.settle();
+        }
+
+        /// The middle of the tab of the open circuit called `name`.
+        fn circuit_tab(&self, name: &str) -> egui::Pos2 {
+            let circuit = self
+                .app
+                .circuits
+                .iter()
+                .find(|c| c.name() == name)
+                .unwrap_or_else(|| panic!("{name} is not open"));
+            self.app
+                .circuit_tab_rects
+                .iter()
+                .find(|(id, _)| *id == circuit.id)
+                .unwrap_or_else(|| panic!("{name} has no tab"))
+                .1
+                .center()
+        }
+
+        fn click_circuit(&mut self, name: &str) {
+            self.click_at(self.circuit_tab(name), egui::PointerButton::Primary);
+        }
+
+        /// The middle of a tab in the active circuit's own row.
+        fn file_tab(&self, tab: &DocTab) -> egui::Pos2 {
+            self.app
+                .file_tab_rects
+                .iter()
+                .find(|(t, _)| t == tab)
+                .unwrap_or_else(|| panic!("no tab {tab:?}"))
+                .1
+                .center()
+        }
+
+        fn active_name(&self) -> String {
+            self.app.active().name()
+        }
+
+        /// The names of the circuits that have tabs.
+        fn open_names(&self) -> Vec<String> {
+            self.app
+                .open_ids()
+                .iter()
+                .map(|&id| {
+                    let i = self.app.index_of(id).unwrap();
+                    assert!(dock::is_open(&self.app.dock, Pane::Circuit(id)));
+                    self.app.circuits[i].name()
+                })
+                .collect()
         }
     }
 
@@ -2872,7 +3652,11 @@ mod tests {
                 .unwrap()
                 .contains(&root.join("blink.asm"))
         );
-        assert!(dock::is_open(&app.dock, Pane::Code), "shown for editing");
+        assert!(
+            app.active()
+                .is_in_front(&DocTab::Source("blink.asm".into())),
+            "shown for editing"
+        );
         assert!(
             app.active()
                 .doc
@@ -2904,6 +3688,449 @@ mod tests {
         rig.settle();
         assert_eq!(rig.app.live_speed, 1.0);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A project in a scratch folder with "Blink" (the Arduino blink example)
+    /// and "Divider" (the first example), and the app with it open.
+    struct Fixture {
+        rig: Rig,
+        root: PathBuf,
+        blink: PathBuf,
+        divider: PathBuf,
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn example(name: &str) -> Schematic {
+        (examples()
+            .iter()
+            .find(|e| e.name == name)
+            .unwrap_or_else(|| panic!("no example {name}"))
+            .build)()
+    }
+
+    fn fixture(tag: &str) -> Fixture {
+        let root = std::env::temp_dir().join(format!("dunbrec-tabs-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let (mut project, _) = Project::create(&root.join("P")).unwrap();
+        let blink = root.join("Blink.dbr");
+        let divider = root.join("Divider.dbr");
+        dunbrec_io::dbr::save(&example("Arduino blink"), &blink).unwrap();
+        dunbrec_io::dbr::save(&(examples()[0].build)(), &divider).unwrap();
+        project
+            .add_files(&[blink.clone(), divider.clone()])
+            .unwrap();
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let app = DunbrecApp::new(&cc, None, Some(project.file.clone()));
+        let mut rig = Rig {
+            ctx,
+            app,
+            time: 0.0,
+            seen: Vec::new(),
+        };
+        rig.settle();
+        Fixture {
+            rig,
+            root,
+            blink,
+            divider,
+        }
+    }
+
+    impl Fixture {
+        fn open(&mut self, path: &std::path::Path) {
+            self.rig.app.request(Pending::OpenPath(path.to_path_buf()));
+            self.rig.settle();
+        }
+
+        fn open_both(&mut self) {
+            self.open(&self.blink.clone());
+            self.open(&self.divider.clone());
+        }
+
+        fn add_a_resistor(&mut self) {
+            self.rig.app.active_mut().doc.edit(|s| {
+                s.add_component(
+                    dunbrec_core::ComponentKind::Resistor { resistance: 1e3 },
+                    dunbrec_core::Point::new(60, 60),
+                )
+            });
+            self.rig.settle();
+        }
+
+        fn parts(path: &std::path::Path) -> usize {
+            dunbrec_io::dbr::load(path).unwrap().components.len()
+        }
+
+        fn chip(&self) -> dunbrec_core::ComponentId {
+            self.rig
+                .app
+                .active()
+                .doc
+                .schematic()
+                .components
+                .iter()
+                .find(|c| matches!(c.kind, dunbrec_core::ComponentKind::Mcu { .. }))
+                .expect("a microcontroller")
+                .id
+        }
+
+        /// Give the active circuit's chip its own assembly blink.
+        fn give_the_chip_a_file(&mut self) {
+            let request = DemoRequest {
+                chip: self.chip(),
+                demo: "blink",
+                language: SourceLanguage::Asm,
+            };
+            let ctx = self.rig.ctx.clone();
+            self.rig.app.use_demo(&ctx, request);
+            self.rig.settle();
+        }
+    }
+
+    #[test]
+    fn each_open_circuit_has_a_tab_and_its_own_schematic() {
+        let mut f = fixture("two");
+        assert!(f.rig.open_names().is_empty());
+        f.open_both();
+        assert_eq!(f.rig.open_names(), ["Blink", "Divider"]);
+        assert_eq!(f.rig.active_name(), "Divider", "the one just opened");
+        let divider = f.rig.app.active().doc.schematic().clone();
+        f.rig.click_circuit("Blink");
+        assert_eq!(f.rig.active_name(), "Blink");
+        assert_ne!(f.rig.app.active().doc.schematic(), &divider);
+        assert_eq!(f.rig.app.title, "Blink — Dunbrec");
+        assert!(!f.rig.app.file_tab_rects.is_empty(), "its second row");
+        f.rig.click_circuit("Divider");
+        assert_eq!(f.rig.app.active().doc.schematic(), &divider);
+        // Opening one that is open goes to its tab.
+        f.open(&f.blink.clone());
+        assert_eq!(f.rig.open_names(), ["Blink", "Divider"]);
+        assert_eq!(f.rig.active_name(), "Blink");
+        // An example has no file, and is named after what it is.
+        f.rig.app.request(Pending::Example(0));
+        f.rig.settle();
+        assert_eq!(f.rig.active_name(), examples()[0].name);
+        assert_eq!(f.rig.open_names().len(), 3);
+    }
+
+    #[test]
+    fn a_circuit_tab_cannot_be_dragged_out_of_the_row() {
+        let mut f = fixture("drag");
+        f.open_both();
+        let before = format!("{:?}", f.rig.app.dock.iter_all_tabs().count());
+        for to in [
+            egui::pos2(800.0, 450.0),
+            egui::pos2(1150.0, 450.0),
+            egui::pos2(60.0, 60.0),
+        ] {
+            let from = f.rig.circuit_tab("Blink");
+            f.rig.drag(from, to);
+            let central = f.rig.app.dock.find_tab(&Pane::Workspace).unwrap();
+            for id in f.rig.app.open_ids() {
+                let at = f.rig.app.dock.find_tab(&Pane::Circuit(id)).unwrap();
+                assert_eq!((at.0, at.1), (central.0, central.1), "dropped at {to:?}");
+            }
+            assert_eq!(
+                format!("{:?}", f.rig.app.dock.iter_all_tabs().count()),
+                before
+            );
+            assert_eq!(f.rig.app.dock.surfaces_count(), 1);
+        }
+    }
+
+    #[test]
+    fn only_the_active_circuit_runs() {
+        let mut f = fixture("run");
+        f.open_both();
+        f.rig.click_circuit("Blink");
+        f.rig.click(" Run");
+        assert!(f.rig.app.live.is_some(), "{:?}", f.rig.app.live_error);
+        // Its own tabs do not stop it.
+        let at = f.rig.file_tab(&DocTab::Schematic);
+        f.rig.click_at(at, egui::PointerButton::Primary);
+        assert!(f.rig.app.live.is_some());
+        f.rig.click_circuit("Divider");
+        assert!(f.rig.app.live.is_none(), "stopped on leaving");
+        f.rig.click_circuit("Blink");
+        assert!(f.rig.app.live.is_none(), "and stays stopped");
+    }
+
+    #[test]
+    fn instruments_follow_the_circuit_and_copies_cross_over() {
+        let mut f = fixture("tools");
+        f.open_both();
+        f.rig.click_circuit("Blink");
+        f.rig.app.bench.show_scope = true;
+        f.rig.app.bench.scope_probes[0] = Some(dunbrec_core::Point::new(1, 2));
+        f.rig.app.active_mut().select_all();
+        f.rig.app.active_mut().copy();
+        let copied = f.rig.app.active().doc.schematic().components.len();
+        f.rig.settle();
+        f.rig.click_circuit("Divider");
+        assert!(f.rig.app.bench.show_scope, "the window stays up");
+        assert_eq!(f.rig.app.bench.scope_probes[0], None, "other probes");
+        let before = f.rig.app.active().doc.schematic().components.len();
+        f.rig.app.active_mut().paste();
+        assert_eq!(
+            f.rig.app.active().doc.schematic().components.len(),
+            before + copied
+        );
+        f.rig.app.bench.show_scope = false;
+        f.rig.settle();
+        f.rig.click_circuit("Blink");
+        assert!(!f.rig.app.bench.show_scope);
+        assert_eq!(
+            f.rig.app.bench.scope_probes[0],
+            Some(dunbrec_core::Point::new(1, 2))
+        );
+    }
+
+    #[test]
+    fn closing_a_tab_asks_only_about_that_circuit() {
+        let mut f = fixture("close");
+        f.open_both();
+        // A saved circuit that is not in front just goes, and nothing else
+        // changes.
+        f.rig.click_circuit("Blink");
+        f.rig.click(" Run");
+        let middle = egui::PointerButton::Middle;
+        f.rig.click_at(f.rig.circuit_tab("Divider"), middle);
+        assert_eq!(f.rig.open_names(), ["Blink"]);
+        assert!(f.rig.app.pending.is_none() && f.rig.app.live.is_some());
+        // An unsaved one is brought to the front to be asked about.
+        f.open(&f.divider.clone());
+        f.add_a_resistor();
+        f.rig.click_circuit("Blink");
+        f.rig.click_at(f.rig.circuit_tab("Divider"), middle);
+        assert_eq!(f.rig.active_name(), "Divider");
+        assert!(f.rig.app.pending.is_some());
+        f.rig.click("Keep editing");
+        assert_eq!(f.rig.open_names(), ["Blink", "Divider"]);
+        f.rig.click_at(f.rig.circuit_tab("Divider"), middle);
+        f.rig.click("Discard changes");
+        assert_eq!(f.rig.open_names(), ["Blink"]);
+        // The last one leaves the central area empty.
+        f.rig.click_at(f.rig.circuit_tab("Blink"), middle);
+        assert!(f.rig.open_names().is_empty() && !f.rig.app.circuit_open);
+        assert!(dock::is_open(&f.rig.app.dock, Pane::Workspace));
+        assert_eq!(f.rig.app.title, "P — Dunbrec");
+    }
+
+    #[test]
+    fn leaving_with_several_unsaved_circuits_asks_once_and_saves_them_all() {
+        let mut f = fixture("quit");
+        f.open_both();
+        let (blink, divider) = (Fixture::parts(&f.blink), Fixture::parts(&f.divider));
+        f.add_a_resistor();
+        f.rig.click_circuit("Blink");
+        f.add_a_resistor();
+        f.rig.app.request(Pending::Quit);
+        f.rig.settle();
+        assert!(!f.rig.app.allow_close);
+        f.rig.click("Cancel");
+        assert!(f.rig.app.pending.is_none() && !f.rig.app.allow_close);
+        f.rig.app.request(Pending::Quit);
+        f.rig.settle();
+        f.rig.click("Save all");
+        assert!(f.rig.app.allow_close);
+        assert_eq!(Fixture::parts(&f.blink), blink + 1);
+        assert_eq!(Fixture::parts(&f.divider), divider + 1);
+    }
+
+    #[test]
+    fn closing_the_project_closes_every_circuit() {
+        let mut f = fixture("project");
+        f.open_both();
+        f.add_a_resistor();
+        let parts = Fixture::parts(&f.divider);
+        f.rig.app.request(Pending::CloseProject);
+        f.rig.settle();
+        // One unsaved circuit, so it is named.
+        f.rig.click("Discard changes");
+        assert!(f.rig.app.project.is_none() && !f.rig.app.circuit_open);
+        assert_eq!(f.rig.app.circuits.len(), 1);
+        assert_eq!(Fixture::parts(&f.divider), parts);
+    }
+
+    #[test]
+    fn deleting_a_circuit_file_closes_its_tab() {
+        let mut f = fixture("delete");
+        f.open_both();
+        f.rig.app.delete_in_project(&f.divider.clone());
+        f.rig.settle();
+        assert_eq!(f.rig.open_names(), ["Blink"]);
+        assert!(!f.divider.exists());
+    }
+
+    #[test]
+    fn a_source_file_has_a_named_tab_beside_its_schematic() {
+        let mut f = fixture("files");
+        f.open_both();
+        f.rig.click_circuit("Blink");
+        f.give_the_chip_a_file();
+        let file = DocTab::Source("blink.asm".into());
+        assert!(f.rig.app.active().is_in_front(&file));
+        assert_eq!(
+            source_title(f.rig.app.active().doc.schematic(), "blink.asm"),
+            "U1: blink.asm"
+        );
+        let at = f.rig.file_tab(&DocTab::Schematic);
+        f.rig.click_at(at, egui::PointerButton::Primary);
+        assert!(f.rig.app.active().is_in_front(&DocTab::Schematic));
+        let at = f.rig.file_tab(&file);
+        f.rig.click_at(at, egui::PointerButton::Primary);
+        assert!(f.rig.app.active().is_in_front(&file));
+        // Closing the file's tab keeps the file with the circuit.
+        f.rig
+            .click_at(f.rig.file_tab(&file), egui::PointerButton::Middle);
+        assert!(f.rig.app.active().tabs.find_tab(&file).is_none());
+        assert!(
+            f.rig
+                .app
+                .active()
+                .doc
+                .schematic()
+                .sources
+                .contains_key("blink.asm")
+        );
+        // The other circuit has no such tab; picking the file in the project
+        // goes to the circuit that has it.
+        f.rig.click_circuit("Divider");
+        assert!(f.rig.app.file_tab_rects.iter().all(|(t, _)| *t != file));
+        f.rig.app.open_source(&f.root.join("blink.asm"));
+        f.rig.settle();
+        assert_eq!(f.rig.active_name(), "Blink");
+        assert!(f.rig.app.active().is_in_front(&file));
+    }
+
+    #[test]
+    fn two_circuits_never_share_a_source_file() {
+        let mut f = fixture("shared");
+        f.open(&f.blink.clone());
+        f.give_the_chip_a_file();
+        assert!(f.rig.app.save(false));
+        // A second circuit whose chip names the same file.
+        let copy = f.root.join("Copy.dbr");
+        std::fs::copy(&f.blink, &copy).unwrap();
+        f.rig.app.project.as_mut().unwrap().add_file(&copy).unwrap();
+        f.open(&copy);
+        assert_eq!(f.rig.open_names(), ["Blink"], "asked first");
+        f.rig.click("Cancel");
+        assert!(f.rig.app.shared_ask.is_none());
+        assert_eq!(f.rig.open_names(), ["Blink"]);
+
+        f.open(&copy);
+        f.rig.click("Make a copy");
+        assert_eq!(f.rig.open_names(), ["Blink", "Copy"]);
+        let circuit = f.rig.app.active();
+        assert!(circuit.doc.is_dirty(), "the new name is not saved yet");
+        assert!(!circuit.doc.can_undo(), "undo cannot share the file again");
+        let sources: Vec<&String> = circuit.doc.schematic().sources.keys().collect();
+        assert_eq!(sources, ["blink2.asm"]);
+        assert_eq!(
+            source_title(circuit.doc.schematic(), "blink2.asm"),
+            "U1: blink2.asm"
+        );
+        let new = f.root.join("blink2.asm");
+        assert!(new.is_file());
+        assert!(f.rig.app.project.as_ref().unwrap().contains(&new));
+        // Once saved, the circuit opens again without a question.
+        assert!(f.rig.app.save(false));
+        assert!(!f.rig.app.active().doc.is_dirty());
+        let id = f.rig.app.active().id;
+        f.rig.app.request(Pending::CloseCircuit(id));
+        f.open(&copy);
+        assert!(f.rig.app.shared_ask.is_none());
+        assert_eq!(f.rig.open_names(), ["Blink", "Copy"]);
+    }
+
+    /// Draw frames until the run that is waiting has started or given up.
+    fn wait_for_the_build(rig: &mut Rig) {
+        let started = std::time::Instant::now();
+        while rig.app.run_after_build.is_some() {
+            assert!(started.elapsed().as_secs() < 180, "the build never ended");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            rig.frame(vec![]);
+        }
+        rig.settle();
+    }
+
+    /// Runs the real Arduino tool, and does nothing on a machine without it.
+    #[test]
+    fn run_builds_a_changed_sketch_before_it_starts() {
+        if dunbrec_mcu::arduino::find_cli(None).is_none() {
+            eprintln!("arduino-cli not installed: skipped");
+            return;
+        }
+        let mut f = fixture("autobuild");
+        f.open(&f.blink.clone());
+        let chip = f.chip();
+        let ctx = f.rig.ctx.clone();
+        f.rig.app.use_demo(
+            &ctx,
+            DemoRequest {
+                chip,
+                demo: "blink",
+                language: SourceLanguage::Cpp,
+            },
+        );
+        f.rig.settle();
+        let set = |f: &mut Fixture, from: &str, to: &str| {
+            f.rig.app.active_mut().doc.edit(|s| {
+                let file = s.sources.get_mut("blink.ino").unwrap();
+                assert!(file.text.contains(from), "{from}");
+                file.text = file.text.replacen(from, to, 1);
+            });
+            f.rig.settle();
+        };
+        // A change, then straight to Run (a time no other test builds).
+        set(&mut f, "ON_MS = 500", "ON_MS = 137");
+        f.rig.click(" Run");
+        assert!(f.rig.app.live.is_none(), "not before it is built");
+        assert!(f.rig.app.run_after_build.is_some());
+        wait_for_the_build(&mut f.rig);
+        assert!(f.rig.app.live.is_some(), "{:?}", f.rig.app.live_error);
+
+        // A mistake: nothing starts, and the file with it is shown.
+        f.rig.app.stop_sim();
+        set(&mut f, "digitalWrite(LED_PIN, HIGH);", "oops();");
+        let at = f.rig.file_tab(&DocTab::Schematic);
+        f.rig.click_at(at, egui::PointerButton::Primary);
+        f.rig.click(" Run");
+        wait_for_the_build(&mut f.rig);
+        assert!(f.rig.app.live.is_none());
+        let why = f.rig.app.live_error.clone().expect("said");
+        assert!(
+            why.contains("blink.ino did not build") && why.contains("oops"),
+            "{why}"
+        );
+        assert!(
+            f.rig
+                .app
+                .active()
+                .is_in_front(&DocTab::Source("blink.ino".into()))
+        );
+        assert!(f.rig.app.message.is_some());
+        f.rig.click("OK");
+
+        // Corrected, and Run again; then a run that is called off.
+        set(&mut f, "oops();", "digitalWrite(LED_PIN, HIGH);");
+        set(&mut f, "ON_MS = 137", "ON_MS = 139");
+        f.rig.click(" Run");
+        assert!(f.rig.app.run_after_build.is_some());
+        f.rig.click(" Stop");
+        assert!(f.rig.app.run_after_build.is_none() && f.rig.app.live.is_none());
+        f.rig.click(" Run");
+        wait_for_the_build(&mut f.rig);
+        assert!(f.rig.app.live.is_some(), "{:?}", f.rig.app.live_error);
     }
 
     #[test]

@@ -1,29 +1,59 @@
 //! Everything that belongs to one open circuit: the document, how it is being
-//! looked at and edited, and what has been worked out from it.
+//! looked at and edited, its row of tabs (the schematic and its source
+//! files), its instruments and what has been worked out from it.
 //!
-//! What is *not* here belongs to the application: the live simulation and the
-//! debugger (only one circuit can run), the instruments, and the panels around
-//! the circuit. See `docs/multi-document-editor.md`.
+//! What is *not* here belongs to the application: the live simulation (only
+//! the active circuit can run) and the panels around the circuit. See
+//! `docs/multi-document-editor.md`.
 //!
 //! The caches are keyed on [`Document::generation`], which is unique across
 //! documents, so one can never be mistaken for another circuit's.
 
-use std::path::PathBuf;
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 
 use dunbrec_core::{
-    ComponentKind, Netlist, NodeId, Point, Schematic, SourceFile, SourceLanguage, build_netlist,
-    units::format_value,
+    ComponentKind, Netlist, NodeId, Point, SOURCE_PREFIX, Schematic, SourceFile, SourceLanguage,
+    build_netlist, units::format_value,
 };
 use dunbrec_sim::{Circuit, SimWarning, operating_point};
+use egui_dock::{DockState, Node};
 
+use crate::analyses_ui::Analyses;
+use crate::assistant::Assistant;
 use crate::canvas::{self, Annotation, Canvas, Item, NodeMap, TagPlace, node_tag_positions};
 use crate::code_ui::CodeEditor;
+use crate::debugger_ui::Debugger;
 use crate::document::Document;
+use crate::instruments_ui::Bench;
 use crate::project;
 use crate::properties::{DemoRequest, Properties};
+use crate::serial_ui::SerialMonitor;
 
-/// The source file made for a demo.
-pub struct DemoFile {
+/// A tab in a circuit's own row.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum DocTab {
+    /// The drawing. Always there.
+    Schematic,
+    /// A source file, by its name in [`Schematic::sources`].
+    Source(String),
+}
+
+/// The instruments and the assistant as one circuit left them: probes sit on
+/// its wires, plots and serial output came from it, breakpoints are in its
+/// chips and the conversation is about it. The application holds the active
+/// circuit's; each of the others keeps its own here.
+#[derive(Default)]
+pub struct Tools {
+    pub bench: Bench,
+    pub analyses: Analyses,
+    pub serial: SerialMonitor,
+    pub debugger: Debugger,
+    pub assistant: Assistant,
+}
+
+/// The source file made for a microcontroller.
+pub struct NewFile {
     /// Its name, which is also the chip's firmware setting.
     pub name: String,
     /// Where it was written; `None` while the circuit has no folder, so the
@@ -48,6 +78,10 @@ pub struct DcTable {
 }
 
 pub struct OpenCircuit {
+    /// Tells this circuit's tab from the others'; never reused in a session.
+    pub id: u32,
+    /// What to call it while it has no file (an example or an import).
+    pub title: Option<String>,
     /// The schematic, its file and its undo history.
     pub doc: Document,
     /// View, selection, current tool and clipboard.
@@ -55,6 +89,12 @@ pub struct OpenCircuit {
     pub properties: Properties,
     /// The editor of the circuit's firmware source files.
     pub code: CodeEditor,
+    /// How the circuit's own tabs are arranged.
+    pub tabs: DockState<DocTab>,
+    /// Source files whose tabs the user has closed.
+    pub hidden: BTreeSet<String>,
+    /// This circuit's instruments while another circuit is the active one.
+    pub tools: Tools,
     /// The netlist, and the document generation it was built from.
     pub netlist: (u64, Netlist),
     /// Node lookup and voltage-tag positions, keyed by generation.
@@ -73,24 +113,33 @@ impl OpenCircuit {
         let netlist = build_netlist(doc.schematic());
         let node_map = NodeMap::new(doc.schematic(), &netlist);
         let tags = node_tag_positions(doc.schematic(), &netlist);
-        Self {
+        let mut circuit = Self {
+            id: 0,
+            title: None,
             node_map: (doc.generation(), node_map, tags),
             netlist: (doc.generation(), netlist),
             doc,
             canvas: Canvas::default(),
             properties: Properties::default(),
             code: CodeEditor::default(),
+            tabs: DockState::new(vec![DocTab::Schematic]),
+            hidden: BTreeSet::new(),
+            tools: Tools::default(),
             dc: None,
-        }
+        };
+        circuit.sync_tabs();
+        circuit
     }
 
-    /// Put another document in this one's place. The view, the clipboard and
-    /// the editors stay; what referred to the old document's parts goes.
-    pub fn replace_document(&mut self, doc: Document) {
-        self.doc = doc;
-        self.canvas.selection.clear();
-        self.canvas.cancel();
-        self.dc = None;
+    /// The circuit's name, as its tab shows it: its file's name, or for one
+    /// without a file what it came from.
+    pub fn name(&self) -> String {
+        self.doc
+            .path()
+            .and_then(|p| p.file_stem())
+            .map(|s| s.to_string_lossy().into_owned())
+            .or_else(|| self.title.clone())
+            .unwrap_or_else(|| "Untitled".to_string())
     }
 
     /// The folder of the circuit's file, which relative firmware paths start
@@ -100,6 +149,160 @@ impl OpenCircuit {
             .path()
             .and_then(|p| p.parent())
             .map(|d| d.to_path_buf())
+    }
+
+    // --------------------------------------------------------- the tabs ---
+
+    /// Make the row of tabs match the circuit: the schematic, then one tab
+    /// for each source file that has not been closed.
+    pub fn sync_tabs(&mut self) {
+        let sources = &self.doc.schematic().sources;
+        let wanted: Vec<DocTab> = sources
+            .keys()
+            .filter(|name| !self.hidden.contains(*name))
+            .map(|name| DocTab::Source(name.clone()))
+            .collect();
+        loop {
+            let stale = self
+                .tabs
+                .iter_all_tabs()
+                .map(|(_, tab)| tab)
+                .find(|tab| **tab != DocTab::Schematic && !wanted.contains(tab))
+                .cloned();
+            let Some(at) = stale.and_then(|tab| self.tabs.find_tab(&tab)) else {
+                break;
+            };
+            self.tabs.remove_tab(at);
+        }
+        for tab in wanted {
+            if self.tabs.find_tab(&tab).is_some() {
+                continue;
+            }
+            // Beside the schematic, without taking its place in front.
+            match self.tabs.find_tab(&DocTab::Schematic) {
+                Some((surface, node, _)) => {
+                    let front = match &self.tabs[surface][node] {
+                        Node::Leaf(leaf) => Some(leaf.active),
+                        _ => None,
+                    };
+                    self.tabs[surface][node].append_tab(tab);
+                    if let Some(front) = front {
+                        self.tabs.set_active_tab((surface, node, front));
+                    }
+                }
+                None => self.tabs.push_to_first_leaf(tab),
+            }
+        }
+    }
+
+    /// Bring the tab of the source file `name` to the front, opening it again
+    /// if it was closed.
+    pub fn show_source(&mut self, name: &str) {
+        self.hidden.remove(name);
+        self.sync_tabs();
+        if let Some(at) = self.tabs.find_tab(&DocTab::Source(name.to_string())) {
+            self.tabs.set_active_tab(at);
+            self.tabs.set_focused_node_and_surface((at.0, at.1));
+        }
+    }
+
+    /// Whether the tab of `tab` is the one in front in its group.
+    #[cfg(test)]
+    pub fn is_in_front(&self, tab: &DocTab) -> bool {
+        self.tabs.find_tab(tab).is_some_and(|(surface, node, index)| {
+            matches!(&self.tabs[surface][node], Node::Leaf(leaf) if leaf.active == index)
+        })
+    }
+
+    // ------------------------------------------------- source files ---
+
+    /// The circuit's source files on disk: name and full path.
+    pub fn source_paths(&self) -> Vec<(String, PathBuf)> {
+        let Some(dir) = self.firmware_dir() else {
+            return Vec::new();
+        };
+        self.doc
+            .schematic()
+            .sources
+            .keys()
+            .filter(|name| project::is_file_source(name))
+            .map(|name| (name.clone(), project::normalize(&dir.join(name))))
+            .collect()
+    }
+
+    /// The name this circuit knows the file at `path` by, if it has it open.
+    pub fn source_at(&self, path: &Path) -> Option<String> {
+        let wanted = project::normalize(path);
+        self.source_paths()
+            .into_iter()
+            .find(|(_, full)| project::path_eq(full, &wanted))
+            .map(|(name, _)| name)
+    }
+
+    /// Give a microcontroller its own copy of a demo program (see
+    /// [`add_source`](Self::add_source)).
+    pub fn add_demo(&mut self, request: DemoRequest) -> Result<NewFile, String> {
+        let demo = dunbrec_mcu::demos::demo(request.demo)
+            .ok_or_else(|| format!("there is no demo called {}", request.demo))?;
+        let text = match request.language {
+            SourceLanguage::Asm => demo.assembly,
+            SourceLanguage::Cpp => demo.sketch,
+        };
+        self.add_source(request.chip, demo.name, request.language, text)
+    }
+
+    /// Make a new source file for a microcontroller beside the circuit, called
+    /// after `base`, and set the chip to run it. Existing files are never
+    /// written over. Undo restores the chip's setting; the file stays on disk.
+    pub fn add_source(
+        &mut self,
+        chip: dunbrec_core::ComponentId,
+        base: &str,
+        language: SourceLanguage,
+        text: &str,
+    ) -> Result<NewFile, String> {
+        let is_chip = self
+            .doc
+            .schematic()
+            .component(chip)
+            .is_some_and(|c| matches!(c.kind, ComponentKind::Mcu { .. }));
+        if !is_chip {
+            return Err("that microcontroller is no longer in the circuit".into());
+        }
+        let extension = match language {
+            SourceLanguage::Asm => "asm",
+            SourceLanguage::Cpp => "ino",
+        };
+        // The programs are built into Dunbrec with the line endings of the
+        // machine that built it.
+        let text = text.replace("\r\n", "\n");
+        let sources = &self.doc.schematic().sources;
+        let taken = |name: &str| sources.keys().any(|k| k.eq_ignore_ascii_case(name));
+        let (name, path) = match self.firmware_dir() {
+            Some(dir) => {
+                let name = project::new_source_copy(&dir, base, extension, &text, taken)?;
+                let path = dir.join(&name);
+                (name, Some(path))
+            }
+            None => {
+                let name = crate::code_ui::unused_file_name(sources, base, extension);
+                (name, None)
+            }
+        };
+        let file = SourceFile {
+            language,
+            text: text.clone(),
+        };
+        self.doc.edit(|s| {
+            s.sources.insert(name.clone(), file);
+            if let Some(c) = s.component_mut(chip)
+                && let ComponentKind::Mcu { firmware, .. } = &mut c.kind
+            {
+                *firmware = name.clone();
+            }
+        });
+        self.show_source(&name);
+        Ok(NewFile { name, path, text })
     }
 
     // ------------------------------------------------ derived results ---
@@ -143,59 +346,6 @@ impl OpenCircuit {
             generation: self.doc.generation(),
             outcome,
         });
-    }
-
-    // ------------------------------------------------- source files ---
-
-    /// Give a microcontroller its own copy of a demo program: a new source
-    /// file beside the circuit, which the chip is set to run. Existing files
-    /// are never written over. Undo restores the chip's setting; the file
-    /// stays on disk.
-    pub fn add_demo(&mut self, request: DemoRequest) -> Result<DemoFile, String> {
-        let demo = dunbrec_mcu::demos::demo(request.demo)
-            .ok_or_else(|| format!("there is no demo called {}", request.demo))?;
-        let is_chip = self
-            .doc
-            .schematic()
-            .component(request.chip)
-            .is_some_and(|c| matches!(c.kind, ComponentKind::Mcu { .. }));
-        if !is_chip {
-            return Err("that microcontroller is no longer in the circuit".into());
-        }
-        let (extension, text) = match request.language {
-            SourceLanguage::Asm => ("asm", demo.assembly),
-            SourceLanguage::Cpp => ("ino", demo.sketch),
-        };
-        // The programs are built into Dunbrec with the line endings of the
-        // machine that built it.
-        let text = text.replace("\r\n", "\n");
-        let sources = &self.doc.schematic().sources;
-        let taken = |name: &str| sources.keys().any(|k| k.eq_ignore_ascii_case(name));
-        let (name, path) = match self.firmware_dir() {
-            Some(dir) => {
-                let name = project::new_source_copy(&dir, demo.name, extension, &text, taken)?;
-                let path = dir.join(&name);
-                (name, Some(path))
-            }
-            None => {
-                let name = crate::code_ui::unused_file_name(sources, demo.name, extension);
-                (name, None)
-            }
-        };
-        let file = SourceFile {
-            language: request.language,
-            text: text.clone(),
-        };
-        self.doc.edit(|s| {
-            s.sources.insert(name.clone(), file);
-            if let Some(c) = s.component_mut(request.chip)
-                && let ComponentKind::Mcu { firmware, .. } = &mut c.kind
-            {
-                *firmware = name.clone();
-            }
-        });
-        self.code.select(&name);
-        Ok(DemoFile { name, path, text })
     }
 
     // ------------------------------------------------------ editing ---
@@ -253,6 +403,30 @@ impl OpenCircuit {
             Item::Wire(id) => s.wires.iter().any(|w| w.id == *id),
             Item::Label(id) => s.labels.iter().any(|l| l.id == *id),
         });
+    }
+}
+
+/// The title of a source file's tab: the microcontrollers that run it, then
+/// its name ("U1: blink.ino"), or just the name if none does.
+pub fn source_title(schematic: &Schematic, name: &str) -> String {
+    let chips: Vec<&str> = schematic
+        .components
+        .iter()
+        .filter(|c| match &c.kind {
+            ComponentKind::Mcu { firmware, .. } => {
+                let firmware = firmware.trim();
+                // A file is named as it is; text kept inside the circuit by
+                // `source:<name>`.
+                firmware == name || firmware.strip_prefix(SOURCE_PREFIX) == Some(name)
+            }
+            _ => false,
+        })
+        .map(|c| c.designator.as_str())
+        .collect();
+    if chips.is_empty() {
+        name.to_string()
+    } else {
+        format!("{}: {name}", chips.join(", "))
     }
 }
 
@@ -384,18 +558,13 @@ mod tests {
     }
 
     #[test]
-    fn another_document_keeps_the_clipboard_and_drops_the_selection() {
+    fn a_circuit_is_named_after_its_file_or_where_it_came_from() {
         let mut c = OpenCircuit::default();
-        add_resistor(&mut c);
-        c.select_all();
-        c.copy();
-        c.run_dc();
-        c.replace_document(Document::default());
-        assert!(c.canvas.selection.is_empty() && c.dc.is_none());
-        assert!(c.canvas.clipboard.is_some());
-        // Paste into the new document.
-        c.paste();
-        assert_eq!(c.doc.schematic().components.len(), 1);
+        assert_eq!(c.name(), "Untitled");
+        c.title = Some("Voltage divider".into());
+        assert_eq!(c.name(), "Voltage divider");
+        c.doc.mark_saved(PathBuf::from("folder").join("Amp.dbr"));
+        assert_eq!(c.name(), "Amp");
     }
 
     /// A circuit with one microcontroller, and its id.
@@ -420,6 +589,83 @@ mod tests {
         }
     }
 
+    fn titles(c: &OpenCircuit) -> Vec<String> {
+        c.tabs
+            .iter_all_tabs()
+            .map(|(_, tab)| match tab {
+                DocTab::Schematic => "Schematic".to_string(),
+                DocTab::Source(name) => source_title(c.doc.schematic(), name),
+            })
+            .collect()
+    }
+
+    fn add_file(c: &mut OpenCircuit, name: &str) {
+        c.doc.edit(|s| {
+            s.sources.insert(
+                name.into(),
+                SourceFile {
+                    language: SourceLanguage::Asm,
+                    text: "nop\n".into(),
+                },
+            )
+        });
+        c.sync_tabs();
+    }
+
+    #[test]
+    fn each_source_file_has_a_tab_named_after_the_chips_that_run_it() {
+        let (mut c, id) = with_chip();
+        assert_eq!(titles(&c), ["Schematic"]);
+        add_file(&mut c, "a.asm");
+        add_file(&mut c, "b.asm");
+        assert_eq!(titles(&c), ["Schematic", "a.asm", "b.asm"]);
+        assert!(
+            c.is_in_front(&DocTab::Schematic),
+            "new tabs do not take over"
+        );
+        c.doc.edit(|s| {
+            s.add_component(
+                ComponentKind::Mcu {
+                    firmware: "a.asm".into(),
+                    clock: 16e6,
+                },
+                Point::new(20, 0),
+            );
+            if let ComponentKind::Mcu { firmware, .. } = &mut s.component_mut(id).unwrap().kind {
+                *firmware = "a.asm".into();
+            }
+        });
+        assert_eq!(titles(&c)[1], "U1, U2: a.asm");
+        // The older way of naming text kept inside the circuit.
+        c.doc.edit(|s| {
+            if let ComponentKind::Mcu { firmware, .. } = &mut s.component_mut(id).unwrap().kind {
+                *firmware = "source:b.asm".into();
+            }
+        });
+        assert_eq!(titles(&c)[2], "U1: b.asm");
+    }
+
+    #[test]
+    fn closing_a_file_tab_hides_it_until_it_is_asked_for() {
+        let mut c = OpenCircuit::default();
+        add_file(&mut c, "a.asm");
+        c.show_source("a.asm");
+        assert!(c.is_in_front(&DocTab::Source("a.asm".into())));
+        c.hidden.insert("a.asm".into());
+        c.sync_tabs();
+        assert_eq!(titles(&c), ["Schematic"]);
+        assert!(c.doc.schematic().sources.contains_key("a.asm"), "kept");
+        c.show_source("a.asm");
+        assert!(c.is_in_front(&DocTab::Source("a.asm".into())));
+        // A file that goes takes its tab, and undo brings both back.
+        c.doc.edit(|s| s.sources.clear());
+        c.sync_tabs();
+        assert_eq!(titles(&c), ["Schematic"]);
+        c.doc.undo();
+        c.sync_tabs();
+        assert_eq!(titles(&c), ["Schematic", "a.asm"]);
+    }
+
     #[test]
     fn a_demo_becomes_the_chips_own_file_and_never_replaces_one() {
         let dir = std::env::temp_dir().join(format!("dunbrec-demo-{}", std::process::id()));
@@ -442,6 +688,9 @@ mod tests {
         assert!(written.contains("LED_PIN = 13") && !written.contains('\r'));
         assert_eq!(c.doc.schematic().sources["blink2.ino"].text, written);
         assert_eq!(first.path, Some(dir.join("blink2.ino")));
+        assert!(c.is_in_front(&DocTab::Source("blink2.ino".into())));
+        assert_eq!(c.source_at(&dir.join("blink2.ino")).unwrap(), "blink2.ino");
+        assert_eq!(c.source_at(&dir.join("other.ino")), None);
 
         // The user's change survives choosing the demo again.
         std::fs::write(dir.join("blink2.ino"), "changed").unwrap();
@@ -470,7 +719,7 @@ mod tests {
     }
 
     #[test]
-    fn a_demo_for_an_unsaved_circuit_waits_in_memory() {
+    fn a_new_file_for_an_unsaved_circuit_waits_in_memory() {
         let (mut c, id) = with_chip();
         let request = DemoRequest {
             chip: id,
@@ -491,6 +740,19 @@ mod tests {
         };
         assert!(c.add_demo(unknown).is_err());
         assert!(c.doc.schematic().sources.is_empty());
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_made_is_reported() {
+        let dir = std::env::temp_dir().join(format!("dunbrec-gone-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (mut c, id) = with_chip();
+        // The circuit's folder does not exist, so the file cannot be written.
+        c.doc.mark_saved(dir.join("x.dbr"));
+        let made = c.add_source(id, "main", SourceLanguage::Asm, "nop\n");
+        assert!(made.is_err());
+        assert!(c.doc.schematic().sources.is_empty());
+        assert_eq!(firmware(&c, id), "builtin:blink");
     }
 
     #[test]

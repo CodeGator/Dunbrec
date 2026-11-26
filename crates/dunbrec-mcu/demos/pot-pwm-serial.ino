@@ -1,7 +1,7 @@
 // Pot, PWM and serial: reads a voltage, copies it to a PWM pin and prints it.
 // To try it, connect a potentiometer to the analog pin chosen below, the
 // oscilloscope to the PWM pin, and open the serial monitor.
-// Press Build in the Code panel after every change, then Run.
+// After a change, just press Run: Dunbrec builds the sketch first.
 
 // ----------------------------------------------------------------------
 // Settings: change these.
