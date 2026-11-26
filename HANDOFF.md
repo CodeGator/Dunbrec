@@ -8,9 +8,10 @@ high level, one line on what it is written in, no steps and no other technical d
 **no user guide**, by the user's decision: the project is too young and changes too much to keep
 one up to date.
 
-*Last updated: 2026-11-26, version 0.6.0 in progress: four LED displays, every chip's program is
-now a visible source file, and the assistant can add every part. Version 0.5.0 is released and
-published. Start at "0.6.0" below.*
+*Last updated: end of the day on 2026-11-26. Version 0.6.0 in progress: four LED displays, every
+chip's program is now a visible source file, and the assistant can add every part, drawing parts
+in series with wires (not yet tried by the user). Version 0.5.0 is released and published. Start
+at "0.6.0" below.*
 
 ## Status
 
@@ -40,11 +41,11 @@ the draft is a separate step, done when the user asks (`gh release edit v<versio
 | 13 | Dockable panels: every panel is an `egui_dock` tab; layout saved between sessions |
 | 0.2.0 | Switches group: SPST, SPDT, DPST, DPDT (`ComponentKind::MultiSwitch`, `SwitchContacts` device) and hold-to-press push buttons (`Switch { momentary }`, `Canvas::push_buttons`) |
 | 0.3.0 | Projects (a `.dbrproj` file listing circuits and firmware files), Junction and hops, J key, CD4066, Linear group |
-| 0.6.0 (in progress) | LED, LED bar and 7-segment parts; a chip's program is always a source file; new circuits join the project when saved. See "0.6.0" below |
+| 0.6.0 (in progress) | LED, LED bar and 7-segment parts; a chip's program is always a source file; new circuits join the project when saved; the assistant adds every part. See "0.6.0" below |
 | 0.5.0 | Projects screen (nothing else shown without a project); assistant draws new circuits with real wires and can add sine sources; no circuit open until one is opened; a central area that never collapses; closable schematic tab. See "0.5.0" below |
 | 0.4.0 | Settings dialog; Assistant (Ollama or Claude); pop-out instruments; text size; every confirmation a message box; Code panel tabs; project behaviour changes. See "0.4.0" below |
 
-Health at handoff: `cargo test --workspace` 546 passed, 0 failed (2 ignored: a real Recycle Bin check and an
+Health at handoff: `cargo test --workspace` 551 passed, 0 failed (2 ignored: a real Recycle Bin check and an
 emulator speed
 benchmark); `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --check`
 clean. Toolchain: Rust 1.99 (edition 2024, MSRV 1.90), Windows 11.
@@ -176,7 +177,8 @@ Key mechanisms worth knowing before changing the engine:
 3. **UI verification of phase 11 in the running app:** done. The readme screenshots show an
    Arduino sketch running with the serial monitor.
 4. **Assistant (0.4.0).** Not yet done: adding parts with more than two pins is drawn on labels
-   only (no real wires; in 0.6.0 a new circuit of small parts is still drawn tidily); rewiring
+   only (no real wires; in 0.6.0 a new circuit of small parts is still drawn tidily, and parts in
+   series are drawn with wires); rewiring
    (moving a pin to another net) is not a suggestion; it cannot create a program file for a chip,
    only replace one the circuit has; the logic analyser's data is not in its context; it has not been run against a real model for long, so the prompt
    may need tuning (small local models are weak at circuit diagnosis). None of the 0.4.0 screens
@@ -429,12 +431,25 @@ the demos look dead: blink changed every 12 s). `sync_speed` tells a running sim
 
 ## 0.6.0 (in progress)
 
-**Where things stand.** Committed, each tried by the user, who is happy with it: the single LED,
-the source-file changes below, the bar display, the one- and four-digit 7-segment displays, and
-the faster LED calculation. The branch is still only on this computer. The LED display work is
-finished: the user decided on 2026-11-26 to skip the 14 or 16 segment display. Committed after
-that, with no word yet on how it does with a real model: the assistant adds every part (see "The
-assistant adds every part"). Releasing 0.6.0 has not been asked for.
+**Where things stand (end of 2026-11-26).** Everything is committed on `0.6.0`, which is still
+only on this computer. Tried by the user, who is happy with them: the single LED, the source-file
+changes below, the bar display, the one- and four-digit 7-segment displays, and the faster LED
+calculation. The LED display work is finished: the user decided to skip the 14 or 16 segment
+display. Then the assistant was taught to add every part. The user tried it with an LED, found it
+joined only by labels and said they would not use that.
+
+**Start here next time:** have the user try the answer to that, "Parts in series are drawn with
+wires" below (for instance an LED and resistor on a spare chip pin). A seconds counter project
+made for them is in their Dunbrec folder (`Display speed test`). Releasing 0.6.0 has not been
+asked for.
+
+**Offered, not agreed** (ask before building any):
+
+- Fan several chains on neighbouring chip pins out to evenly spaced rows.
+- Draw displays and other large parts added by the assistant with wires too.
+- Let the assistant create a chip's program file, fixing at the same time its overwriting a file of
+  the same name.
+- Repair the two older hints with runs of spaces (noted under "LED displays").
 
 **The assistant adds every part** (asked for by the user).
 
@@ -451,7 +466,24 @@ assistant adds every part"). Releasing 0.6.0 has not been asked for.
   the labelled layout.
 - A circuit with LEDs, displays or anything SPICE cannot hold is described to the model by
   `assistant::parts_list` (designator, kind, value, `PIN=NET`), not SPICE, whose names differ.
-- Not run against a real model: the prompt may need tuning.
+- The prompt has had little use with a real model and may need tuning.
+
+**Parts in series are drawn with wires** (the user's complaint: a part that is only electrically
+connected, by labels, is not worth using; treat that as the bar for assistant drawing).
+
+- `part_edits::chains` finds new two-pin parts in series that start at a net the circuit has and
+  end at ground, at another of its nets, or at a net other new parts join (which gets a label).
+  `draw_chain` searches straight runs from a pin on the start net, with an optional step to one
+  side, and takes the cheapest that is clear and passes `verify`. It runs after `try_wire` and
+  before the tidy and labelled layouts. About 65 ms on a 22-part circuit in a release build, so
+  the assistant's card keeps the result (`tried_add`) instead of redoing it every frame.
+- *Still on labels:* displays, chips and other large or three-pin parts, and any chain that finds
+  no room. Several chains on neighbouring chip pins are wired but look busy; a fan to evenly
+  spaced rows would be neater (not built).
+- `verify` now also refuses a drawing that grounds a net of the circuit when nothing in it was
+  grounded before (it used to pass). The label fallback puts a name on the pin itself where a
+  stub would run into something.
+- A net made only of new wires has no label, so `verify` finds it by its pins.
 
 **What a chip runs is always a file the user can see** (the user found it confusing that a demo
 ran with no source file; the table of changes was agreed).

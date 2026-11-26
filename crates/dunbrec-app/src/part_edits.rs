@@ -21,8 +21,10 @@
 //! to them with real wires: positions near the pins it must reach are tried
 //! in each rotation, wires run at right angles to a pin already on each net
 //! (or to an existing ground symbol), and the tidiest drawing that passes the
-//! check below is used. Any other part is laid out in empty space below the
-//! drawing. Like an imported netlist, each of its pins gets a short stub
+//! check below is used. Parts in series that lead away from a net the circuit
+//! has (a resistor and an LED from a pin to ground, say) are drawn in a row
+//! from a pin on it, again with wires. Any other part is laid out in empty
+//! space below the drawing. Like an imported netlist, each of its pins gets a short stub
 //! ending in a net label (or a ground symbol for net `0`), and same-named
 //! labels are connected. A net the circuit never named (`N001`) first gets a
 //! label of its own on one of its pins.
@@ -39,7 +41,9 @@ use dunbrec_core::{
     DEFAULT_MCU_CLOCK, GateOp, LedColour, ModelKind, ModelLibrary, Netlist, NodeId, OPAMP_PARTS,
     Point, Polarity, Rotation, Schematic, SwitchForm, Waveform, build_netlist,
 };
-use dunbrec_io::layout::{self, MANY_PINS, Part, STUB, UNJOINED, is_ground, pin_direction};
+use dunbrec_io::layout::{
+    self, MANY_PINS, Part, STUB, UNJOINED, ground_rotation, is_ground, pin_direction,
+};
 use dunbrec_io::tidy;
 
 use crate::canvas::NodeMap;
@@ -832,6 +836,12 @@ pub fn add_parts(s: &mut Schematic, parts: &[NewPart]) -> Result<Vec<String>, St
             None => leftover.push(p),
         }
     }
+    for chain in chains(&nets, parts, &leftover) {
+        if let Some(note) = draw_chain(s, &before, &map, &nets, &chain) {
+            notes.push(note);
+            leftover.retain(|p| chain.links.iter().all(|l| l.part != *p));
+        }
+    }
     if !leftover.is_empty() && !place_tidy(s, &before, &nets, &leftover, &mut notes) {
         place_with_labels(s, &before, &nets, &leftover, &mut notes);
     }
@@ -975,8 +985,18 @@ fn place_with_labels(
             continue;
         };
         let away = pin_direction(c, def.offset);
-        let end = Point::new(at.x + away.x * STUB, at.y + away.y * STUB);
-        s.add_wire(at, end);
+        let stub = Seg {
+            a: at,
+            b: step(at, away, STUB),
+        };
+        // A stub that would run into something would join it: then the name
+        // goes on the pin itself.
+        let blocked = points_of(s).any(|p| p != at && on(&stub, p))
+            || s.wires.iter().any(|w| on(&Seg { a: w.a, b: w.b }, stub.b));
+        let end = if blocked { at } else { stub.b };
+        if end != at {
+            s.add_wire(at, end);
+        }
         s.add_label(a.label.clone(), end);
         notes.push(format!(
             "Named a net {} so the new parts can join it.",
@@ -1452,6 +1472,449 @@ fn judge(new: &[Seg], body: &Seg, boxes: &[Area], wires: &[Seg]) -> Option<i32> 
     Some(cost)
 }
 
+// ---- drawing parts in series ----
+
+/// One part of a chain, and the pin of it nearer the start.
+struct Link<'a> {
+    part: &'a NewPart,
+    entry: usize,
+}
+
+/// Where a chain stops.
+enum End {
+    Ground,
+    /// At a net the circuit already has.
+    Existing(NodeId),
+    /// At a net other new parts join, or nothing yet: it is labelled.
+    Open(String),
+}
+
+/// Two-pin parts in series, leading away from a net the circuit has.
+struct Chain<'a> {
+    start: NodeId,
+    links: Vec<Link<'a>>,
+    end: End,
+}
+
+/// The chains among the `left` parts. A net joins two links when nothing but
+/// those two of all the new `parts` is on it.
+fn chains<'a>(
+    nets: &HashMap<String, Net>,
+    parts: &'a [NewPart],
+    left: &[&'a NewPart],
+) -> Vec<Chain<'a>> {
+    let fits = |p: &NewPart| {
+        p.kind.pins().len() == 2 && p.nets[0] != p.nets[1] && p.nets.iter().all(|n| n != UNJOINED)
+    };
+    let mut used: Vec<&str> = Vec::new();
+    let mut found = Vec::new();
+    for &first in left {
+        if !fits(first) || used.contains(&first.designator.as_str()) {
+            continue;
+        }
+        let from = first
+            .nets
+            .iter()
+            .enumerate()
+            .find_map(|(pin, net)| match nets.get(net) {
+                Some(Net::Existing { old, .. }) if !old.is_ground() => Some((pin, *old)),
+                _ => None,
+            });
+        let Some((entry, start)) = from else { continue };
+        used.push(&first.designator);
+        let mut links = vec![Link { part: first, entry }];
+        let end = loop {
+            let last = &links[links.len() - 1];
+            let net = &last.part.nets[1 - last.entry];
+            if is_ground(net) {
+                break End::Ground;
+            }
+            if let Some(Net::Existing { old, .. }) = nets.get(net) {
+                break End::Existing(*old);
+            }
+            let on: Vec<&NewPart> = parts.iter().filter(|p| p.nets.contains(net)).collect();
+            let next = left.iter().copied().find(|p| {
+                fits(p) && !used.contains(&p.designator.as_str()) && p.nets.contains(net)
+            });
+            match next {
+                Some(next) if on.len() == 2 => {
+                    used.push(&next.designator);
+                    let entry = usize::from(next.nets[0] != *net);
+                    links.push(Link { part: next, entry });
+                }
+                _ => break End::Open(net.clone()),
+            }
+        };
+        found.push(Chain { start, links, end });
+    }
+    found
+}
+
+/// A chain laid out in one particular way.
+struct Run {
+    cost: i32,
+    parts: Vec<(Point, Rotation)>,
+    wires: Vec<Seg>,
+    ground: Option<(Point, Rotation)>,
+    label: Option<Point>,
+}
+
+/// The space the text of a label takes.
+fn label_area(at: Point, name: &str) -> Area {
+    Area {
+        x0: at.x,
+        x1: at.x + 1 + name.len() as i32 / 2,
+        y0: at.y - 2,
+        y1: at.y,
+    }
+}
+
+fn step(from: Point, along: Point, far: i32) -> Point {
+    Point::new(from.x + along.x * far, from.y + along.y * far)
+}
+
+/// The room a ground symbol takes, hanging whichever way it is turned.
+fn ground_area(at: Point, rotation: Rotation) -> Area {
+    let way = rotation.apply(Point::new(0, 3));
+    let side = rotation.apply(Point::new(1, 0));
+    let corners = [
+        Point::new(at.x + side.x, at.y + side.y),
+        Point::new(at.x - side.x + way.x, at.y - side.y + way.y),
+    ];
+    Area {
+        x0: corners[0].x.min(corners[1].x),
+        x1: corners[0].x.max(corners[1].x),
+        y0: corners[0].y.min(corners[1].y),
+        y1: corners[0].y.max(corners[1].y),
+    }
+}
+
+/// Lay `chain` out in a straight line from the pin at `anchor`, in the
+/// direction `along`, for `lead` before its first part. If `aside` is not
+/// nothing, the wire first runs `turn` that way, then steps that far to one
+/// side. Gives each way of finishing it, if there is any.
+fn lay_out(
+    chain: &Chain,
+    anchor: Point,
+    along: Point,
+    (turn, aside, lead): (i32, i32, i32),
+    targets: &[Point],
+) -> Vec<Run> {
+    let mut wires = Vec::new();
+    let mut at = anchor;
+    if aside != 0 {
+        let across = Point::new(-along.y, along.x);
+        let corner = step(at, along, turn);
+        let turned = step(corner, across, aside);
+        wires.push(Seg { a: at, b: corner });
+        wires.push(Seg {
+            a: corner,
+            b: turned,
+        });
+        at = turned;
+    }
+    let mut cursor = step(at, along, lead);
+    wires.push(Seg { a: at, b: cursor });
+
+    let mut parts = Vec::new();
+    for (i, link) in chain.links.iter().enumerate() {
+        if i > 0 {
+            let next = step(cursor, along, STUB);
+            wires.push(Seg { a: cursor, b: next });
+            cursor = next;
+        }
+        let pins = link.part.kind.pins();
+        let (inward, outer) = (pins[link.entry].offset, pins[1 - link.entry].offset);
+        let turned = [Rotation::R0, Rotation::R90, Rotation::R180, Rotation::R270]
+            .into_iter()
+            .find(|r| {
+                let span = r.apply(Point::new(outer.x - inward.x, outer.y - inward.y));
+                (span.x.signum(), span.y.signum()) == (along.x, along.y)
+            });
+        let Some(rotation) = turned else {
+            return Vec::new();
+        };
+        let offset = rotation.apply(inward);
+        let position = Point::new(cursor.x - offset.x, cursor.y - offset.y);
+        let leaving = rotation.apply(outer);
+        cursor = Point::new(position.x + leaving.x, position.y + leaving.y);
+        parts.push((position, rotation));
+    }
+
+    let run = |wires: Vec<Seg>, ground, label| Run {
+        cost: 0,
+        parts: parts.clone(),
+        wires,
+        ground,
+        label,
+    };
+    let beyond = step(cursor, along, STUB);
+    wires.push(Seg {
+        a: cursor,
+        b: beyond,
+    });
+    match &chain.end {
+        End::Ground => {
+            // Straight on, the symbol turned to suit; or, from a level
+            // chain, turned down to a symbol hanging the usual way.
+            let straight = (Some((beyond, ground_rotation(along))), wires.clone());
+            if along.y != 0 {
+                vec![run(straight.1, straight.0, None)]
+            } else {
+                let below = Point::new(beyond.x, beyond.y + STUB);
+                wires.push(Seg {
+                    a: beyond,
+                    b: below,
+                });
+                let mut sideways = run(straight.1, straight.0, None);
+                sideways.cost = 6;
+                vec![run(wires, Some((below, Rotation::R0)), None), sideways]
+            }
+        }
+        End::Open(name) => {
+            // A name reads to the right of its point: going left, the wire
+            // is longer so that the name ends before the part.
+            let at = if along.x < 0 {
+                let at = step(beyond, along, (name.len() as i32 + 1) / 2);
+                wires.push(Seg { a: beyond, b: at });
+                at
+            } else {
+                beyond
+            };
+            vec![run(wires, None, Some(at))]
+        }
+        End::Existing(_) => targets
+            .iter()
+            .flat_map(|&t| routes(beyond, t))
+            .map(|route| {
+                let mut all = wires.clone();
+                all.extend(route);
+                run(all, None, None)
+            })
+            .collect(),
+    }
+}
+
+/// True if `p` is on the wire, its ends included.
+fn on(w: &Seg, p: Point) -> bool {
+    let ((x0, x1), (y0, y1)) = (w.x_range(), w.y_range());
+    (w.horizontal() || w.vertical()) && x0 <= p.x && p.x <= x1 && y0 <= p.y && p.y <= y1
+}
+
+/// Draw `chain` with wires beside a pin on the net it starts from: the
+/// shortest, straightest way that keeps clear of what is drawn and passes
+/// the check. `None` leaves its parts for the labels.
+fn draw_chain(
+    s: &mut Schematic,
+    before: &Netlist,
+    map: &NodeMap,
+    nets: &HashMap<String, Net>,
+    chain: &Chain,
+) -> Option<String> {
+    // The pins it could start from, and which way each one points.
+    let anchors: Vec<(Point, Point)> = before
+        .elements
+        .iter()
+        .flat_map(|e| {
+            let c = s.component(e.component);
+            let pins = c.into_iter().flat_map(|c| {
+                c.pin_positions()
+                    .map(|(def, at)| (at, pin_direction(c, def.offset)))
+                    .collect::<Vec<_>>()
+            });
+            pins.zip(&e.nodes)
+                .filter(|(_, node)| **node == chain.start)
+                .map(|(pin, _)| pin)
+                .collect::<Vec<_>>()
+        })
+        .take(TARGETS)
+        .collect();
+    let targets = match chain.end {
+        End::Existing(node) => {
+            let from: Vec<Point> = anchors.iter().map(|a| a.0).collect();
+            nearest(net_points(s, before, map, node), &from)
+        }
+        _ => Vec::new(),
+    };
+
+    // What the new drawing must keep clear of, labels included.
+    let mut boxes: Vec<Area> = s
+        .components
+        .iter()
+        .map(|c| {
+            let pins: Vec<Point> = c.pin_positions().map(|(_, at)| at).collect();
+            if matches!(c.kind, K::Ground) {
+                ground_area(c.position, c.rotation)
+            } else {
+                body_of(&pins, false)
+            }
+        })
+        .collect();
+    boxes.extend(s.labels.iter().map(|l| label_area(l.position, &l.name)));
+    let wires: Vec<Seg> = s
+        .wires
+        .iter()
+        .map(|w| Seg { a: w.a, b: w.b })
+        .filter(|w| w.horizontal() || w.vertical())
+        .collect();
+
+    // The way out from each pin, best left free for what may join it later.
+    let ways_out: Vec<(Point, Seg)> = s
+        .components
+        .iter()
+        .flat_map(|c| {
+            c.pin_positions()
+                .map(|(def, at)| {
+                    let away = pin_direction(c, def.offset);
+                    let way = Seg {
+                        a: step(at, away, 1),
+                        b: step(at, away, 3 * STUB),
+                    };
+                    (at, way)
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    // Anything a new wire passes over or ends on joins it.
+    let joints: Vec<Point> = points_of(s).collect();
+
+    let [right, down] = [Point::new(1, 0), Point::new(0, 1)];
+    let [left, up] = [Point::new(-1, 0), Point::new(0, -1)];
+    let mut runs = Vec::new();
+    for &(anchor, outward) in &anchors {
+        for along in [outward, right, down, left, up] {
+            // How far out the wire turns, how far it steps aside, and how
+            // far it runs on to the first part.
+            let ways = (-24..=24).step_by(2).flat_map(|aside| {
+                let turns = if aside == 0 { STUB } else { 6 * STUB };
+                (1..=turns).map(move |turn| (turn, aside))
+            });
+            for (turn, aside) in ways {
+                for lead in (STUB..=24).step_by(2) {
+                    'run: for mut run in
+                        lay_out(chain, anchor, along, (turn, aside, lead), &targets)
+                    {
+                        // Room for each part and the text beside it.
+                        let mut bodies: Vec<Area> = Vec::new();
+                        for (link, &(position, rotation)) in chain.links.iter().zip(&run.parts) {
+                            let ends: Vec<Point> = link
+                                .part
+                                .kind
+                                .pins()
+                                .iter()
+                                .map(|p| {
+                                    let o = rotation.apply(p.offset);
+                                    Point::new(position.x + o.x, position.y + o.y)
+                                })
+                                .collect();
+                            let body = body_of(&ends, false);
+                            let roomy = Area {
+                                y0: body.y0 - 1,
+                                y1: body.y1 + 1,
+                                ..body
+                            };
+                            if boxes.iter().any(|b| b.overlaps(&roomy))
+                                || wires.iter().any(|w| roomy.crossed_by(w))
+                            {
+                                continue 'run;
+                            }
+                            bodies.push(body);
+                        }
+                        if let Some((at, rotation)) = run.ground {
+                            let area = ground_area(at, rotation);
+                            if boxes.iter().any(|b| b.overlaps(&area))
+                                || wires.iter().any(|w| area.crossed_by(w))
+                            {
+                                continue;
+                            }
+                        }
+                        if let (Some(at), End::Open(name)) = (run.label, &chain.end) {
+                            let area = label_area(at, name);
+                            if boxes.iter().chain(&bodies).any(|b| b.overlaps(&area)) {
+                                continue;
+                            }
+                        }
+                        run.wires.retain(|w| w.a != w.b);
+                        // It may only touch the circuit where it starts, and
+                        // where it ends if it ends there.
+                        let meant = |p: Point| p == anchor || targets.contains(&p);
+                        let new_ends = run.wires.iter().flat_map(|w| [w.a, w.b]);
+                        let ground = run.ground.map(|g| g.0);
+                        if joints
+                            .iter()
+                            .any(|&p| !meant(p) && run.wires.iter().any(|w| on(w, p)))
+                            || new_ends
+                                .chain(ground)
+                                .any(|p| !meant(p) && wires.iter().any(|w| on(w, p)))
+                        {
+                            continue;
+                        }
+                        for w in &run.wires {
+                            if boxes.iter().chain(&bodies).any(|b| b.crossed_by(w))
+                                || wires.iter().any(|e| collinear_overlap(w, e))
+                            {
+                                continue 'run;
+                            }
+                            let crossings = wires.iter().filter(|e| crosses(w, e)).count();
+                            run.cost += w.length() + 2 + 6 * crossings as i32;
+                        }
+                        let blocked = ways_out
+                            .iter()
+                            .filter(|(pin, way)| {
+                                *pin != anchor
+                                    && run.wires.iter().any(|w| collinear_overlap(w, way))
+                            })
+                            .count();
+                        run.cost += 20 * blocked as i32;
+                        // The way the pin points is the natural one, and
+                        // upwards the least.
+                        if along != outward {
+                            run.cost += if along == up { 30 } else { 16 };
+                        }
+                        run.cost += aside.abs() + turn;
+                        runs.push(run);
+                    }
+                }
+            }
+        }
+    }
+    runs.sort_by_key(|r| r.cost);
+
+    let drawn: Vec<NewPart> = chain.links.iter().map(|l| l.part.clone()).collect();
+    for run in runs.into_iter().take(TRIES) {
+        let mut trial = s.clone();
+        for (part, &(position, rotation)) in drawn.iter().zip(&run.parts) {
+            let id =
+                trial.add_component_named(part.kind.clone(), part.designator.clone(), position);
+            if let Some(c) = trial.component_mut(id) {
+                c.rotation = rotation;
+            }
+            library::ensure_model(&mut trial, &part.kind);
+        }
+        for w in &run.wires {
+            trial.add_wire(w.a, w.b);
+        }
+        if let Some((at, rotation)) = run.ground {
+            let id = trial.add_component(K::Ground, at);
+            if let Some(c) = trial.component_mut(id) {
+                c.rotation = rotation;
+            }
+        }
+        if let (Some(at), End::Open(name)) = (run.label, &chain.end) {
+            trial.add_label(name.clone(), at);
+        }
+        if verify(&trial, before, &drawn, nets).is_ok() {
+            *s = trial;
+            let names: Vec<&str> = drawn.iter().map(|p| p.designator.as_str()).collect();
+            return Some(format!(
+                "{} drawn with wires next to the circuit.",
+                names.join(", ")
+            ));
+        }
+    }
+    None
+}
+
 /// Check the result: each new pin is on the net asked for, and no nets that
 /// were separate have been joined (or one split) by the new drawing.
 fn verify(
@@ -1469,7 +1932,10 @@ fn verify(
             continue;
         };
         for (&a, &b) in old.nodes.iter().zip(&new.nodes) {
-            if forward.insert(a, b).is_some_and(|prev| prev != b)
+            // Ground counts as a net of the circuit even before anything
+            // in it is grounded.
+            if a.is_ground() != b.is_ground()
+                || forward.insert(a, b).is_some_and(|prev| prev != b)
                 || backward.insert(b, a).is_some_and(|prev| prev != a)
             {
                 return Err(
@@ -1480,6 +1946,8 @@ fn verify(
             }
         }
     }
+    // Where each net only the new parts have has been found.
+    let mut new_nodes: HashMap<&str, NodeId> = HashMap::new();
     for p in parts {
         let Some(e) = after.element(&p.designator) else {
             return Err(format!("{} did not appear in the circuit.", p.designator));
@@ -1504,7 +1972,18 @@ fn verify(
             } else {
                 match nets.get(net) {
                     Some(Net::Existing { old, .. }) => forward.get(old).copied(),
-                    _ => after.node_by_name(net),
+                    // By its label, or if it is only wires, wherever its
+                    // first pin is; either way a net of its own.
+                    _ => {
+                        let at = after.node_by_name(net).unwrap_or_else(|| {
+                            new_nodes.get(net.as_str()).copied().unwrap_or(node)
+                        });
+                        let shared = at.is_ground()
+                            || backward.contains_key(&at)
+                            || new_nodes.iter().any(|(&n, &v)| v == at && n != net);
+                        new_nodes.insert(net, at);
+                        (!shared).then_some(at)
+                    }
                 }
             };
             if wanted != Some(node) {
@@ -2067,6 +2546,143 @@ C1 capacitor 10u INPUT BASE
                 assert_eq!(before.nodes[a.0].name, n.nodes[b.0].name);
             }
         }
+    }
+
+    /// A circuit holding one microcontroller and nothing else.
+    fn lone_chip() -> Schematic {
+        let mut s = Schematic::new();
+        s.add_component(
+            K::Mcu {
+                firmware: String::new(),
+                clock: DEFAULT_MCU_CLOCK,
+            },
+            Point::new(0, 0),
+        );
+        s
+    }
+
+    /// Fail if any part is drawn over another, or the netlist has anything to
+    /// say.
+    fn assert_clear(s: &Schematic) {
+        assert_apart(s);
+        let n = build_netlist(s);
+        assert!(
+            n.diagnostics.is_empty(),
+            "{:?}\n{}",
+            n.diagnostics,
+            ascii(s)
+        );
+    }
+
+    /// Fail if any part is drawn over another.
+    fn assert_apart(s: &Schematic) {
+        let areas: Vec<(&str, egui::Rect)> = s
+            .components
+            .iter()
+            .map(|c| (c.designator.as_str(), crate::symbols::bounds(c).shrink(0.2)))
+            .collect();
+        for (i, (a, area)) in areas.iter().enumerate() {
+            for (b, other) in &areas[i + 1..] {
+                assert!(!area.intersects(*other), "{a} lies over {b}\n{}", ascii(s));
+            }
+        }
+    }
+
+    #[test]
+    fn a_resistor_and_led_are_drawn_with_wires_from_a_chip_pin() {
+        for pin in ["D13", "D2", "A0"] {
+            let mut s = lone_chip();
+            let text = format!("R1 resistor 220 U1.{pin} LA\nLED1 led red LA 0");
+            let notes = add_parts(&mut s, &parse_add(&text).unwrap()).unwrap();
+            println!("{pin}: {notes:?}\n{}", ascii(&s));
+            assert!(notes.iter().any(|n| n.contains("with wires")), "{notes:?}");
+            // No labels at all: it is one drawing.
+            assert!(s.labels.is_empty(), "{:?}", s.labels);
+            assert_clear(&s);
+            // Beside the chip, level with the pin it comes from.
+            let chip = s.components[0].clone();
+            let (_, at) = chip.pin_positions().find(|(d, _)| d.name == pin).unwrap();
+            for name in ["R1", "LED1"] {
+                let c = find(&s, name).unwrap();
+                assert_eq!(c.position.y, at.y, "{pin} {name}");
+                assert!((c.position.x - at.x).abs() <= 16, "{pin} {name}");
+            }
+            let n = build_netlist(&s);
+            let (r, led) = (n.element("R1").unwrap(), n.element("LED1").unwrap());
+            let index = chip.kind.pins().iter().position(|p| p.name == pin).unwrap();
+            assert_eq!(r.nodes[0], n.element("U1").unwrap().nodes[index]);
+            assert_eq!(r.nodes[1], led.nodes[0]);
+            assert!(led.nodes[1].is_ground() && !led.nodes[0].is_ground());
+        }
+    }
+
+    #[test]
+    fn leds_on_neighbouring_pins_are_all_wired_without_overlapping() {
+        let mut s = lone_chip();
+        let text: String = (2..5)
+            .map(|k| format!("R{k} resistor 220 U1.D{k} N{k}x\nLED{k} led red N{k}x 0\n"))
+            .collect();
+        let notes = add_parts(&mut s, &parse_add(&text).unwrap()).unwrap();
+        println!("{notes:?}\n{}", ascii(&s));
+        assert!(s.labels.is_empty(), "{}", ascii(&s));
+        assert_clear(&s);
+        // One at a time works too, as when the user asks again.
+        add_parts(
+            &mut s,
+            &parse_add("R9 resistor 220 U1.D5 Q\nLED9 led green Q 0").unwrap(),
+        )
+        .unwrap();
+        assert!(s.labels.is_empty(), "{}", ascii(&s));
+        assert_clear(&s);
+    }
+
+    #[test]
+    fn a_chain_leaves_an_ordinary_circuit_by_wire() {
+        let mut s = divider();
+        let labels = s.labels.len();
+        let text = "R9 resistor 1k VOUT X\nD9 led yellow X Y\nR8 resistor 100 Y 0";
+        let notes = add_parts(&mut s, &parse_add(text).unwrap()).unwrap();
+        println!("{notes:?}\n{}", ascii(&s));
+        assert_eq!(s.labels.len(), labels, "{}", ascii(&s));
+        assert_clear(&s);
+        assert_eq!(node_of(&s, "R9", 0), "VOUT");
+        assert_eq!(node_of(&s, "R9", 1), node_of(&s, "D9", 0));
+        assert_eq!(node_of(&s, "D9", 1), node_of(&s, "R8", 0));
+        assert_eq!(node_of(&s, "R8", 1), "0");
+    }
+
+    #[test]
+    fn resistors_for_a_new_display_are_wired_to_the_chip() {
+        let mut s = lone_chip();
+        let text = "R1 resistor 220 U1.D2 SA\nR2 resistor 220 U1.D5 SB\n\
+                    DS1 7seg-cathode red a=SA b=SB COM=0";
+        let notes = add_parts(&mut s, &parse_add(text).unwrap()).unwrap();
+        println!("{notes:?}\n{}", ascii(&s));
+        assert!(notes[0].contains("R1 drawn with wires"), "{notes:?}");
+        // Only the display's side of each net needs its name.
+        let mut names: Vec<&str> = s.labels.iter().map(|l| l.name.as_str()).collect();
+        names.sort();
+        assert_eq!(names, ["SA", "SA", "SB", "SB"]);
+        // (Its other segments are rightly reported as unconnected.)
+        assert_apart(&s);
+        assert_eq!(node_of(&s, "DS1", 0), "SA");
+        assert_eq!(node_of(&s, "R2", 1), "SB");
+    }
+
+    #[test]
+    fn nothing_may_ground_a_pin_that_was_not_meant_to_be() {
+        // No ground symbol yet: a wire from D3 onto one being added with the
+        // part must still be refused.
+        let s = lone_chip();
+        let before = build_netlist(&s);
+        let mut bad = s.clone();
+        let chip = bad.components[0].clone();
+        let (_, at) = chip.pin_positions().find(|(d, _)| d.name == "D3").unwrap();
+        let ground = bad.add_component(K::Ground, Point::new(at.x - 4, at.y));
+        let ground = bad.component(ground).unwrap().position;
+        bad.add_wire(at, ground);
+        let e = verify(&bad, &before, &[], &HashMap::new()).unwrap_err();
+        assert!(e.contains("joined"), "{e}");
     }
 
     #[test]

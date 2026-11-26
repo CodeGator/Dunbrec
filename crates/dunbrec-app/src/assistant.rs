@@ -9,6 +9,7 @@
 //! cards under its answer; nothing changes until the user presses Apply.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use dunbrec_core::units::format_value;
 use dunbrec_core::{ComponentKind, Netlist, Schematic};
@@ -16,7 +17,7 @@ use egui::{Align, Color32, FontId, Layout, RichText, ScrollArea, TextEdit, Ui};
 
 use crate::ai::{self, AiSettings, Chat, ChatMessage, Event, Request, Role};
 use crate::edits::{self, DiffKind, Edit};
-use crate::part_edits;
+use crate::part_edits::{self, NewPart};
 
 /// Lines of text the question box shows before it scrolls.
 const INPUT_ROWS: usize = 6;
@@ -611,7 +612,7 @@ fn card(
                     return;
                 }
             };
-            let can_apply = preview(ui, edit, schematic);
+            let can_apply = preview(ui, key, edit, schematic);
             if let Some(Outcome::Failed(e)) = outcomes.get(&key) {
                 ui.colored_label(BAD, e);
             }
@@ -639,8 +640,31 @@ fn card(
     apply
 }
 
+/// What [`part_edits::check_add`] says of `parts`. Trying them means drawing
+/// them, too much work for every frame, so the answer is kept until the
+/// circuit or the parts differ.
+fn tried_add(
+    ui: &Ui,
+    key: Key,
+    schematic: &Schematic,
+    parts: &[NewPart],
+) -> Result<Vec<String>, String> {
+    type Tried = (Schematic, Vec<NewPart>, Result<Vec<String>, String>);
+    let id = egui::Id::new(("assistant tried", key));
+    if let Some(tried) = ui.data(|d| d.get_temp::<Arc<Tried>>(id))
+        && tried.0 == *schematic
+        && tried.1 == parts
+    {
+        return tried.2.clone();
+    }
+    let result = part_edits::check_add(schematic, parts);
+    let tried: Arc<Tried> = Arc::new((schematic.clone(), parts.to_vec(), result.clone()));
+    ui.data_mut(|d| d.insert_temp(id, tried));
+    result
+}
+
 /// Show what `edit` would do; true if it can be done and does something.
-fn preview(ui: &mut Ui, edit: &Edit, schematic: &Schematic) -> bool {
+fn preview(ui: &mut Ui, key: Key, edit: &Edit, schematic: &Schematic) -> bool {
     match edit {
         Edit::Set(lines) => {
             let mut all_fine = true;
@@ -669,7 +693,7 @@ fn preview(ui: &mut Ui, edit: &Edit, schematic: &Schematic) -> bool {
                     ),
                 );
             }
-            match part_edits::check_add(schematic, parts) {
+            match tried_add(ui, key, schematic, parts) {
                 Ok(notes) => {
                     for n in &notes {
                         ui.label(RichText::new(n).weak());
