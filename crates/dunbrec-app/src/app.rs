@@ -3,18 +3,15 @@
 use std::path::PathBuf;
 
 use dunbrec_core::{
-    Diagnostic, Element, Netlist, NodeId, Schematic, build_netlist, units::format_value,
+    Diagnostic, Element, Netlist, NodeId, Schematic, SourceLanguage, units::format_value,
 };
-use dunbrec_sim::{Circuit, Sample, SimWarning, operating_point};
+use dunbrec_sim::Sample;
 use egui::{Color32, Key, KeyboardShortcut, Modifiers, RichText, ViewportCommand};
 use egui_dock::tab_viewer::OnCloseResponse;
 use egui_dock::{DockArea, DockState, TabViewer};
 
 use crate::analyses_ui::{Analyses, Inputs};
-use crate::canvas::{
-    Annotation, Canvas, Item, Marker, NodeMap, PartDrag, TagPlace, Tool, delete_items,
-    node_tag_positions, transform_components,
-};
+use crate::canvas::{Annotation, Canvas, Item, Marker, PartDrag, Tool};
 use crate::code_ui::CodeEditor;
 use crate::debugger_ui::{Action as DebugAction, Debugger};
 use crate::dialog::{self, Dialog, Message, Unsaved};
@@ -24,9 +21,10 @@ use crate::examples::examples;
 use crate::instruments_ui::{Bench, MeterSignal, Signals};
 use crate::library::{PaletteEntry, palette_groups};
 use crate::live::{Command, Event, LiveSim};
+use crate::open_circuit::{DcResults, OpenCircuit};
 use crate::project::{self, Project};
 use crate::project_ui::{self, ProjectPanel};
-use crate::properties::Properties;
+use crate::properties::{DemoRequest, Properties};
 use crate::serial_ui::SerialMonitor;
 use crate::settings::{STORAGE_KEY, Settings};
 
@@ -102,28 +100,12 @@ struct DeleteAsk {
     discard_first: bool,
 }
 
-/// DC operating point shown on the canvas and in the results panel.
-struct DcResults {
-    generation: u64,
-    outcome: Result<DcTable, String>,
-}
-
-struct DcTable {
-    annotations: Vec<Annotation>,
-    /// Voltage of every node, indexed by node number.
-    node_voltages: Vec<f64>,
-    voltages: Vec<(String, f64)>,
-    currents: Vec<(String, f64)>,
-    warnings: Vec<String>,
-}
-
 pub struct DunbrecApp {
-    doc: Document,
-    canvas: Canvas,
-    properties: Properties,
-    code: CodeEditor,
-    netlist: (u64, Netlist),
-    dc: Option<DcResults>,
+    /// The open circuits. For now there is always exactly one; whether it is
+    /// shown is `circuit_open`.
+    circuits: Vec<OpenCircuit>,
+    /// Which of `circuits` the panels show and the commands act on.
+    active: usize,
     live_dc: bool,
     show_voltages: bool,
     pending: Option<Pending>,
@@ -153,6 +135,8 @@ pub struct DunbrecApp {
     // ---- live simulation and instruments ----
     bench: Bench,
     live: Option<LiveSim>,
+    /// Simulated seconds per real second the simulation was last told to run.
+    live_speed: f64,
     /// Document generation the running simulation reflects.
     live_generation: u64,
     live_time: f64,
@@ -164,8 +148,6 @@ pub struct DunbrecApp {
     latest: Option<Sample>,
     /// Probe signals, keyed by (document generation, probe revision).
     signals: ((u64, u64), Signals),
-    /// Node lookup and voltage-tag positions, keyed by generation.
-    node_map: (u64, NodeMap, Vec<TagPlace>),
     /// Bode plotter, curve tracer, DC transfer, function generator.
     analyses: Analyses,
     /// Microcontroller serial output.
@@ -197,6 +179,14 @@ fn same_structure(a: &Netlist, b: &Netlist) -> bool {
             .iter()
             .zip(&b.elements)
             .all(|(x, y)| x.component == y.component && x.nodes == y.nodes)
+}
+
+/// Whether the circuit has a microcontroller, which sets the "Auto" speed.
+fn has_mcu(netlist: &Netlist) -> bool {
+    netlist
+        .elements
+        .iter()
+        .any(|e| matches!(e.kind, dunbrec_core::ComponentKind::Mcu { .. }))
 }
 
 /// Feed one simulation sample to the instruments.
@@ -260,9 +250,6 @@ impl DunbrecApp {
             .storage
             .and_then(|s| eframe::get_value::<DockState<Pane>>(s, LAYOUT_KEY))
             .map_or_else(dock::default_layout, dock::sanitize);
-        let netlist = build_netlist(doc.schematic());
-        let node_map = NodeMap::new(doc.schematic(), &netlist);
-        let tags = node_tag_positions(doc.schematic(), &netlist);
         // No project is open until the user opens one: the last one is not
         // reopened, so an open project is never a surprise.
         let project: Option<Project> = None;
@@ -274,24 +261,20 @@ impl DunbrecApp {
             palette_search: String::new(),
             debugger: Debugger::default(),
             debug_loaded: None,
-            node_map: (doc.generation(), node_map, tags),
             analyses: Analyses::default(),
             serial: SerialMonitor::default(),
             signals: ((u64::MAX, 0), Signals::default()),
             bench: Bench::default(),
             live: None,
+            live_speed: 0.0,
             live_generation: 0,
             live_time: 0.0,
             live_keeping_up: 1.0,
             live_error: None,
             probe_hint: None,
             latest: None,
-            netlist: (doc.generation(), netlist),
-            doc,
-            canvas: Canvas::default(),
-            properties: Properties::default(),
-            code: CodeEditor::default(),
-            dc: None,
+            circuits: vec![OpenCircuit::new(doc)],
+            active: 0,
             live_dc: true,
             show_voltages: true,
             pending: None,
@@ -323,10 +306,19 @@ impl DunbrecApp {
         app
     }
 
+    /// The circuit the panels show and the commands act on.
+    fn active(&self) -> &OpenCircuit {
+        &self.circuits[self.active]
+    }
+
+    fn active_mut(&mut self) -> &mut OpenCircuit {
+        &mut self.circuits[self.active]
+    }
+
     // ------------------------------------------------------- files ---
 
     fn request(&mut self, action: Pending) {
-        if self.doc.is_dirty() {
+        if self.active().doc.is_dirty() {
             self.pending = Some(action);
         } else {
             self.perform(action);
@@ -442,7 +434,7 @@ impl DunbrecApp {
             .add_filter("SPICE netlist", &["cir"])
             .set_file_name(format!(
                 "{}.cir",
-                self.doc.display_name().trim_end_matches(".dbr")
+                self.active().doc.display_name().trim_end_matches(".dbr")
             ))
             .save_file()
         else {
@@ -451,8 +443,8 @@ impl DunbrecApp {
         if path.extension().is_none() {
             path.set_extension("cir");
         }
-        let title = self.doc.display_name();
-        let result = dunbrec_io::spice_export::export(self.doc.schematic(), &title, &[])
+        let title = self.active().doc.display_name();
+        let result = dunbrec_io::spice_export::export(self.active().doc.schematic(), &title, &[])
             .map_err(|_| "Fix the problems listed under Checks first.".to_string())
             .and_then(|text| std::fs::write(&path, text).map_err(|e| e.to_string()));
         if let Err(e) = result {
@@ -487,10 +479,7 @@ impl DunbrecApp {
         self.circuit_open = true;
         self.stop_sim();
         self.bench = Bench::default();
-        self.doc = doc;
-        self.canvas.selection.clear();
-        self.canvas.cancel();
-        self.dc = None;
+        self.active_mut().replace_document(doc);
         // A circuit that is opened is shown, not the Code tab beside it.
         dock::bring_to_front(&mut self.dock, Pane::Schematic);
     }
@@ -502,13 +491,13 @@ impl DunbrecApp {
     }
 
     fn save(&mut self, ask: bool) -> bool {
-        let path = match (ask, self.doc.path()) {
+        let path = match (ask, self.active().doc.path()) {
             (false, Some(p)) => Some(p.to_path_buf()),
             _ => rfd::FileDialog::new()
                 .add_filter("Dunbrec schematic", &["dbr"])
                 .set_file_name(format!(
                     "{}.dbr",
-                    self.doc.display_name().trim_end_matches(".dbr")
+                    self.active().doc.display_name().trim_end_matches(".dbr")
                 ))
                 .save_file(),
         };
@@ -520,7 +509,7 @@ impl DunbrecApp {
         // the schematic itself keeps only the names.
         let mut written = Vec::new();
         if let Some(dir) = path.parent() {
-            match project::write_sources(self.doc.schematic(), dir) {
+            match project::write_sources(self.active().doc.schematic(), dir) {
                 Ok(names) => written = names.into_iter().map(|n| dir.join(n)).collect(),
                 Err(e) => {
                     self.message = Some(Message::error("Could not save the source files", e));
@@ -528,10 +517,10 @@ impl DunbrecApp {
                 }
             }
         }
-        match dunbrec_io::dbr::save(&project::for_saving(self.doc.schematic()), &path) {
+        match dunbrec_io::dbr::save(&project::for_saving(self.active().doc.schematic()), &path) {
             Ok(()) => {
                 self.settings.remember(&path);
-                self.doc.mark_saved(path.clone());
+                self.active_mut().doc.mark_saved(path.clone());
                 // New source files of a schematic in the project are the project's.
                 if let Some(p) = &mut self.project {
                     if p.contains(&path) && !written.is_empty() {
@@ -687,7 +676,7 @@ impl DunbrecApp {
         let target = match &to {
             ProjectTarget::Open(file) | ProjectTarget::Create(file) => file,
         };
-        if leaves_circuit(self.project.as_ref(), self.doc.path(), target) {
+        if leaves_circuit(self.project.as_ref(), self.active().doc.path(), target) {
             self.request(Pending::SwitchProject(to));
         } else {
             self.go_to_project(to);
@@ -765,7 +754,7 @@ impl DunbrecApp {
             }
             C::AskRename(path) => self.name_prompt = Some(project_ui::NamePrompt::rename(&path)),
             C::AskDelete(path) => {
-                let discard_first = self.doc.is_dirty() && self.open_circuit_is_in(&path);
+                let discard_first = self.active().doc.is_dirty() && self.open_circuit_is_in(&path);
                 self.confirm_delete = Some(DeleteAsk {
                     path,
                     discard_first,
@@ -808,7 +797,7 @@ impl DunbrecApp {
             return;
         };
         let name = project::relative_to(&dir, path);
-        if let Err(e) = project::attach(self.doc.schematic_mut(), &dir, &name) {
+        if let Err(e) = project::attach(self.active_mut().doc.schematic_mut(), &dir, &name) {
             self.message = Some(Message::error("Could not open the source file", e));
             return;
         }
@@ -816,11 +805,11 @@ impl DunbrecApp {
         if let Some(at) = self.dock.find_tab(&Pane::Code) {
             self.dock.set_active_tab(at);
         }
-        self.code.select(&name);
+        self.active_mut().code.select(&name);
     }
 
     fn rename_in_project(&mut self, from: &std::path::Path, to: &std::path::Path) {
-        let open = self.doc.path().map(|p| p.to_path_buf());
+        let open = self.active().doc.path().map(|p| p.to_path_buf());
         let Some(project) = self.project.as_mut() else {
             return;
         };
@@ -839,16 +828,16 @@ impl DunbrecApp {
                 None => open.clone(),
             };
             let new_dir = new_open.parent().unwrap_or(none).to_path_buf();
-            let mut probe = self.doc.schematic().clone();
+            let mut probe = self.active().doc.schematic().clone();
             if project::rewrite_refs(&mut probe, &old_dir, &new_dir, from, to) > 0 {
-                self.doc.edit(|s| {
+                self.active_mut().doc.edit(|s| {
                     project::rewrite_refs(s, &old_dir, &new_dir, from, to);
                 });
             }
             if new_open != open {
                 self.settings.forget(&open);
                 self.settings.remember(&new_open);
-                self.doc.set_path(new_open);
+                self.active_mut().doc.set_path(new_open);
             }
         }
         self.refresh_project();
@@ -857,7 +846,8 @@ impl DunbrecApp {
     /// Whether the open circuit's file is `path` or inside the folder `path`.
     fn open_circuit_is_in(&self, path: &std::path::Path) -> bool {
         let gone = project::normalize(path);
-        self.doc
+        self.active()
+            .doc
             .path()
             .is_some_and(|p| project::starts_with_ci(p, &gone))
     }
@@ -872,7 +862,7 @@ impl DunbrecApp {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
         if ask.discard_first {
-            match dialog::unsaved_changes(ctx, &self.doc.display_name(), false) {
+            match dialog::unsaved_changes(ctx, &self.active().doc.display_name(), false) {
                 Some(Unsaved::Discard) => {
                     self.confirm_delete = Some(DeleteAsk {
                         discard_first: false,
@@ -928,6 +918,7 @@ impl DunbrecApp {
             // Drop open source files that were deleted with it.
             let gone = project::normalize(path);
             let dead: Vec<String> = self
+                .active()
                 .doc
                 .schematic()
                 .sources
@@ -937,7 +928,7 @@ impl DunbrecApp {
                 .cloned()
                 .collect();
             for name in dead {
-                self.doc.schematic_mut().sources.remove(&name);
+                self.active_mut().doc.schematic_mut().sources.remove(&name);
             }
         }
         self.refresh_project();
@@ -954,10 +945,10 @@ impl DunbrecApp {
             p.refresh();
             self.message = Some(Message::error("Could not read the project file", e));
         }
-        if !self.doc.is_dirty()
+        if !self.active().doc.is_dirty()
             && let Some(dir) = self.firmware_dir()
         {
-            let changed = project::sync_from_disk(self.doc.schematic_mut(), &dir);
+            let changed = project::sync_from_disk(self.active_mut().doc.schematic_mut(), &dir);
             if !changed.is_empty() {
                 // The debugger lists the new text.
                 self.debug_loaded = None;
@@ -976,13 +967,16 @@ impl DunbrecApp {
             ));
             return;
         };
-        let mut copy = self.doc.schematic().clone();
+        let mut copy = self.active().doc.schematic().clone();
         match project::extract_embedded(&mut copy, &dir) {
             Ok(moved) if moved.is_empty() => {}
             Ok(moved) => {
-                self.doc.edit(|s| *s = copy);
+                self.active_mut().doc.edit(|s| *s = copy);
                 if let Some(p) = &mut self.project
-                    && self.doc.path().is_some_and(|d| p.contains(d))
+                    && self.circuits[self.active]
+                        .doc
+                        .path()
+                        .is_some_and(|d| p.contains(d))
                 {
                     let files: Vec<PathBuf> = moved.iter().map(|(_, f)| dir.join(f)).collect();
                     let _ = p.add_files(&files);
@@ -1009,73 +1003,6 @@ impl DunbrecApp {
 
     // ------------------------------------------------- simulation ---
 
-    fn refresh_netlist(&mut self) {
-        if self.netlist.0 != self.doc.generation() {
-            self.netlist = (self.doc.generation(), build_netlist(self.doc.schematic()));
-        }
-        let stale = self
-            .dc
-            .as_ref()
-            .is_some_and(|d| d.generation != self.doc.generation());
-        if self.live_dc && (self.dc.is_none() || stale) {
-            self.run_dc();
-        } else if stale {
-            self.dc = None;
-        }
-    }
-
-    fn run_dc(&mut self) {
-        let s = self.doc.schematic();
-        let netlist = &self.netlist.1;
-        let outcome = if s.components.is_empty() {
-            Err("Place some parts to see the DC operating point.".to_string())
-        } else {
-            Circuit::from_netlist(netlist, &s.models)
-                .and_then(|c| operating_point(&c).map(|op| (c, op)))
-                .map(|(circuit, op)| {
-                    let annotations = node_tag_positions(s, netlist)
-                        .into_iter()
-                        .map(|place| Annotation {
-                            text: format_value(op.voltage(place.node), "V"),
-                            place,
-                        })
-                        .collect();
-                    let unused = netlist.unused_io_nets();
-                    let voltages = (1..circuit.node_count())
-                        .map(NodeId)
-                        .filter(|n| !unused.contains(n))
-                        .map(|n| (circuit.node_name(n).to_string(), op.voltage(n)))
-                        .filter(|(name, _)| !name.contains('#'))
-                        .collect();
-                    let currents = op.currents().map(|(d, i)| (d.to_string(), i)).collect();
-                    let warnings = op
-                        .warnings
-                        .iter()
-                        .map(|w| match w {
-                            SimWarning::FloatingNodes { nodes } => format!(
-                                "No DC path to ground at {} (tied down with 1 TΩ).",
-                                nodes.join(", ")
-                            ),
-                        })
-                        .collect();
-                    DcTable {
-                        node_voltages: (0..circuit.node_count())
-                            .map(|n| op.voltage(NodeId(n)))
-                            .collect(),
-                        annotations,
-                        voltages,
-                        currents,
-                        warnings,
-                    }
-                })
-                .map_err(|e| e.to_string())
-        };
-        self.dc = Some(DcResults {
-            generation: self.doc.generation(),
-            outcome,
-        });
-    }
-
     // ---------------------------------------------------- shortcuts ---
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
@@ -1098,10 +1025,10 @@ impl DunbrecApp {
             self.request(Pending::CloseCircuit);
         }
         if pressed(cmd_shift(Key::Z)) || pressed(cmd(Key::Y)) {
-            self.doc.redo();
+            self.active_mut().doc.redo();
         }
         if pressed(cmd(Key::Z)) {
-            self.doc.undo();
+            self.active_mut().doc.undo();
         }
         if pressed(cmd_shift(Key::S)) {
             self.save(true);
@@ -1116,56 +1043,50 @@ impl DunbrecApp {
             self.new_in_project(project_ui::Create::Schematic);
         }
         if pressed(cmd(Key::C)) {
-            self.copy();
+            self.active_mut().copy();
         }
         if pressed(cmd(Key::X)) {
-            self.copy();
-            let items = std::mem::take(&mut self.canvas.selection);
-            self.doc.edit(|s| delete_items(s, &items));
+            self.active_mut().copy();
+            self.active_mut().delete_selection();
         }
         if pressed(cmd(Key::V)) {
-            self.paste();
+            self.active_mut().paste();
         }
         if pressed(cmd(Key::D)) {
-            self.copy();
-            self.paste();
+            self.active_mut().copy();
+            self.active_mut().paste();
         }
         if pressed(cmd(Key::A)) {
-            let s = self.doc.schematic();
-            self.canvas.selection = s
-                .components
-                .iter()
-                .map(|c| Item::Component(c.id))
-                .chain(s.wires.iter().map(|w| Item::Wire(w.id)))
-                .chain(s.labels.iter().map(|l| Item::Label(l.id)))
-                .collect();
+            self.active_mut().select_all();
         }
         let plain = |key| ctx.input(|i| i.key_pressed(key) && i.modifiers.is_none());
         if plain(Key::W) {
-            self.canvas.tool = Tool::Wire;
+            self.active_mut().canvas.tool = Tool::Wire;
         }
         if plain(Key::L) {
-            self.canvas.tool = Tool::Label;
+            self.active_mut().canvas.tool = Tool::Label;
         }
         if plain(Key::P) {
-            self.canvas.tool = Tool::Probe;
+            self.active_mut().canvas.tool = Tool::Probe;
         }
         if plain(Key::J) {
-            self.canvas.tool = junction_tool();
+            self.active_mut().canvas.tool = junction_tool();
         }
         if plain(Key::Space) {
             self.toggle_run();
         }
         if plain(Key::S) {
-            self.canvas.cancel();
+            self.active_mut().canvas.cancel();
         }
     }
 
     /// Logic LEDs whose input is high: from the running simulation, or
     /// from the DC operating point when stopped.
     fn lit_leds(&self) -> std::collections::HashSet<dunbrec_core::ComponentId> {
-        let voltages: Option<&[f64]> = match (&self.live, &self.latest, &self.dc) {
-            (Some(_), Some(sample), _) if self.live_generation == self.doc.generation() => {
+        let voltages: Option<&[f64]> = match (&self.live, &self.latest, &self.active().dc) {
+            (Some(_), Some(sample), _)
+                if self.live_generation == self.active().doc.generation() =>
+            {
                 Some(&sample.voltages)
             }
             (
@@ -1175,13 +1096,14 @@ impl DunbrecApp {
                     outcome: Ok(t),
                     generation,
                 }),
-            ) if *generation == self.doc.generation() => Some(&t.node_voltages),
+            ) if *generation == self.active().doc.generation() => Some(&t.node_voltages),
             _ => None,
         };
         let Some(voltages) = voltages else {
             return Default::default();
         };
-        self.netlist
+        self.active()
+            .netlist
             .1
             .elements
             .iter()
@@ -1191,35 +1113,11 @@ impl DunbrecApp {
             .collect()
     }
 
-    // --------------------------------------------------- clipboard ---
-
-    fn copy(&mut self) {
-        if let Some(clip) = crate::canvas::copy_items(self.doc.schematic(), &self.canvas.selection)
-        {
-            self.canvas.clipboard = Some(clip);
-            self.canvas.paste_count = 0;
-        }
-    }
-
-    fn paste(&mut self) {
-        let Some(clip) = self.canvas.clipboard.clone() else {
-            return;
-        };
-        self.canvas.paste_count += 1;
-        let step = 2 * self.canvas.paste_count;
-        let offset = dunbrec_core::Point::new(step, step);
-        let pasted = self.doc.edit(|s| crate::canvas::paste(s, &clip, offset));
-        self.canvas.selection = pasted;
-    }
-
     // ------------------------------------------------ live simulation ---
 
     /// Relative firmware paths are relative to the schematic's folder.
     fn firmware_dir(&self) -> Option<PathBuf> {
-        self.doc
-            .path()
-            .and_then(|p| p.parent())
-            .map(|d| d.to_path_buf())
+        self.active().firmware_dir()
     }
 
     fn start_sim(&mut self) {
@@ -1230,20 +1128,21 @@ impl DunbrecApp {
     /// debugger to step from the first instruction).
     fn start_sim_with(&mut self, paused: bool) {
         self.stop_sim();
-        let netlist = self.netlist.1.clone();
+        let netlist = self.active().netlist.1.clone();
         if netlist.has_errors() {
             self.live_error = Some("Fix the problems listed under Checks first.".into());
             return;
         }
         self.bench.clear_readings();
-        let speed = self.bench.speed.value(&self.bench.scope);
-        let models = self.doc.schematic().models.clone();
+        let speed = self.bench.run_speed(has_mcu(&netlist));
+        self.live_speed = speed;
+        let models = self.active().doc.schematic().models.clone();
         let firmware_dir = self.firmware_dir();
         self.serial.clear();
         // The firmware file is read again for every run, so the debugger
         // lists what this run will execute.
         self.debugger.load(&netlist, firmware_dir.as_deref());
-        self.debug_loaded = Some(self.netlist.0);
+        self.debug_loaded = Some(self.active().netlist.0);
         let debug = self.debugger.setup(&netlist, paused);
         match LiveSim::start_debug(
             netlist,
@@ -1256,12 +1155,23 @@ impl DunbrecApp {
             Ok(live) => {
                 self.debugger.sim_started();
                 self.live = Some(live);
-                self.live_generation = self.doc.generation();
+                self.live_generation = self.active().doc.generation();
                 self.live_error = None;
                 self.live_time = 0.0;
                 self.live_keeping_up = 1.0;
             }
             Err(e) => self.live_error = Some(e),
+        }
+    }
+
+    /// Tell a running simulation when the speed to run at changes: another
+    /// choice, another time base, or an instrument opening or closing.
+    fn sync_speed(&mut self) {
+        let Some(live) = &mut self.live else { return };
+        let speed = self.bench.run_speed(has_mcu(&live.netlist));
+        if speed != self.live_speed {
+            live.send(Command::SetSpeed(speed));
+            self.live_speed = speed;
         }
     }
 
@@ -1282,20 +1192,15 @@ impl DunbrecApp {
 
     /// Keep probe signals and node lookups in step with the schematic.
     fn refresh_signals(&mut self) {
-        let generation = self.doc.generation();
-        if self.node_map.0 != generation {
-            let s = self.doc.schematic();
-            self.node_map = (
-                generation,
-                NodeMap::new(s, &self.netlist.1),
-                node_tag_positions(s, &self.netlist.1),
-            );
-        }
-        let key = (generation, self.bench.probe_revision);
+        let circuit = &mut self.circuits[self.active];
+        circuit.refresh_node_map();
+        let key = (circuit.doc.generation(), self.bench.probe_revision);
         if self.signals.0 != key {
-            let resolved =
-                self.bench
-                    .resolve(self.doc.schematic(), &self.netlist.1, &self.node_map.1);
+            let resolved = self.bench.resolve(
+                circuit.doc.schematic(),
+                &circuit.netlist.1,
+                &circuit.node_map.1,
+            );
             self.signals = (key, resolved);
         }
     }
@@ -1345,9 +1250,10 @@ impl DunbrecApp {
             return;
         }
 
-        let generation = self.doc.generation();
+        let circuit = &self.circuits[self.active];
+        let generation = circuit.doc.generation();
         if !restart && generation != self.live_generation {
-            let new = &self.netlist.1;
+            let new = &circuit.netlist.1;
             if new.has_errors() {
                 self.stop_sim();
                 self.live_error =
@@ -1356,7 +1262,7 @@ impl DunbrecApp {
             }
             if same_structure(&live.netlist, new) {
                 // Same circuit, new values: update it in place.
-                let models = &self.doc.schematic().models;
+                let models = &circuit.doc.schematic().models;
                 let changed: Vec<(usize, Element)> = new
                     .elements
                     .iter()
@@ -1435,12 +1341,7 @@ impl DunbrecApp {
                 }
                 ui.separator();
                 ui.label("Speed");
-                if self.bench.speed_combo(ui) {
-                    let speed = self.bench.speed.value(&self.bench.scope);
-                    if let Some(live) = &mut self.live {
-                        live.send(Command::SetSpeed(speed));
-                    }
-                }
+                self.bench.speed_combo(ui);
                 if self.live.is_some() {
                     // Fixed-width slots: the text changes every frame, and
                     // a label that grows or shrinks would shove everything
@@ -1480,12 +1381,12 @@ impl DunbrecApp {
                     );
                 }
                 ui.separator();
-                let probing = self.canvas.tool == Tool::Probe;
+                let probing = self.active().canvas.tool == Tool::Probe;
                 if ui.selectable_label(probing, "🔌 Probe   (P)").clicked() {
                     if probing {
-                        self.canvas.cancel();
+                        self.active_mut().canvas.cancel();
                     } else {
-                        self.canvas.tool = Tool::Probe;
+                        self.active_mut().canvas.tool = Tool::Probe;
                     }
                 }
                 ui.toggle_value(&mut self.bench.show_scope, "📈 Oscilloscope");
@@ -1526,10 +1427,11 @@ impl DunbrecApp {
 
     /// The instruments: free-floating windows that never dock.
     fn instrument_windows(&mut self, ctx: &egui::Context) {
-        let probing = self.canvas.tool == Tool::Probe;
-        let s = self.doc.schematic();
-        let netlist = &self.netlist.1;
-        let map = &self.node_map.1;
+        let probing = self.active().canvas.tool == Tool::Probe;
+        let circuit = &mut self.circuits[self.active];
+        let s = circuit.doc.schematic();
+        let netlist = &circuit.netlist.1;
+        let map = &circuit.node_map.1;
         let mut probe_clicked = false;
         if self.bench.show_scope {
             let (timebase_changed, clicked) =
@@ -1537,7 +1439,6 @@ impl DunbrecApp {
             probe_clicked |= clicked;
             if timebase_changed && let Some(live) = &mut self.live {
                 live.send(Command::SetMaxStep(self.bench.max_step()));
-                live.send(Command::SetSpeed(self.bench.speed.value(&self.bench.scope)));
             }
         }
         if self.bench.show_meter {
@@ -1547,31 +1448,31 @@ impl DunbrecApp {
                 .meter_window(ctx, s, netlist, map, probing, running);
         }
         let inputs = Inputs {
-            doc: &mut self.doc,
-            netlist: &self.netlist.1,
-            map: &self.node_map.1,
+            doc: &mut circuit.doc,
+            netlist: &circuit.netlist.1,
+            map: &circuit.node_map.1,
             bench: &mut self.bench,
             probing,
         };
         probe_clicked |= self.analyses.show(ctx, inputs);
         if self.bench.show_logic {
-            let s = self.doc.schematic();
+            let s = circuit.doc.schematic();
             probe_clicked |=
                 self.bench
-                    .logic_window(ctx, s, &self.netlist.1, &self.node_map.1, probing);
+                    .logic_window(ctx, s, &circuit.netlist.1, &circuit.node_map.1, probing);
         }
         self.serial.window(ctx);
         if probe_clicked {
-            self.canvas.tool = Tool::Probe;
+            circuit.canvas.tool = Tool::Probe;
         }
 
         // The debugger lists the firmware of the circuit as it is now.
         if (self.debugger.show || dock::is_open(&self.dock, Pane::Code))
-            && self.debug_loaded != Some(self.netlist.0)
+            && self.debug_loaded != Some(circuit.netlist.0)
         {
-            let dir = self.firmware_dir();
-            self.debugger.load(&self.netlist.1, dir.as_deref());
-            self.debug_loaded = Some(self.netlist.0);
+            let dir = circuit.firmware_dir();
+            self.debugger.load(&circuit.netlist.1, dir.as_deref());
+            self.debug_loaded = Some(circuit.netlist.0);
         }
         if self.debugger.window(ctx, &mut self.live) == DebugAction::StartPaused {
             self.start_sim_with(true);
@@ -1582,7 +1483,11 @@ impl DunbrecApp {
     /// channels, the multimeter, and the stopped microcontroller.
     fn instrument_sections(&self) -> Vec<(String, Vec<String>)> {
         let mut out = Vec::new();
-        let (s, netlist, map) = (self.doc.schematic(), &self.netlist.1, &self.node_map.1);
+        let (s, netlist, map) = (
+            self.active().doc.schematic(),
+            &self.active().netlist.1,
+            &self.active().node_map.1,
+        );
         if self.bench.show_scope {
             let mut lines = Vec::new();
             for (i, channel) in self.bench.scope.channels.iter().enumerate() {
@@ -1650,13 +1555,34 @@ impl DunbrecApp {
         // The central area holds the schematic while a circuit is open, and
         // nothing (but stays) when none is.
         dock::sync_documents(&mut self.dock, self.circuit_open);
+        let running = self.live.is_some();
+        let lit = self.lit_leds();
+        let markers = self.bench.markers(self.active().doc.schematic());
+        let title = self.active().doc.display_name();
+        let generation = self.active().doc.generation();
+        let live_is_current = running && self.live_generation == generation;
+        let sections = if dock::is_open(&self.dock, Pane::Assistant) {
+            self.instrument_sections()
+        } else {
+            Vec::new()
+        };
+        // The panels borrow the parts of the circuit one by one.
+        let OpenCircuit {
+            doc,
+            canvas,
+            properties,
+            code,
+            netlist,
+            node_map,
+            dc,
+        } = &mut self.circuits[self.active];
+        let (netlist, dc) = (&netlist.1, &*dc);
         // Live values while simulating, otherwise the DC point.
         let live_tags: Vec<Annotation>;
-        let annotations: &[Annotation] = match (&self.live, &self.latest, &self.dc) {
+        let annotations: &[Annotation] = match (&self.live, &self.latest, dc) {
             _ if !self.show_voltages => &[],
-            (Some(_), Some(sample), _) if self.live_generation == self.doc.generation() => {
-                live_tags = self
-                    .node_map
+            (Some(_), Some(sample), _) if self.live_generation == generation => {
+                live_tags = node_map
                     .2
                     .iter()
                     .filter_map(|place| {
@@ -1675,45 +1601,33 @@ impl DunbrecApp {
                     outcome: Ok(t),
                     generation,
                 }),
-            ) if *generation == self.doc.generation() => &t.annotations,
+            ) if *generation == doc.generation() => &t.annotations,
             _ => &[],
         };
-        let markers = self.bench.markers(self.doc.schematic());
-        let lit = self.lit_leds();
-
-        let running = self.live.is_some();
         let mut project_command = None;
         let mut close_circuit = false;
         let mut open_settings = false;
-        let title = self.doc.display_name();
-        let generation = self.doc.generation();
-        let live_is_current = running && self.live_generation == generation;
-        let sections = if dock::is_open(&self.dock, Pane::Assistant) {
-            self.instrument_sections()
-        } else {
-            Vec::new()
-        };
         let readings = || {
             assistant_readings(
-                &self.netlist.1,
+                netlist,
                 sections.clone(),
                 &self.latest,
                 live_is_current,
-                &self.dc,
+                dc,
                 generation,
                 &self.serial,
             )
         };
         let mut viewer = PaneViewer {
-            doc: &mut self.doc,
-            canvas: &mut self.canvas,
-            properties: &mut self.properties,
-            code: &mut self.code,
+            doc,
+            canvas,
+            properties,
+            code,
             debugger: &mut self.debugger,
             live: &mut self.live,
             palette_search: &mut self.palette_search,
-            netlist: &self.netlist.1,
-            dc: &self.dc,
+            netlist,
+            dc,
             latest: &self.latest,
             readings: &readings,
             running,
@@ -1741,9 +1655,10 @@ impl DunbrecApp {
         }
         // Source files the Code panel made on disk belong to the project the
         // circuit is in.
-        let created = self.code.take_created();
+        let created = self.active_mut().code.take_created();
         if !created.is_empty()
-            && let (Some(circuit), Some(project)) = (self.doc.path(), self.project.as_mut())
+            && let (Some(circuit), Some(project)) =
+                (self.circuits[self.active].doc.path(), self.project.as_mut())
             && project.contains(circuit)
         {
             if let Err(e) = project.add_files(&created) {
@@ -1751,19 +1666,62 @@ impl DunbrecApp {
             }
             project.refresh();
         }
-        if let Some(problem) = self.code.take_problem() {
+        if let Some(problem) = self.active_mut().code.take_problem() {
             self.message = Some(Message::error("Could not create the file", problem));
         }
         if open_settings {
             self.settings_dialog.open();
         }
-        // "Edit" on a microcontroller's source file opens it in the editor.
-        if let Some(name) = self.properties.open_code.take() {
-            dock::open(&mut self.dock, Pane::Code);
-            if let Some(at) = self.dock.find_tab(&Pane::Code) {
-                self.dock.set_active_tab(at);
+        // "Edit code" on a microcontroller's source file opens it in the
+        // editor.
+        if let Some(name) = self.active_mut().properties.open_code.take() {
+            self.show_code(&name);
+        }
+        if let Some(request) = self.active_mut().properties.demo.take() {
+            self.use_demo(ctx, request);
+        }
+    }
+
+    /// Bring the Code panel to the front on the source `name`.
+    fn show_code(&mut self, name: &str) {
+        dock::open(&mut self.dock, Pane::Code);
+        dock::bring_to_front(&mut self.dock, Pane::Code);
+        self.active_mut().code.select(name);
+    }
+
+    /// Make a microcontroller its own copy of a demo program, list the file
+    /// in the project, and show it. A sketch is built straight away, so that
+    /// it can be run.
+    fn use_demo(&mut self, ctx: &egui::Context, request: DemoRequest) {
+        let sketch = request.language == SourceLanguage::Cpp;
+        // A sketch cannot run until it is built.
+        if sketch {
+            self.stop_sim();
+        }
+        let file = match self.active_mut().add_demo(request) {
+            Ok(file) => file,
+            Err(e) => {
+                self.message = Some(Message::error("Could not create the file", e));
+                return;
             }
-            self.code.select(&name);
+        };
+        if let Some(path) = &file.path
+            && let Some(project) = self.project.as_mut()
+            && self.circuits[self.active]
+                .doc
+                .path()
+                .is_some_and(|c| project.contains(c))
+        {
+            if let Err(e) = project.add_files(std::slice::from_ref(path)) {
+                self.message = Some(Message::error("Could not update the project file", e));
+            }
+            project.refresh();
+        }
+        self.show_code(&file.name);
+        if sketch {
+            self.active_mut()
+                .code
+                .build_sketch(ctx, &file.name, &file.text);
         }
     }
 
@@ -1896,43 +1854,46 @@ impl DunbrecApp {
                         ui.disable();
                     }
                     if ui
-                        .add_enabled(self.doc.can_undo(), egui::Button::new("Undo   Ctrl+Z"))
+                        .add_enabled(
+                            self.active().doc.can_undo(),
+                            egui::Button::new("Undo   Ctrl+Z"),
+                        )
                         .clicked()
                     {
-                        self.doc.undo();
+                        self.active_mut().doc.undo();
                         ui.close();
                     }
                     if ui
-                        .add_enabled(self.doc.can_redo(), egui::Button::new("Redo   Ctrl+Y"))
+                        .add_enabled(
+                            self.active().doc.can_redo(),
+                            egui::Button::new("Redo   Ctrl+Y"),
+                        )
                         .clicked()
                     {
-                        self.doc.redo();
+                        self.active_mut().doc.redo();
                         ui.close();
                     }
                     ui.separator();
-                    let has_selection = !self.canvas.selection.is_empty();
+                    let has_selection = !self.active().canvas.selection.is_empty();
                     if ui
                         .add_enabled(has_selection, egui::Button::new("Rotate   R"))
                         .clicked()
                     {
-                        let items = self.canvas.selection.clone();
-                        self.doc.edit(|s| transform_components(s, &items, false));
+                        self.active_mut().transform_selection(false);
                         ui.close();
                     }
                     if ui
                         .add_enabled(has_selection, egui::Button::new("Mirror   X"))
                         .clicked()
                     {
-                        let items = self.canvas.selection.clone();
-                        self.doc.edit(|s| transform_components(s, &items, true));
+                        self.active_mut().transform_selection(true);
                         ui.close();
                     }
                     if ui
                         .add_enabled(has_selection, egui::Button::new("Delete   Del"))
                         .clicked()
                     {
-                        let items = std::mem::take(&mut self.canvas.selection);
-                        self.doc.edit(|s| delete_items(s, &items));
+                        self.active_mut().delete_selection();
                         ui.close();
                     }
                     ui.separator();
@@ -1940,25 +1901,25 @@ impl DunbrecApp {
                         .add_enabled(has_selection, egui::Button::new("Copy        Ctrl+C"))
                         .clicked()
                     {
-                        self.copy();
+                        self.active_mut().copy();
                         ui.close();
                     }
                     if ui
                         .add_enabled(
-                            self.canvas.clipboard.is_some(),
+                            self.active().canvas.clipboard.is_some(),
                             egui::Button::new("Paste       Ctrl+V"),
                         )
                         .clicked()
                     {
-                        self.paste();
+                        self.active_mut().paste();
                         ui.close();
                     }
                     if ui
                         .add_enabled(has_selection, egui::Button::new("Duplicate   Ctrl+D"))
                         .clicked()
                     {
-                        self.copy();
-                        self.paste();
+                        self.active_mut().copy();
+                        self.active_mut().paste();
                         ui.close();
                     }
                 });
@@ -1969,7 +1930,7 @@ impl DunbrecApp {
                     ui.checkbox(&mut self.live_dc, "Live DC operating point");
                     ui.checkbox(&mut self.show_voltages, "Show node voltages on schematic");
                     if ui.button("Recalculate DC now").clicked() {
-                        self.run_dc();
+                        self.active_mut().run_dc();
                         ui.close();
                     }
                 });
@@ -2046,7 +2007,7 @@ impl DunbrecApp {
 
     fn dialogs(&mut self, ctx: &egui::Context) {
         if let Some(action) = self.pending.clone() {
-            match dialog::unsaved_changes(ctx, &self.doc.display_name(), true) {
+            match dialog::unsaved_changes(ctx, &self.active().doc.display_name(), true) {
                 Some(Unsaved::Save) if self.save(false) => {
                     self.pending = None;
                     self.perform(action);
@@ -2060,7 +2021,7 @@ impl DunbrecApp {
             }
         }
 
-        if self.canvas.has_label_request() {
+        if self.active().canvas.has_label_request() {
             let answer = Dialog {
                 id: "label",
                 kind: dialog::Kind::Question,
@@ -2080,10 +2041,10 @@ impl DunbrecApp {
                 r.request_focus();
             });
             if let Some(choice) = answer {
-                let at = self.canvas.take_label_request();
+                let at = self.active_mut().canvas.take_label_request();
                 let name = std::mem::take(&mut self.label_name).trim().to_string();
                 if let (0, Some(at), false) = (choice, at, name.is_empty()) {
-                    self.doc.edit(|s| s.add_label(name, at));
+                    self.active_mut().doc.edit(|s| s.add_label(name, at));
                 }
             }
         }
@@ -2137,7 +2098,7 @@ impl DunbrecApp {
         let frame = self.run_frame(ctx);
         egui::TopBottomPanel::bottom("status").frame(frame).show(ctx, |ui| {
             ui.horizontal(|ui| {
-                let hint = match &self.canvas.tool {
+                let hint = match &self.active().canvas.tool {
                     Tool::Select => "Click to select · click a pin to start a wire · drag a wire corner to reshape it · drag to move · drag empty space to box-select · R rotate · X mirror · Del delete",
                     Tool::Place { .. } => "Click to place · R rotate · X mirror · Esc or right-click to stop",
                     Tool::Wire => "Click to start a wire (a part's body selects it instead), click to bend · ends on a pin or wire, not inside a part · double-click, Esc or right-click to stop",
@@ -2146,7 +2107,7 @@ impl DunbrecApp {
                 };
                 ui.label(RichText::new(hint).weak());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(format!("{:.0}%", self.canvas.camera.scale / 14.0 * 100.0));
+                    ui.label(format!("{:.0}%", self.active().canvas.camera.scale / 14.0 * 100.0));
                     ui.label(RichText::new("Wheel: zoom · middle-drag: pan").weak());
                 });
             });
@@ -2647,7 +2608,9 @@ impl eframe::App for DunbrecApp {
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Closing with unsaved changes asks first.
-        if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close && self.doc.is_dirty()
+        if ctx.input(|i| i.viewport().close_requested())
+            && !self.allow_close
+            && self.active().doc.is_dirty()
         {
             ctx.send_viewport_cmd(ViewportCommand::CancelClose);
             self.pending = Some(Pending::Quit);
@@ -2684,7 +2647,8 @@ impl eframe::App for DunbrecApp {
         }
 
         self.shortcuts(ctx);
-        self.refresh_netlist();
+        let live_dc = self.live_dc;
+        self.active_mut().refresh_netlist(live_dc);
         self.refresh_signals();
         self.sync_live();
         if self.live.as_ref().is_some_and(|l| !l.paused) {
@@ -2694,8 +2658,12 @@ impl eframe::App for DunbrecApp {
         let title = if self.circuit_open {
             format!(
                 "{}{} — Dunbrec",
-                self.doc.display_name(),
-                if self.doc.is_dirty() { " •" } else { "" }
+                self.active().doc.display_name(),
+                if self.active().doc.is_dirty() {
+                    " •"
+                } else {
+                    ""
+                }
             )
         } else {
             let name = self.project.as_ref().map(|p| p.name());
@@ -2711,20 +2679,21 @@ impl eframe::App for DunbrecApp {
         self.status_bar(ctx);
         self.dock_area(ctx);
 
-        if let Some((at, part)) = self.canvas.take_probe_request() {
-            let s = self.doc.schematic();
-            let on_net = self.node_map.1.node_at(s, &self.netlist.1, at).is_some();
+        if let Some((at, part)) = self.active_mut().canvas.take_probe_request() {
+            let s = self.active().doc.schematic();
+            let on_net = self
+                .active()
+                .node_map
+                .1
+                .node_at(s, &self.active().netlist.1, at)
+                .is_some();
             self.probe_hint = self.bench.connect(at, part, on_net).err();
         }
         self.instrument_windows(ctx);
+        self.sync_speed();
 
         // Drop selections of items that no longer exist (after undo etc.).
-        let s = self.doc.schematic();
-        self.canvas.selection.retain(|item| match item {
-            Item::Component(id) => s.component(*id).is_some(),
-            Item::Wire(id) => s.wires.iter().any(|w| w.id == *id),
-            Item::Label(id) => s.labels.iter().any(|l| l.id == *id),
-        });
+        self.active_mut().prune_selection();
 
         self.dialogs(ctx);
         self.settings_dialog.show(ctx, &mut self.settings);
@@ -2786,6 +2755,155 @@ mod tests {
             .find(|e| matches!((e.make)(), dunbrec_core::ComponentKind::Junction))
             .expect("a junction in the palette");
         assert_eq!(junction_tool(), place_tool(entry));
+    }
+
+    /// The whole app in a headless context, clicked by the labels it shows.
+    struct Rig {
+        ctx: egui::Context,
+        app: DunbrecApp,
+        time: f64,
+        seen: Vec<(String, egui::Rect)>,
+    }
+
+    impl Rig {
+        fn frame(&mut self, events: Vec<egui::Event>) {
+            use eframe::App as _;
+            self.time += 0.1;
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 900.0));
+            let input = egui::RawInput {
+                screen_rect: Some(screen),
+                time: Some(self.time),
+                events,
+                ..Default::default()
+            };
+            let app = &mut self.app;
+            let mut frame = eframe::Frame::_new_kittest();
+            let out = self.ctx.run(input, |ctx| app.update(ctx, &mut frame));
+            if let Some(update) = out.platform_output.accesskit_update {
+                self.seen = update
+                    .nodes
+                    .iter()
+                    .filter_map(|(_, n)| {
+                        let text = n.label().or_else(|| n.value())?.to_string();
+                        let b = n.bounds()?;
+                        let min = egui::pos2(b.x0 as f32, b.y0 as f32);
+                        let max = egui::pos2(b.x1 as f32, b.y1 as f32);
+                        Some((text, egui::Rect::from_min_max(min, max)))
+                    })
+                    .collect();
+            }
+        }
+
+        fn settle(&mut self) {
+            for _ in 0..4 {
+                self.frame(vec![]);
+            }
+        }
+
+        /// Click the thing labelled `label`, or failing that one whose label
+        /// ends with it.
+        fn click(&mut self, label: &str) {
+            let at = self
+                .seen
+                .iter()
+                .find(|(text, _)| text == label)
+                .or_else(|| self.seen.iter().find(|(text, _)| text.ends_with(label)))
+                .unwrap_or_else(|| panic!("nothing labelled {label:?} is shown"))
+                .1
+                .center();
+            self.frame(vec![egui::Event::PointerMoved(at)]);
+            for pressed in [true, false] {
+                self.frame(vec![egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: Modifiers::NONE,
+                }]);
+            }
+            self.settle();
+        }
+    }
+
+    #[test]
+    fn choosing_a_demo_adds_a_file_to_the_project_and_it_runs_in_real_time() {
+        let dir = std::env::temp_dir().join(format!("dunbrec-usedemo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (project, circuit) = Project::create(&dir.join("P")).unwrap();
+        let blink = examples()
+            .iter()
+            .find(|e| e.name == "Arduino blink")
+            .expect("the blink example");
+        let schematic = (blink.build)();
+        let chip = schematic
+            .components
+            .iter()
+            .find(|c| matches!(c.kind, dunbrec_core::ComponentKind::Mcu { .. }))
+            .unwrap()
+            .id;
+        dunbrec_io::dbr::save(&schematic, &circuit).unwrap();
+
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = DunbrecApp::new(&cc, None, Some(project.file.clone()));
+        app.open_path(circuit);
+        app.active_mut().canvas.selection = [Item::Component(chip)].into_iter().collect();
+        let mut rig = Rig {
+            ctx,
+            app,
+            time: 0.0,
+            seen: Vec::new(),
+        };
+        rig.settle();
+
+        // The box shows which built-in program the chip runs.
+        rig.click("blink");
+        rig.click("blink (assembly)");
+        let root = project.root.clone();
+        assert!(
+            root.join("blink.asm").is_file(),
+            "written beside the circuit"
+        );
+        let app = &rig.app;
+        assert!(
+            app.project
+                .as_ref()
+                .unwrap()
+                .contains(&root.join("blink.asm"))
+        );
+        assert!(dock::is_open(&app.dock, Pane::Code), "shown for editing");
+        assert!(
+            app.active()
+                .doc
+                .schematic()
+                .sources
+                .contains_key("blink.asm")
+        );
+
+        // On "Auto" it runs as a board would: the light changes every half
+        // second of real time.
+        rig.click(" Run");
+        assert!(rig.app.live.is_some(), "{:?}", rig.app.live_error);
+        assert_eq!(rig.app.live_speed, 1.0);
+        let mut states = Vec::new();
+        for _ in 0..60 {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            rig.frame(vec![]);
+            let lit = rig.app.lit_leds().len();
+            if states.last() != Some(&lit) {
+                states.push(lit);
+            }
+        }
+        assert!(states.len() >= 3, "the light went on and off: {states:?}");
+        // Opening the oscilloscope slows it, and closing it speeds it up.
+        rig.app.bench.show_scope = true;
+        rig.settle();
+        assert!(rig.app.live_speed < 0.1);
+        rig.app.bench.show_scope = false;
+        rig.settle();
+        assert_eq!(rig.app.live_speed, 1.0);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -26,6 +26,7 @@ pub mod arduino;
 pub mod asm;
 pub mod asm_text;
 mod avr;
+pub mod demos;
 pub mod disasm;
 pub mod firmware;
 pub mod hex;

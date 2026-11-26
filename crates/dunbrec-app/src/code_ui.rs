@@ -518,6 +518,13 @@ impl CodeEditor {
         });
     }
 
+    /// Compile sketch `name` now, unless a build is already running.
+    pub fn build_sketch(&mut self, ctx: &egui::Context, name: &str, text: &str) {
+        if self.building.is_none() {
+            self.start_build(ctx, name, text);
+        }
+    }
+
     /// Show `name` the next time the panel is drawn.
     pub fn select(&mut self, name: &str) {
         self.selected = Some(name.to_string());

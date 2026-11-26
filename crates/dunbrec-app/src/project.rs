@@ -682,6 +682,37 @@ pub fn new_source(dir: &Path, name: &str, kind: NewSource) -> Result<PathBuf, St
     Ok(path)
 }
 
+/// Write `text` to a new source file in `dir` called `base.extension`, or
+/// `base2.extension` and so on: never over a file that exists, nor under a
+/// name that is `taken`. Returns the file's name.
+pub fn new_source_copy(
+    dir: &Path,
+    base: &str,
+    extension: &str,
+    text: &str,
+    taken: impl Fn(&str) -> bool,
+) -> Result<String, String> {
+    use std::io::Write;
+    for n in 1u32.. {
+        let number = if n == 1 { String::new() } else { n.to_string() };
+        let name = format!("{base}{number}.{extension}");
+        if taken(&name) {
+            continue;
+        }
+        let path = dir.join(&name);
+        let failed = |e| format!("cannot write {}: {e}", path.display());
+        match std::fs::File::create_new(&path) {
+            Ok(mut file) => {
+                file.write_all(text.as_bytes()).map_err(failed)?;
+                return Ok(name);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(failed(e)),
+        }
+    }
+    unreachable!("some number is free")
+}
+
 fn has_source(dir: &Path) -> bool {
     std::fs::read_dir(dir).is_ok_and(|r| {
         r.flatten()

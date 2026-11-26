@@ -3,7 +3,7 @@
 State of the project for whoever picks it up next. User-facing documentation is in
 [README.md](README.md); this file covers status, decisions and open work.
 
-*Last updated: 2026-11-24, version 0.5.0 in progress (0.4.0 released: assistant, settings, message boxes, project behaviour). Next task: the multi-document editor, designed in [docs/multi-document-editor.md](docs/multi-document-editor.md), not started.*
+*Last updated: 2026-11-26, version 0.5.0 in progress (0.4.0 released: assistant, settings, message boxes, project behaviour). Next task: the multi-document editor, designed in [docs/multi-document-editor.md](docs/multi-document-editor.md), stage 1 done.*
 
 ## Status
 
@@ -31,7 +31,7 @@ drafts the GitHub release (see `.github/workflows/release.yml`).
 | 0.5.0 (in progress) | Projects screen (nothing else shown without a project); assistant draws new circuits with real wires and can add sine sources; no circuit open until one is opened; a central area that never collapses; closable schematic tab. See "0.5.0" below |
 | 0.4.0 | Settings dialog; Assistant (Ollama or Claude); pop-out instruments; text size; every confirmation a message box; Code panel tabs; project behaviour changes. See "0.4.0" below |
 
-Health at handoff: `cargo test --workspace` 426 passed, 0 failed (1 ignored: an emulator speed
+Health at handoff: `cargo test --workspace` 441 passed, 0 failed (1 ignored: an emulator speed
 benchmark); `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --check`
 clean. Toolchain: Rust 1.99 (edition 2024, MSRV 1.90), Windows 11.
 
@@ -323,10 +323,27 @@ workspace from being dragged into windows. The schematic tab has a close button;
 the tab's right-click Close come through `TabViewer::on_close`, which asks to close the circuit
 (`Pending::CloseCircuit`, with the unsaved-changes question). File > Close circuit, Ctrl+W.
 
+**Demo programs are files** (`dunbrec-mcu/demos/*.asm` and `*.ino`, listed in `demos.rs`).
+Choosing one in a chip's properties (`Properties::demo`, then `DunbrecApp::use_demo` and
+`OpenCircuit::add_demo`) writes a new file beside the circuit with `project::new_source_copy`
+(never overwrites), points the chip at it, lists it in the project, opens the Code panel and, for
+a sketch, starts a build. The compiled-in `builtin:` programs (`programs.rs`) remain for new
+chips, the examples and older circuits; *Edit code* on such a chip makes a copy. Keep a demo's
+two sources and its compiled-in program behaving alike (tests in `demos.rs`).
+
+**Speed "Auto"** (`Bench::run_speed`) is real time for a circuit with a microcontroller while the
+oscilloscope and logic analyser are closed, otherwise four scope screens per second (which made
+the demos look dead: blink changed every 12 s). `sync_speed` tells a running simulation.
+
 **Still single-document.** One circuit at a time. The next task is the multi-document editor: see
 [docs/multi-document-editor.md](docs/multi-document-editor.md) (an `OpenCircuit` struct per open
-circuit, tabs per circuit and per source file, one simulation at a time; three proposed decisions
-await the user's confirmation).
+circuit; two rows of tabs, circuits above the active circuit's schematic and source files; code is
+tied to the microcontroller that runs it, shared between chips of one circuit but never between
+circuits; only the active circuit simulates; one unsaved-changes prompt for all). Decisions agreed 2026-11-26; the stage 0 trial showed the two rows work in egui_dock
+(findings in the design). Stage 1 is done: per-circuit state is in `OpenCircuit`
+(`open_circuit.rs`), still exactly one circuit. The demo copies and the speed change have been
+tested headlessly, not yet tried by hand. Next:
+stage 2, several circuit tabs.
 
 ## Gotchas
 

@@ -76,7 +76,9 @@ unconnected pins, missing models), and the DC operating point is recalculated af
 with each node's voltage shown on the schematic.
 
 **Simulating.** Press ▶ Run (or Space) for a live time-domain simulation paced to the clock;
-the Speed box sets how much simulated time passes per second. Open instruments from the
+the Speed box sets how much simulated time passes per second. On *Auto* a circuit with a
+microcontroller runs in real time while the oscilloscope and logic analyser are closed;
+otherwise Auto passes about four oscilloscope screens a second. Open instruments from the
 toolbar or the Instruments menu, click an input's 🔌 Probe button, then click a wire or pin
 (or a part, for current). Edits while running take effect at once: double-click a switch to
 flip it (hold a push button to press it), drag a potentiometer's wiper, use the function generator, change a value. Changing the
@@ -133,9 +135,17 @@ In the Arduino IDE use *Sketch → Export Compiled Binary* and pick the `.hex` f
 `with_bootloader` one) in the part's properties; relative paths are relative to the schematic,
 and the file is reloaded each time the simulation starts, so rebuild and press Run again. Pins
 meet the circuit like the real chip: outputs drive through about 25 Ω, pull-ups are 35 kΩ,
-inputs switch at 3.0 V rising and 1.5 V falling, and the ADC samples the net's voltage. Built-in
-demo programs (`blink`, `fade`, `pot-pwm-serial`) need no toolchain; try File → Open example →
-Arduino blink, Arduino PWM fade, or Arduino pot, PWM and serial.
+inputs switch at 3.0 V rising and 1.5 V falling, and the ADC samples the net's voltage.
+
+**Demo programs.** `blink`, `fade` and `pot-pwm-serial` come in AVR assembly and as Arduino
+sketches. Pick one under *Demo* in a microcontroller's properties and Dunbrec makes your own copy,
+a file beside the circuit (`blink.ino`, `blink.asm`, then `blink2…`, never over an existing
+file), lists it in the project, points the chip at it and opens it in the Code panel. The pin and
+timing settings are at the top of each file. Assembly is built when you press Run; a sketch is
+built when you make it, and after a change you press **Build**. A new chip, and the example
+circuits (File → Open example → Arduino blink, Arduino PWM fade, or Arduino pot, PWM and serial),
+run a copy built into Dunbrec, which needs no toolchain and has no file: *Edit code* on the chip
+makes one.
 
 **Debugging firmware.** Instruments → *MCU debugger* opens a floating window for the
 microcontrollers in the circuit. It lists the firmware as assembly (registers and I/O by name,
