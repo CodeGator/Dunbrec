@@ -8,8 +8,8 @@ high level, one line on what it is written in, no steps and no other technical d
 **no user guide**, by the user's decision: the project is too young and changes too much to keep
 one up to date.
 
-*Last updated: 2026-11-26, version 0.6.0 in progress: the first three LED displays (single LED,
-10-segment bar, one-digit 7-segment), and every chip's program is now a visible source file.
+*Last updated: 2026-11-26, version 0.6.0 in progress: four LED displays (single LED, 10-segment
+bar, one- and four-digit 7-segment), and every chip's program is now a visible source file.
 Version 0.5.0 is released and published. Start at "0.6.0" below.*
 
 ## Status
@@ -44,7 +44,7 @@ the draft is a separate step, done when the user asks (`gh release edit v<versio
 | 0.5.0 | Projects screen (nothing else shown without a project); assistant draws new circuits with real wires and can add sine sources; no circuit open until one is opened; a central area that never collapses; closable schematic tab. See "0.5.0" below |
 | 0.4.0 | Settings dialog; Assistant (Ollama or Claude); pop-out instruments; text size; every confirmation a message box; Code panel tabs; project behaviour changes. See "0.4.0" below |
 
-Health at handoff: `cargo test --workspace` 531 passed, 0 failed (2 ignored: a real Recycle Bin check and an
+Health at handoff: `cargo test --workspace` 536 passed, 0 failed (2 ignored: a real Recycle Bin check and an
 emulator speed
 benchmark); `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --check`
 clean. Toolchain: Rust 1.99 (edition 2024, MSRV 1.90), Windows 11.
@@ -429,10 +429,11 @@ the demos look dead: blink changed every 12 s). `sync_speed` tells a running sim
 
 ## 0.6.0 (in progress)
 
-**Where things stand.** Four pieces are committed, each tried by the user, who is happy with
-them: the single LED, the source-file changes below, the bar display and the one-digit 7-segment
-display. The branch is still only on this computer. Next in the agreed plan is the four-digit
-7-segment.
+**Where things stand.** All committed, and each piece tried by the user, who is happy with it:
+the single LED, the source-file changes below, the bar display, the one- and four-digit 7-segment
+displays, and the faster LED calculation. The branch is still only on this computer. Next in the
+agreed plan is the 14 or 16 segment display; which of the two has not been agreed (14 is
+recommended).
 
 **What a chip runs is always a file the user can see** (the user found it confusing that a demo
 ran with no source file; the table of changes was agreed).
@@ -455,7 +456,7 @@ ran with no source file; the table of changes was agreed).
 **LED displays** (asked for by the user; plan agreed 2026-11-26). Build in this order, letting the
 user try each: (1) single LED, *done*; (2) 10-segment bar display, each LED with its own two
 pins, *done*; (3) one-digit 7-segment with decimal point,
-common cathode or common anode, *done*; (4) four-digit 7-segment sharing its segment pins;
+common cathode or common anode, *done*; (4) four-digit 7-segment sharing its segment pins, *done*;
 (5) 14 or 16 segment.
 
 - *Electrically real* (the user's choice over a logic indicator): needs a series resistor, shines by
@@ -489,8 +490,32 @@ common cathode or common anode, *done*; (4) four-digit 7-segment sharing its seg
   `CommonPin`, also switchable in the properties. Mirroring moves the pins to the other sides but
   leaves the digit the right way round (so its outlines are drawn by the canvas, not held in the
   symbol); rotating turns the digit, as it would a real part.
+- *Four digits:* `ComponentKind::FourDigit { colour, common }`, pins `a`-`g` and `dp` on the left,
+  `D1`-`D4` below their digits. LEDs are numbered eight to a digit (`digit_count`), named `1a` to
+  `4dp`. Mirroring keeps the digits reading left to right, so `D1` is then under the last one.
 - `pins()` returns static lists, so each variant (common cathode or anode, digit count) needs its
   own.
+- *LEDs solve for their own series resistance* (`Diode::folded`, LEDs only; other diodes keep
+  the internal node), so an LED adds no unknown. Tests in `parts_tests.rs` compare it with the
+  same model as an ordinary diode. This was the first speed step, agreed with the user.
+- **Speed** (the user tried a seconds counter on the four-digit display on 2026-11-26 and finds
+  it fine as it is; do not take it further unasked). Benchmark: a chip multiplexing the four-digit display through
+  eight resistors and four transistors, a digit every 3.8 ms, release build; the chip alone runs
+  about 4.8 times real time. Simulated speed as a fraction of real time:
+
+  | Largest step | Before folding | After |
+  |---|---|---|
+  | 40 µs (the default 1 ms/div time base, which counts even with the scope closed) | 0.30 | 0.46 |
+  | 1 ms | 0.43 | 0.68 |
+
+  That counter, with a digit every 5 ms, ran at 0.57 with no screen drawing. About 85 % of the time was in `solve_linearised` before folding, with a
+  normal 2 to 5 Newton iterations, so it is the cost per solve. The matrix is mostly zeros, but
+  skipping them inside `DenseLu` gained nothing and was not kept, and there are no subnormal
+  numbers. Ideas, not tried, should speed come up again: a sparse solver behind `LinearSolver`
+  that reuses its elimination order; a longer largest step for a chip circuit while no instrument
+  is open. The benchmark was temporary and is not in the repo.
+- *Text fault, not fixed:* the CD4066 hint in `properties.rs` and the context size hint in
+  `settings_ui.rs` hold long runs of spaces mid-sentence (a lost line continuation).
 
 ## Gotchas
 

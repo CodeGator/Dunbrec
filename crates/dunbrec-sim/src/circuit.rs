@@ -724,7 +724,7 @@ pub(crate) fn make_device(e: &Element, models: &ModelLibrary) -> Result<Box<dyn 
         }
         ComponentKind::Led { colour } => {
             let p = DiodeParams::from_model(&colour.model());
-            Box::new(Diode::new(name, node(0), node(1), p))
+            Box::new(Diode::new(name, node(0), node(1), p).folded())
         }
         kind @ (ComponentKind::LedBar { .. }
         | ComponentKind::SevenSegment { .. }

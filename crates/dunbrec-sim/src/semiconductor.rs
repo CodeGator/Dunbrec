@@ -315,8 +315,12 @@ pub struct Diode {
     pub name: String,
     pub anode: NodeId,
     pub cathode: NodeId,
-    /// Anode side of the junction: an internal node when RS > 0.
+    /// Anode side of the junction: an internal node when RS > 0, unless the
+    /// resistance is folded into the device.
     anode_int: NodeId,
+    /// RS is solved for inside the device, which then needs no internal node
+    /// (see [`Diode::folded`]).
+    folded: bool,
     p: DiodeParams,
     nvt: f64,
     vcrit: f64,
@@ -336,6 +340,7 @@ impl Diode {
             anode,
             cathode,
             anode_int: anode,
+            folded: false,
             vcrit: vcrit(p.is, nvt),
             nvt,
             bv_eff,
@@ -344,6 +349,45 @@ impl Diode {
             limited: Cell::new(false),
             charge: ChargeStore::default(),
         }
+    }
+
+    /// Solve for the series resistance inside the device instead of giving
+    /// the circuit an internal node for it: the same curve, with one unknown
+    /// fewer. A display's many LEDs make that matter. Only for a diode that
+    /// stores no charge and has no breakdown; any other is left as it was.
+    pub fn folded(mut self) -> Self {
+        self.folded = self.p.rs > 0.0 && !self.p.has_charge() && self.bv_eff.is_none();
+        self
+    }
+
+    /// The junction voltage of a folded diode with `v` across its terminals:
+    /// the root of `vj + RS·I(vj) = v`.
+    fn junction_behind_resistor(&self, v: f64) -> f64 {
+        let rs = self.p.rs;
+        // Forwards the left side is convex and rising, so Newton comes down
+        // to the root from above without overshooting. Both the whole voltage
+        // and the voltage at which the junction alone would pass `v / RS` are
+        // above it.
+        let mut vj = if v > 0.0 {
+            v.min(self.nvt * (v / (rs * self.p.is)).ln_1p())
+        } else {
+            v
+        };
+        for _ in 0..100 {
+            let (i, g) = self.eval(vj);
+            let step = (vj + rs * i - v) / (1.0 + rs * g);
+            vj -= step;
+            if step.abs() <= 1e-12 {
+                break;
+            }
+        }
+        vj
+    }
+
+    /// Current and conductance of a folded diode, seen from its terminals.
+    fn eval_folded(&self, v: f64) -> (f64, f64) {
+        let (i, g) = self.eval(self.junction_behind_resistor(v));
+        (i, g / (1.0 + g * self.p.rs))
     }
 
     /// Junction current and conductance at junction voltage `vd`.
@@ -399,6 +443,11 @@ impl Device for Diode {
         &self.name
     }
     fn stamp_ac(&self, s: &mut AcStamper, ctx: &AcContext) {
+        if self.folded {
+            let (_, g) = self.eval_folded(self.junction(&ctx.op));
+            s.conductance(self.anode, self.cathode, g);
+            return;
+        }
         if self.p.rs > 0.0 {
             s.conductance(self.anode, self.anode_int, 1.0 / self.p.rs);
         }
@@ -408,7 +457,7 @@ impl Device for Diode {
         s.admittance(self.anode_int, self.cathode, C64::new(gd, ctx.omega * c));
     }
     fn internal_nodes(&self) -> Vec<String> {
-        if self.p.rs > 0.0 {
+        if self.p.rs > 0.0 && !self.folded {
             vec!["a".into()]
         } else {
             Vec::new()
@@ -427,6 +476,16 @@ impl Device for Diode {
         self.v_last.set(None);
     }
     fn stamp(&self, s: &mut Stamper, ctx: &StampContext) {
+        if self.folded {
+            // The resistance keeps the current from growing exponentially
+            // with the terminal voltage, so no step needs limiting.
+            let (a, k) = (self.anode, self.cathode);
+            let v = s.iterate_voltage(a) - s.iterate_voltage(k);
+            let (i, g) = self.eval_folded(v);
+            s.conductance(a, k, g);
+            s.current(a, k, i - g * v);
+            return;
+        }
         if self.p.rs > 0.0 {
             s.conductance(self.anode, self.anode_int, 1.0 / self.p.rs);
         }
@@ -459,6 +518,9 @@ impl Device for Diode {
     }
     /// Junction current plus charging current, into the anode.
     fn current(&self, sol: &SolutionView) -> f64 {
+        if self.folded {
+            return self.eval_folded(self.junction(sol)).0;
+        }
         self.eval(self.junction(sol)).0 + self.charge.i_prev
     }
     fn ringing(&self) -> bool {

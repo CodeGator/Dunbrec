@@ -470,6 +470,123 @@ fn only_the_digit_whose_common_pin_is_selected_lights() {
     }
 }
 
+/// An LED solves for its series resistance itself. A diode with the same
+/// model, which has an internal node for it, must agree in every circuit.
+#[test]
+fn an_led_matches_the_same_diode_with_an_internal_node() {
+    use dunbrec_core::LedColour;
+    // The currents through two in series, fed from `source` through `ohms`.
+    let currents = |part: K, model: &ModelLibrary, source: K, ohms: f64| {
+        let netlist = NetlistBuilder::new()
+            .element("S1", source, &["s", "0"])
+            .element("R1", K::Resistor { resistance: ohms }, &["s", "a"])
+            .element("D1", part.clone(), &["a", "b"])
+            .element("D2", part, &["b", "0"])
+            .build();
+        let circuit = Circuit::from_netlist(&netlist, model).unwrap();
+        let op = operating_point(&circuit).unwrap();
+        (
+            op.current("D1").unwrap(),
+            op.voltage_by_name("a").unwrap(),
+            circuit.node_count(),
+        )
+    };
+    for colour in LedColour::ALL {
+        let mut lib = ModelLibrary::new();
+        lib.insert(colour.model());
+        let diode = K::Diode {
+            model: colour.model().name,
+        };
+        let voltage = |v: f64| K::VoltageSource { waveform: dc(v) };
+        // Current out of the source's first pin, into the LEDs.
+        let current = |i: f64| K::CurrentSource { waveform: dc(-i) };
+        let mut cases = Vec::new();
+        for v in [-20.0, -5.0, -0.1, 0.0, 0.5, 3.0, 4.0, 5.0, 9.0, 100.0] {
+            cases.extend([1e-3, 220.0, 1e5].map(|ohms| (voltage(v), ohms)));
+        }
+        cases.extend([1e-9, 1e-6, 0.01, 0.5, 5.0].map(|i| (current(i), 10.0)));
+        for (source, ohms) in cases {
+            let led = currents(K::Led { colour }, &lib, source.clone(), ohms);
+            let plain = currents(diode.clone(), &lib, source.clone(), ohms);
+            let close = |a: f64, b: f64, floor: f64| (a - b).abs() <= 1e-5 * b.abs() + floor;
+            assert!(
+                close(led.0, plain.0, 1e-10) && close(led.1, plain.1, 1e-4),
+                "{colour:?} {source:?} {ohms}: {led:?} against {plain:?}"
+            );
+            // Two nodes fewer, one for each of the pair.
+            assert_eq!(led.2 + 2, plain.2);
+        }
+    }
+}
+
+/// Through a whole alternating cycle, the same agreement while running.
+#[test]
+fn a_running_led_follows_an_alternating_supply() {
+    use dunbrec_core::LedColour;
+    let colour = LedColour::Blue;
+    let mut lib = ModelLibrary::new();
+    lib.insert(colour.model());
+    let run = |part: K| {
+        let waveform = Waveform::Sine {
+            offset: 0.0,
+            amplitude: 6.0,
+            frequency: 1e3,
+            delay: 0.0,
+            damping: 0.0,
+            phase: 0.0,
+        };
+        let netlist = NetlistBuilder::new()
+            .element("V1", K::VoltageSource { waveform }, &["s", "0"])
+            .element("R1", K::Resistor { resistance: 150.0 }, &["s", "a"])
+            .element("D1", part, &["a", "0"])
+            .build();
+        let circuit = Circuit::from_netlist(&netlist, &lib).unwrap();
+        let mut options = TransientOptions::new(1e-3);
+        options.max_step = Some(5e-6);
+        let mut sim = Transient::new(circuit, options).unwrap();
+        // The current at the first step past each twentieth of the cycle,
+        // and the supply then.
+        let mut seen = Vec::new();
+        while let Some(step) = sim.step().unwrap() {
+            let sample = step.sample;
+            if sample.time >= seen.len() as f64 * 5e-5 {
+                let supply = 6.0 * (std::f64::consts::TAU * 1e3 * sample.time).sin();
+                seen.push((supply, sample.currents[2]));
+            }
+        }
+        seen
+    };
+    let led = run(K::Led { colour });
+    assert!(led.iter().any(|&(_, i)| i > 0.01) && led.iter().any(|&(_, i)| i.abs() < 1e-9));
+    // Each current is what the diode with an internal node passes from the
+    // same supply held steady.
+    for (supply, i) in led {
+        let netlist = NetlistBuilder::new()
+            .element(
+                "V1",
+                K::VoltageSource {
+                    waveform: dc(supply),
+                },
+                &["s", "0"],
+            )
+            .element("R1", K::Resistor { resistance: 150.0 }, &["s", "a"])
+            .element(
+                "D1",
+                K::Diode {
+                    model: colour.model().name,
+                },
+                &["a", "0"],
+            )
+            .build();
+        let circuit = Circuit::from_netlist(&netlist, &lib).unwrap();
+        let steady = operating_point(&circuit).unwrap().current("D1").unwrap();
+        assert!(
+            (i - steady).abs() <= 1e-4 * steady.abs() + 1e-9,
+            "{supply} V: {i} against {steady}"
+        );
+    }
+}
+
 #[test]
 fn each_colour_of_led_drops_its_own_voltage() {
     use dunbrec_core::LedColour;
