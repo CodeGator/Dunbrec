@@ -239,7 +239,7 @@ pub fn node_tag_positions(s: &Schematic, netlist: &Netlist) -> Vec<TagPlace> {
             },
         ));
     }
-    let unused = netlist.unused_io_nets();
+    let unused = netlist.unused_nets();
     let mut out: Vec<TagPlace> = best
         .into_values()
         .map(|(_, place)| place)
@@ -952,7 +952,7 @@ pub fn value_text(kind: &ComponentKind) -> String {
         | ComponentKind::LogicLed => String::new(),
         ComponentKind::Clock { frequency, .. } => format_value(*frequency, "Hz"),
         ComponentKind::LogicSwitch { high } => (if *high { "high" } else { "low" }).into(),
-        ComponentKind::Led { colour } => colour.name().into(),
+        ComponentKind::Led { colour } | ComponentKind::LedBar { colour } => colour.name().into(),
         ComponentKind::Mcu { firmware, .. } => firmware_label(firmware),
         ComponentKind::OpAmp { part } => part.clone(),
         ComponentKind::Timer555 => "NE555".into(),
@@ -987,6 +987,38 @@ impl Painter<'_> {
 
     fn stroke_width(&self) -> f32 {
         (self.camera.scale * 0.12).clamp(1.0, 3.0)
+    }
+
+    /// A bar display's colours, drawn behind its symbol: each bar pale when
+    /// off, and filled with a glow around it as bright as its current.
+    fn bar_light(&self, c: &dunbrec_core::Component, light: Color32, currents: &[f64]) {
+        let at = |x: f32, y: f32| self.screen(symbols::to_schematic(c, pos2(x, y)));
+        let block = |area: Rect, colour: Color32| {
+            let corners = [
+                area.left_top(),
+                area.right_top(),
+                area.right_bottom(),
+                area.left_bottom(),
+            ];
+            let corners = corners.iter().map(|p| at(p.x, p.y)).collect();
+            self.painter
+                .add(Shape::convex_polygon(corners, colour, Stroke::NONE));
+        };
+        let segments = c.kind.led_segments().map_or(0, |s| s.1.len());
+        let brightness: Vec<f32> = (0..segments)
+            .map(|k| leds::brightness(currents.get(k).copied().unwrap_or(0.0)))
+            .collect();
+        // Every glow first, so that none lies over a neighbouring bar.
+        for (k, &b) in brightness.iter().enumerate() {
+            if b > 0.0 {
+                let glow = symbols::bar_segment(k).expand(0.35);
+                block(glow, light.gamma_multiply(0.35 * b));
+            }
+        }
+        for (k, &b) in brightness.iter().enumerate() {
+            let fill = light.gamma_multiply(0.22 + 0.78 * b);
+            block(symbols::bar_segment(k), fill);
+        }
     }
 
     /// An LED's colour, drawn behind its symbol: a pale filling when it is
@@ -1122,8 +1154,10 @@ fn label_cursor(painter: &egui::Painter, at: Pos2, fill: Color32, ink: Color32) 
 }
 
 /// The warning over an LED carrying more than it should, ending above `at`.
-fn too_much_current(painter: &egui::Painter, at: Pos2, current: f64) {
-    let text = format!("⚠ {} - too much", format_value(current, "A"));
+/// `segment` says which LED of a display it is.
+fn too_much_current(painter: &egui::Painter, at: Pos2, segment: Option<usize>, current: f64) {
+    let which = segment.map_or(String::new(), |k| format!("LED {}: ", k + 1));
+    let text = format!("⚠ {which}{} - too much", format_value(current, "A"));
     let text = painter.layout_no_wrap(text, FontId::proportional(14.0), Color32::WHITE);
     let corner = at - vec2(text.size().x / 2.0, text.size().y + 3.0);
     let behind = Rect::from_min_size(corner, text.size()).expand(3.0);
@@ -1542,9 +1576,13 @@ impl Canvas {
             } else {
                 colors.symbol
             };
+            let currents = lights.leds.get(&c.id).map_or(&[][..], Vec::as_slice);
             if let ComponentKind::Led { colour } = c.kind {
-                let current = lights.leds.get(&c.id).copied().unwrap_or(0.0);
+                let current = currents.first().copied().unwrap_or(0.0);
                 p.led_light(c, leds::light(colour), leds::brightness(current));
+            }
+            if let Some((colour, _)) = c.kind.led_segments() {
+                p.bar_light(c, leds::light(colour), currents);
             }
             p.component(
                 c,
@@ -1627,14 +1665,24 @@ impl Canvas {
             painter.galley(at, galley, colors.annotation_fg);
         }
 
-        // Over everything else drawn: the LEDs with too much current.
+        // Over everything else drawn: the LEDs with too much current. A
+        // display is warned about once, for its worst LED.
         for c in &s.components {
-            if let Some(&current) = lights.leds.get(&c.id)
+            let currents = lights.leds.get(&c.id).into_iter().flatten().copied();
+            let worst = currents.enumerate().max_by(|a, b| a.1.total_cmp(&b.1));
+            if let Some((segment, current)) = worst
                 && current > leds::MOST_CURRENT
             {
+                let display = c.kind.led_segments().is_some();
                 let centre = p.screen(symbols::to_schematic(c, pos2(0.0, 0.0)));
-                let above = centre - vec2(0.0, self.camera.scale * 2.6);
-                too_much_current(&painter, above, current);
+                // Clear of the part, however it is turned.
+                let rise = if display {
+                    c.position.y as f32 - symbols::bounds(c).top() + 0.3
+                } else {
+                    2.6
+                };
+                let above = centre - vec2(0.0, self.camera.scale * rise);
+                too_much_current(&painter, above, display.then_some(segment), current);
             }
         }
 
@@ -2852,7 +2900,7 @@ mod tests {
         // How solidly its triangle is filled, how many glows surround it, and
         // the warning if there is one.
         let seen = |rig: &mut Rig, current: Option<f64>| {
-            rig.lights.leds = current.into_iter().map(|i| (id, i)).collect();
+            rig.lights.leds = current.into_iter().map(|i| (id, vec![i])).collect();
             rig.hold(NO_KEY);
             let greenish = |c: Color32| c.a() > 0 && c.g() > c.r() && c.g() > c.b();
             let mut fill = None;
@@ -2883,6 +2931,51 @@ mod tests {
         assert!(off < faint && faint < full, "{off} {faint} {full}");
         let (.., warning) = seen(&mut rig, Some(0.045));
         assert_eq!(warning.as_deref(), Some("⚠ 45 mA - too much"));
+    }
+
+    #[test]
+    fn a_bar_display_lights_each_bar_by_itself_and_names_the_worst() {
+        let mut s = Schematic::new();
+        let colour = dunbrec_core::LedColour::Green;
+        let id = s.add_component(ComponentKind::LedBar { colour }, Point::new(10, 10));
+        let mut rig = Rig::new(s);
+        let green = leds::light(colour);
+        // How solidly each bar is filled, top first, how many glows there
+        // are, and the warning if there is one.
+        let seen = |rig: &mut Rig, currents: Vec<f64>| {
+            rig.lights.leds = [(id, currents)].into_iter().collect();
+            rig.hold(NO_KEY);
+            let greenish = |c: Color32| c.a() > 0 && c.g() > c.r() && c.g() > c.b();
+            let mut blocks = Vec::new();
+            let mut warning = None;
+            for shape in &rig.drawn {
+                match &shape.shape {
+                    egui::Shape::Path(p) if p.points.len() == 4 && greenish(p.fill) => {
+                        blocks.push(p.fill.a());
+                    }
+                    egui::Shape::Text(t) if t.galley.text().contains("too much") => {
+                        warning = Some(t.galley.text().to_string());
+                    }
+                    _ => {}
+                }
+            }
+            // The glows are drawn first, then the ten bars.
+            let glows = blocks.len() - 10;
+            (blocks.split_off(glows), glows, warning)
+        };
+        let (off, glows, warning) = seen(&mut rig, Vec::new());
+        assert_eq!((glows, warning), (0, None));
+        assert!(off.iter().all(|&a| a < green.a() / 2), "{off:?}");
+
+        let mut currents = vec![0.0; 10];
+        (currents[1], currents[6]) = (0.002, 0.020);
+        let (bars, glows, warning) = seen(&mut rig, currents.clone());
+        assert_eq!((glows, warning), (2, None));
+        assert!(off[0] == bars[0] && bars[0] < bars[1] && bars[1] < bars[6]);
+
+        (currents[2], currents[8]) = (0.035, 0.050);
+        let (.., warning) = seen(&mut rig, currents);
+        assert_eq!(warning.as_deref(), Some("⚠ LED 9: 50 mA - too much"));
     }
 
     #[test]

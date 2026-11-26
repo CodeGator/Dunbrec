@@ -1,6 +1,6 @@
 //! Builds the simulator's view of a circuit from a [`Netlist`].
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 
 use dunbrec_core::{ComponentKind, Element, ModelLibrary, Netlist, NodeId, Polarity, Severity};
 
@@ -14,7 +14,7 @@ use crate::error::{SimError, SimWarning};
 use crate::linalg::{DenseMatrix, LinearSolver};
 use crate::macromodel::{
     CD4066_EDGE, CD4066_R_OFF, Composite, TIMER555_EDGE, TIMER555_PORTS, TIMER555_R_OFF,
-    TIMER555_R_ON, cd4066, opamp, timer555,
+    TIMER555_R_ON, cd4066, led_display, opamp, timer555,
 };
 use crate::mcu::{McuPin, McuSpec};
 use crate::semiconductor::{Bjt, BjtParams, Diode, DiodeParams, Mosfet, MosfetParams};
@@ -190,7 +190,7 @@ impl Circuit {
             firmware_dir: None,
             sources: netlist.sources.clone(),
         };
-        circuit.check_topology()?;
+        circuit.check_topology(&netlist.unused_nets())?;
         Ok(circuit)
     }
 
@@ -296,7 +296,10 @@ impl Circuit {
         }
     }
 
-    fn check_topology(&mut self) -> Result<(), SimError> {
+    /// Fail on circuits with no solution, and tie down nodes with no DC path
+    /// to ground, saying so unless nothing was meant to be joined to them
+    /// (`unused`).
+    fn check_topology(&mut self, unused: &HashSet<NodeId>) -> Result<(), SimError> {
         let n = self.node_count();
 
         // Voltage loops: adding a voltage constraint between two nodes that
@@ -345,12 +348,27 @@ impl Circuit {
         // Otherwise (e.g. nodes between series capacitors) tie them to
         // ground with a very large resistor, as SPICE's rshunt option does.
         self.shunted = floating.iter().map(|&i| NodeId(i)).collect();
-        self.warnings.push(SimWarning::FloatingNodes {
-            nodes: floating
-                .iter()
-                .map(|&i| self.node_names[i].clone())
-                .collect(),
-        });
+        // Nothing is said of a group of nodes that holds only unused pins,
+        // and the internal nodes between them.
+        let (mut quiet, mut used) = (HashSet::new(), HashSet::new());
+        for &i in &floating {
+            if unused.contains(&NodeId(i)) {
+                quiet.insert(dsu.find(i));
+            } else if !self.node_names[i].contains('#') {
+                used.insert(dsu.find(i));
+            }
+        }
+        let nodes: Vec<String> = floating
+            .iter()
+            .filter(|&&i| {
+                let group = dsu.find(i);
+                used.contains(&group) || !quiet.contains(&group)
+            })
+            .map(|&i| self.node_names[i].clone())
+            .collect();
+        if !nodes.is_empty() {
+            self.warnings.push(SimWarning::FloatingNodes { nodes });
+        }
         Ok(())
     }
 }
@@ -697,6 +715,10 @@ pub(crate) fn make_device(e: &Element, models: &ModelLibrary) -> Result<Box<dyn 
         ComponentKind::Led { colour } => {
             let p = DiodeParams::from_model(&colour.model());
             Box::new(Diode::new(name, node(0), node(1), p))
+        }
+        kind @ ComponentKind::LedBar { .. } => {
+            let model = led_display(kind).expect("a display has LEDs");
+            Box::new(Composite::new(name, model, &e.nodes)?)
         }
         ComponentKind::Bjt { polarity, model } => {
             let p = BjtParams::from_model(lookup(e, models, model)?);

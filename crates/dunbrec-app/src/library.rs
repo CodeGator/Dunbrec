@@ -266,6 +266,13 @@ pub fn palette() -> &'static [PaletteEntry] {
             },
         },
         PaletteEntry {
+            name: "10-segment LED bar",
+            group: "Displays",
+            make: || ComponentKind::LedBar {
+                colour: dunbrec_core::LedColour::Red,
+            },
+        },
+        PaletteEntry {
             name: "741 op-amp",
             group: "Linear",
             make: || ComponentKind::OpAmp {
@@ -551,7 +558,10 @@ mod tests {
         let found = palette_groups("led");
         assert!(names(&found).contains(&"LED"));
         assert!(names(&found).contains(&"Logic LED"));
-        assert_eq!(names(&palette_groups("displays")), vec!["LED"]);
+        assert_eq!(
+            names(&palette_groups("displays")),
+            vec!["LED", "10-segment LED bar"]
+        );
     }
 
     #[test]

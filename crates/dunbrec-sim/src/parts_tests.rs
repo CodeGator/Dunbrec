@@ -5,7 +5,7 @@ use dunbrec_core::{
     ComponentKind as K, ModelLibrary, Netlist, NetlistBuilder, Polarity, Waveform, parts,
 };
 
-use crate::{DcSweeper, ac_analysis};
+use crate::{Circuit, DcSweeper, Transient, TransientOptions, ac_analysis, operating_point};
 
 fn library() -> ModelLibrary {
     let mut lib = ModelLibrary::new();
@@ -332,6 +332,61 @@ fn reverse_recovery_time(model: &str) -> f64 {
         .find(|p| p.1 > -1e-3)
         .expect("the reverse current never recovered");
     back.0 - edge
+}
+
+/// A bar display whose LED 3 is fed from 5 V through 220 ohms and LED 8
+/// through 1 kilohm, cathodes grounded; the other eight are not connected.
+fn two_lit_bars() -> Netlist {
+    let mut b = NetlistBuilder::new()
+        .element("V1", K::VoltageSource { waveform: dc(5.0) }, &["s", "0"])
+        .element("R1", K::Resistor { resistance: 220.0 }, &["s", "a3"])
+        .element("R2", K::Resistor { resistance: 1e3 }, &["s", "a8"]);
+    let nets: Vec<String> = (1..=10)
+        .map(|n| match n {
+            3 | 8 => format!("a{n}"),
+            _ => format!("unused_a{n}"),
+        })
+        .chain((1..=10).map(|n| match n {
+            3 | 8 => "0".to_string(),
+            _ => format!("unused_k{n}"),
+        }))
+        .collect();
+    let nets: Vec<&str> = nets.iter().map(String::as_str).collect();
+    let colour = dunbrec_core::LedColour::Red;
+    b.push("DS1", K::LedBar { colour }, &nets);
+    let mut netlist = b.build();
+    // Nets a drawing leaves unconnected carry no label.
+    for node in &mut netlist.nodes {
+        node.labelled = !node.name.starts_with("unused");
+    }
+    netlist
+}
+
+#[test]
+fn each_led_of_a_bar_display_carries_its_own_current() {
+    let netlist = two_lit_bars();
+    let circuit = Circuit::from_netlist(&netlist, &ModelLibrary::new()).unwrap();
+    let op = operating_point(&circuit).unwrap();
+    // Nothing is said about the LEDs left unconnected.
+    assert!(op.warnings.is_empty(), "{:?}", op.warnings);
+    let lit = |name: &str| op.current(name).unwrap();
+    assert!((0.012..0.016).contains(&lit("DS1.3")), "{}", lit("DS1.3"));
+    assert!((0.0025..0.0035).contains(&lit("DS1.8")), "{}", lit("DS1.8"));
+    for n in [1, 2, 4, 5, 6, 7, 9, 10] {
+        assert!(lit(&format!("DS1.{n}")).abs() < 1e-6, "LED {n}");
+    }
+    assert_eq!(op.current("DS1"), None);
+
+    // A running circuit reports the same, by segment.
+    let circuit = Circuit::from_netlist(&netlist, &ModelLibrary::new()).unwrap();
+    let mut sim = Transient::new(circuit, TransientOptions::new(1e-3)).unwrap();
+    sim.step().unwrap();
+    let sample = sim.sample();
+    let (element, currents) = &sample.lamps[0];
+    assert_eq!(netlist.elements[*element].designator, "DS1");
+    assert_eq!(currents.len(), 10);
+    assert!((currents[2] - lit("DS1.3")).abs() < 1e-5);
+    assert!((currents[7] - lit("DS1.8")).abs() < 1e-5);
 }
 
 #[test]

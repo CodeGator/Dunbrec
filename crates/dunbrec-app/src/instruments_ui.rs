@@ -178,6 +178,11 @@ impl Bench {
         self.logic.clear();
     }
 
+    /// True if the probe being connected takes a part, not a point.
+    pub fn wants_part(&self) -> bool {
+        self.active == ProbeSlot::MeterPlus && self.meter.mode.measures_current()
+    }
+
     /// Connect the active probe to what was clicked. Returns a message if
     /// the click did not land on something usable.
     pub fn connect(

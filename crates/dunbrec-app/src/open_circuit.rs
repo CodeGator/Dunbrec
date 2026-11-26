@@ -632,7 +632,7 @@ fn dc_table(s: &Schematic, netlist: &Netlist) -> Result<DcTable, String> {
                     place,
                 })
                 .collect();
-            let unused = netlist.unused_io_nets();
+            let unused = netlist.unused_nets();
             let voltages = (1..circuit.node_count())
                 .map(NodeId)
                 .filter(|n| !unused.contains(n))

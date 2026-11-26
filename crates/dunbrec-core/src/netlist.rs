@@ -12,7 +12,7 @@
 //! * labels with the same name are connected;
 //! * every ground symbol pin is node 0.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -115,23 +115,31 @@ impl Netlist {
             .any(|d| d.severity() == Severity::Error)
     }
 
-    /// Nets made of nothing but one unused microcontroller I/O pin (no
-    /// other pin, no label): not worth showing voltages for.
-    pub fn unused_io_nets(&self) -> std::collections::HashSet<NodeId> {
-        let mut pins: HashMap<NodeId, (usize, bool)> = HashMap::new();
+    /// Nets nothing was meant to be joined to, so not worth showing voltages
+    /// for or remarking on: an unused microcontroller I/O pin, and both pins
+    /// of an unused LED of a display (no other pin, no label).
+    pub fn unused_nets(&self) -> HashSet<NodeId> {
+        let mut pins: HashMap<NodeId, usize> = HashMap::new();
+        for &n in self.elements.iter().flat_map(|e| &e.nodes) {
+            *pins.entry(n).or_default() += 1;
+        }
+        let alone = |n: NodeId| !n.is_ground() && pins[&n] == 1 && !self.nodes[n.0].labelled;
+        let mut unused = HashSet::new();
         for e in &self.elements {
             for (pin, &n) in e.kind.pins().iter().zip(&e.nodes) {
-                let entry = pins.entry(n).or_default();
-                entry.0 += 1;
-                entry.1 |= pin.domain == crate::schematic::PinDomain::DigitalIo;
+                if pin.domain == crate::schematic::PinDomain::DigitalIo && alone(n) {
+                    unused.insert(n);
+                }
+            }
+            let segments = e.kind.led_segments().map_or(&[][..], |s| s.1);
+            for &(a, k) in segments {
+                let (a, k) = (e.nodes[a], e.nodes[k]);
+                if alone(a) && alone(k) {
+                    unused.extend([a, k]);
+                }
             }
         }
-        pins.into_iter()
-            .filter(|(n, (count, io))| {
-                *count == 1 && *io && !n.is_ground() && !self.nodes[n.0].labelled
-            })
-            .map(|(n, _)| n)
-            .collect()
+        unused
     }
 
     pub fn node_by_name(&self, name: &str) -> Option<NodeId> {
@@ -391,15 +399,23 @@ pub fn build_netlist(schematic: &Schematic) -> Netlist {
         }
     }
 
+    let mut netlist = Netlist {
+        nodes,
+        elements,
+        diagnostics: Vec::new(),
+        sources: schematic.sources.clone(),
+    };
+
     // Unconnected pins: a non-ground node touched by only one pin and not
-    // labelled (a labelled stub is intentional, e.g. a probe point).
-    // Microcontroller I/O pins are often left unused, like on a real board.
-    for e in &elements {
+    // labelled (a labelled stub is intentional, e.g. a probe point). Pins
+    // that are often left unused, as on a real board, are not remarked on.
+    let unused = netlist.unused_nets();
+    for e in &netlist.elements {
         for (pin, node) in e.kind.pins().iter().zip(&e.nodes) {
-            if pin.domain != crate::schematic::PinDomain::DigitalIo
+            if !unused.contains(node)
                 && !node.is_ground()
                 && pin_count_by_node[node] == 1
-                && !nodes[node.0].labelled
+                && !netlist.nodes[node.0].labelled
             {
                 diagnostics.push(Diagnostic::UnconnectedPin {
                     component: e.component,
@@ -410,7 +426,7 @@ pub fn build_netlist(schematic: &Schematic) -> Netlist {
     }
 
     // Model references.
-    for e in &elements {
+    for e in &netlist.elements {
         let Some(model_name) = e.kind.model_name() else {
             continue;
         };
@@ -451,7 +467,7 @@ pub fn build_netlist(schematic: &Schematic) -> Netlist {
 
     // Duplicate designators.
     let mut by_designator: BTreeMap<&str, Vec<ComponentId>> = BTreeMap::new();
-    for e in &elements {
+    for e in &netlist.elements {
         if !e.designator.is_empty() {
             by_designator
                 .entry(&e.designator)
@@ -468,12 +484,8 @@ pub fn build_netlist(schematic: &Schematic) -> Netlist {
         }
     }
 
-    Netlist {
-        nodes,
-        elements,
-        diagnostics,
-        sources: schematic.sources.clone(),
-    }
+    netlist.diagnostics = diagnostics;
+    netlist
 }
 
 #[cfg(test)]
@@ -508,6 +520,34 @@ mod tests {
         s.add_wire(Point::new(10, -2), Point::new(10, 2));
         s.add_wire(Point::new(0, 2), Point::new(10, 2)); // ground at (5,2) is a T-junction
         s
+    }
+
+    #[test]
+    fn only_a_half_connected_led_of_a_display_is_remarked_on() {
+        let mut s = Schematic::new();
+        let colour = crate::schematic::LedColour::Red;
+        let id = s.add_component(ComponentKind::LedBar { colour }, Point::new(0, 0));
+        // On its own: nothing to say about any of its twenty pins.
+        let n = build_netlist(&s);
+        let unconnected = |n: &Netlist| -> Vec<String> {
+            n.diagnostics
+                .iter()
+                .filter_map(|d| match d {
+                    Diagnostic::UnconnectedPin { component, pin } if *component == id => {
+                        Some(pin.clone())
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        assert!(unconnected(&n).is_empty(), "{:?}", n.diagnostics);
+        assert_eq!(n.unused_nets().len(), 20);
+
+        // LED 1's cathode grounded and its anode forgotten.
+        s.add_component(ComponentKind::Ground, Point::new(4, -9));
+        let n = build_netlist(&s);
+        assert_eq!(unconnected(&n), ["A1"]);
+        assert_eq!(n.unused_nets().len(), 18);
     }
 
     #[test]

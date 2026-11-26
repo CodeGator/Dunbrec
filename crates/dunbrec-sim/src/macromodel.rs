@@ -42,6 +42,9 @@ pub struct MacroModel {
     pub ports: &'static [&'static str],
     pub elements: Vec<MacroElement>,
     pub models: ModelLibrary,
+    /// How many of the elements, from the first, are the LEDs of a display,
+    /// whose currents are reported one by one.
+    pub lamps: usize,
 }
 
 impl MacroModel {
@@ -227,6 +230,7 @@ pub fn ua741() -> MacroModel {
         ports: &["in+", "in-", "V+", "V-", "out"],
         elements: e.0,
         models,
+        lamps: 0,
     }
 }
 
@@ -258,6 +262,7 @@ pub fn timer555() -> MacroModel {
         ports: TIMER555_PORTS,
         elements: e.0,
         models: ModelLibrary::new(),
+        lamps: 0,
     }
 }
 
@@ -282,8 +287,42 @@ pub fn cd4066() -> MacroModel {
         ports: CD4066_PORTS,
         elements: e.0,
         models: ModelLibrary::new(),
+        lamps: 0,
     }
 }
+
+/// Names of a display's LEDs within it, by segment.
+const LAMP_NAMES: [&str; 16] = [
+    "S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8", "S9", "S10", "S11", "S12", "S13", "S14", "S15",
+    "S16",
+];
+
+/// A display of several LEDs: one for each of the part's segments, between
+/// its two pins.
+pub fn led_display(kind: &ComponentKind) -> Option<MacroModel> {
+    let (colour, segments) = kind.led_segments()?;
+    let pins = kind.pins();
+    let mut e = Elements(Vec::new());
+    for (&(a, k), name) in segments.iter().zip(LAMP_NAMES) {
+        e.add(
+            name,
+            ComponentKind::Led { colour },
+            &[pins[a].name, pins[k].name],
+        );
+    }
+    Some(MacroModel {
+        ports: LED_BAR_PORTS,
+        elements: e.0,
+        models: ModelLibrary::new(),
+        lamps: segments.len(),
+    })
+}
+
+/// Pin names of the LED bar display, in pin order.
+const LED_BAR_PORTS: &[&str] = &[
+    "A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8", "A9", "A10", "K1", "K2", "K3", "K4", "K5",
+    "K6", "K7", "K8", "K9", "K10",
+];
 
 /// Pin names of the CD4066B, in package order.
 pub const CD4066_PORTS: &[&str] = &[
@@ -443,6 +482,12 @@ impl Device for Composite {
     /// A chip has no single current "through" it; reported as zero.
     fn current(&self, _sol: &SolutionView) -> f64 {
         0.0
+    }
+    fn lamp_currents(&self, sol: &SolutionView) -> Vec<f64> {
+        self.parts[..self.model.lamps]
+            .iter()
+            .map(|d| d.current(sol))
+            .collect()
     }
     fn begin_transient(&mut self, sol: &SolutionView, time: f64) {
         self.parts

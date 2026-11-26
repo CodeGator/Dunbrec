@@ -114,6 +114,9 @@ pub struct Sample {
     pub voltages: Vec<f64>,
     /// Current entering each device's first pin, in device order.
     pub currents: Vec<f64>,
+    /// For each display: its device index and the current through each of
+    /// its LEDs.
+    pub lamps: Vec<(usize, Vec<f64>)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -490,6 +493,14 @@ impl Transient {
                 .devices
                 .iter()
                 .map(|d| d.current(&sol))
+                .collect(),
+            lamps: self
+                .circuit
+                .devices
+                .iter()
+                .enumerate()
+                .map(|(i, d)| (i, d.lamp_currents(&sol)))
+                .filter(|(_, lamps)| !lamps.is_empty())
                 .collect(),
         }
     }

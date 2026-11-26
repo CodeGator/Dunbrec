@@ -212,6 +212,45 @@ const MCU: &[PinDef] = &[
 ];
 const LOGIC_LED: &[PinDef] = &[din("A", -3, 0)];
 
+/// LED bar pins: the anodes down the left side and the cathodes down the
+/// right, segment 1 at the top.
+const LED_BAR: &[PinDef] = &[
+    pin("A1", -4, -9),
+    pin("A2", -4, -7),
+    pin("A3", -4, -5),
+    pin("A4", -4, -3),
+    pin("A5", -4, -1),
+    pin("A6", -4, 1),
+    pin("A7", -4, 3),
+    pin("A8", -4, 5),
+    pin("A9", -4, 7),
+    pin("A10", -4, 9),
+    pin("K1", 4, -9),
+    pin("K2", 4, -7),
+    pin("K3", 4, -5),
+    pin("K4", 4, -3),
+    pin("K5", 4, -1),
+    pin("K6", 4, 1),
+    pin("K7", 4, 3),
+    pin("K8", 4, 5),
+    pin("K9", 4, 7),
+    pin("K10", 4, 9),
+];
+
+/// The anode and cathode pin of each LED of a bar display.
+const LED_BAR_SEGMENTS: &[(usize, usize)] = &[
+    (0, 10),
+    (1, 11),
+    (2, 12),
+    (3, 13),
+    (4, 14),
+    (5, 15),
+    (6, 16),
+    (7, 17),
+    (8, 18),
+    (9, 19),
+];
+
 /// Op-amp pins in SPICE subcircuit order (in+, in-, V+, V-, out). The
 /// inverting input is on top, as in most textbook drawings.
 const OPAMP: &[PinDef] = &[
@@ -640,6 +679,11 @@ pub enum ComponentKind {
     Led {
         colour: LedColour,
     },
+    /// A bar display of ten LEDs in one package, all one colour, each with
+    /// its own anode and cathode pins.
+    LedBar {
+        colour: LedColour,
+    },
 
     // ---- Microcontrollers ----
     /// ATmega328P (Arduino Uno/Nano) running firmware from `firmware`: the
@@ -777,6 +821,7 @@ impl ComponentKind {
             ComponentKind::Counter4 { .. } => COUNTER4,
             ComponentKind::Clock { .. } | ComponentKind::LogicSwitch { .. } => LOGIC_SOURCE,
             ComponentKind::LogicLed => LOGIC_LED,
+            ComponentKind::LedBar { .. } => LED_BAR,
             ComponentKind::Mcu { .. } => MCU,
             ComponentKind::OpAmp { .. } => OPAMP,
             ComponentKind::Timer555 => TIMER555,
@@ -813,6 +858,17 @@ impl ComponentKind {
             ComponentKind::Clock { .. } => "CLK",
             ComponentKind::LogicSwitch { .. } => "SW",
             ComponentKind::LogicLed | ComponentKind::Led { .. } => "LED",
+            ComponentKind::LedBar { .. } => "DS",
+        }
+    }
+
+    /// For a display made of several real LEDs: their colour, and the anode
+    /// and cathode pin of each, in order. Such a part has no single current
+    /// through it; each of its LEDs has its own.
+    pub fn led_segments(&self) -> Option<(LedColour, &'static [(usize, usize)])> {
+        match self {
+            ComponentKind::LedBar { colour } => Some((*colour, LED_BAR_SEGMENTS)),
+            _ => None,
         }
     }
 

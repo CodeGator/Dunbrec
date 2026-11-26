@@ -124,6 +124,12 @@ fn resistor_body(prims: &mut Vec<Prim>) {
 /// The corners of an LED's triangle, closed.
 pub const LED_BODY: [(f32, f32); 4] = [(-0.8, -0.8), (-0.8, 0.8), (0.8, 0.0), (-0.8, -0.8)];
 
+/// The lit area of LED `segment` (from 0) of a bar display.
+pub fn bar_segment(segment: usize) -> Rect {
+    let row = -9.0 + 2.0 * segment as f32;
+    Rect::from_min_max(pos2(-1.6, row - 0.6), pos2(1.6, row + 0.6))
+}
+
 fn source_circle(prims: &mut Vec<Prim>) {
     prims.push(Prim::Circle {
         center: pos2(0.0, 0.0),
@@ -337,6 +343,22 @@ pub fn symbol_styled(kind: &ComponentKind, zener: bool) -> Symbol {
                 p.push(arrow_head(from, to, 0.45));
             }
             label = pos2(0.0, 1.5);
+        }
+        ComponentKind::LedBar { .. } => {
+            p.push(rect(-3.0, -10.8, 3.0, 10.0));
+            const NUMBERS: [&str; 10] = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"];
+            for (k, number) in NUMBERS.into_iter().enumerate() {
+                let bar = bar_segment(k);
+                let y = bar.center().y;
+                p.push(line(&[(-4.0, y), (bar.left(), y)]));
+                p.push(line(&[(4.0, y), (bar.right(), y)]));
+                p.push(rect(bar.left(), bar.top(), bar.right(), bar.bottom()));
+                p.push(text(-2.35, y - 0.45, number, 0.6));
+            }
+            // Which side is which.
+            p.push(text(-2.3, -10.2, "A", 0.7));
+            p.push(text(2.3, -10.2, "K", 0.7));
+            label = pos2(0.0, 10.5);
         }
         ComponentKind::Bjt { polarity, .. } => {
             p.push(Prim::Circle {

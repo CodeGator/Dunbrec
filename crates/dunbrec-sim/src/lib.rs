@@ -41,7 +41,7 @@ pub mod waveform;
 
 pub use ac::{AcResult, ac_analysis, log_frequencies};
 pub use circuit::Circuit;
-pub use dc::{OperatingPoint, operating_point};
+pub use dc::{OperatingPoint, lamp_name, operating_point};
 pub use error::{SimError, SimWarning};
 pub use mcu::{HaltReason, McuHalt, McuInfo, SerialByte, load_firmware, unbuilt_sketch};
 pub use sweep::{DcSweeper, dc_sweep, linear_steps};

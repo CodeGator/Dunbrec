@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use dunbrec_core::{
     Diagnostic, Element, Netlist, NodeId, Schematic, SourceLanguage, units::format_value,
 };
-use dunbrec_sim::Sample;
+use dunbrec_sim::{Sample, lamp_name};
 use egui::{Color32, Key, KeyboardShortcut, Modifiers, RichText, ViewportCommand};
 use egui_dock::tab_viewer::OnCloseResponse;
 use egui_dock::{AllowedSplits, DockArea, DockState, TabViewer};
@@ -2094,9 +2094,9 @@ impl DunbrecApp {
             .collect()
     }
 
-    /// The current through each LED: from the running simulation, or from
+    /// The current through each LED, by part: from the running simulation, or from
     /// the DC operating point when stopped.
-    fn led_currents(&self) -> std::collections::HashMap<dunbrec_core::ComponentId, f64> {
+    fn led_currents(&self) -> std::collections::HashMap<dunbrec_core::ComponentId, Vec<f64>> {
         let current = self.active().doc.generation();
         match (&self.live, &self.active().dc) {
             (Some(_), _) if self.live_generation == current => self.led_meter.currents(),
@@ -2112,10 +2112,20 @@ impl DunbrecApp {
                 .1
                 .elements
                 .iter()
-                .filter(|e| matches!(e.kind, dunbrec_core::ComponentKind::Led { .. }))
                 .filter_map(|e| {
-                    let found = t.currents.iter().find(|(d, _)| *d == e.designator)?;
-                    Some((e.component, found.1))
+                    let find = |name: &str| {
+                        let found = t.currents.iter().find(|(d, _)| d == name)?;
+                        Some(found.1)
+                    };
+                    let currents = if matches!(e.kind, dunbrec_core::ComponentKind::Led { .. }) {
+                        vec![find(&e.designator)?]
+                    } else {
+                        let (_, segments) = e.kind.led_segments()?;
+                        (0..segments.len())
+                            .map(|k| find(&lamp_name(&e.designator, k)))
+                            .collect::<Option<_>>()?
+                    };
+                    Some((e.component, currents))
                 })
                 .collect(),
             _ => Default::default(),
@@ -2310,7 +2320,7 @@ impl DunbrecApp {
             match event {
                 Event::Samples(samples) => {
                     for s in samples {
-                        self.led_meter.add(s.time, &s.currents, self.live_speed);
+                        self.led_meter.add(&s, self.live_speed);
                         feed(&mut self.bench, &self.signals.1, &s);
                         self.latest = Some(s);
                     }
@@ -3537,15 +3547,13 @@ fn assistant_readings(
                 "The simulation is running; this is a snapshot at t = {}.",
                 format_value(sample.time, "s")
             );
-            let unused = netlist.unused_io_nets();
+            let unused = netlist.unused_nets();
             for (i, node) in netlist.nodes.iter().enumerate().skip(1) {
                 if let (false, Some(v)) = (unused.contains(&NodeId(i)), sample.voltages.get(i)) {
                     r.voltages.push((node.name.clone(), *v));
                 }
             }
-            for (e, i) in netlist.elements.iter().zip(&sample.currents) {
-                r.currents.push((e.designator.clone(), *i));
-            }
+            r.currents = live_currents(netlist, sample);
         }
         (
             _,
@@ -3564,6 +3572,24 @@ fn assistant_readings(
         _ => {}
     }
     r
+}
+
+/// The currents of a running circuit by name: each part's, or for a display
+/// that of each of its LEDs.
+fn live_currents(netlist: &Netlist, sample: &Sample) -> Vec<(String, f64)> {
+    let mut named = Vec::new();
+    for (index, (e, &i)) in netlist.elements.iter().zip(&sample.currents).enumerate() {
+        match sample.lamps.iter().find(|(element, _)| *element == index) {
+            Some((_, lamps)) => named.extend(
+                lamps
+                    .iter()
+                    .enumerate()
+                    .map(|(k, &i)| (lamp_name(&e.designator, k), i)),
+            ),
+            None => named.push((e.designator.clone(), i)),
+        }
+    }
+    named
 }
 
 /// Explain a netlist problem in a sentence.
@@ -3770,7 +3796,7 @@ fn values_ui(
             .id_salt("live")
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                let unused = netlist.unused_io_nets();
+                let unused = netlist.unused_nets();
                 egui::Grid::new("live_table").striped(true).show(ui, |ui| {
                     for (i, node) in netlist.nodes.iter().enumerate().skip(1) {
                         if unused.contains(&NodeId(i)) {
@@ -3782,9 +3808,9 @@ fn values_ui(
                             ui.end_row();
                         }
                     }
-                    for (e, i) in netlist.elements.iter().zip(&sample.currents) {
-                        ui.monospace(format!("I({})", e.designator));
-                        ui.monospace(format_value(*i, "A"));
+                    for (name, i) in live_currents(netlist, sample) {
+                        ui.monospace(format!("I({name})"));
+                        ui.monospace(format_value(i, "A"));
                         ui.end_row();
                     }
                 });
@@ -4295,7 +4321,18 @@ impl eframe::App for DunbrecApp {
                 .1
                 .node_at(s, &self.active().netlist.1, at)
                 .is_some();
-            self.probe_hint = self.bench.connect(at, part, on_net).err();
+            let display = part
+                .and_then(|id| s.component(id))
+                .is_some_and(|c| c.kind.led_segments().is_some());
+            self.probe_hint = if display && self.bench.wants_part() {
+                Some(
+                    "A display has no single current to measure: the current through each \
+                     of its LEDs is listed under Values."
+                        .into(),
+                )
+            } else {
+                self.bench.connect(at, part, on_net).err()
+            };
         }
         self.instrument_windows(ctx);
         self.sync_speed();
@@ -5871,7 +5908,7 @@ mod tests {
         });
         f.rig.settle();
         let led = led.unwrap();
-        let near = |i: Option<&f64>| i.is_some_and(|i| (0.012..0.016).contains(i));
+        let near = |i: Option<&Vec<f64>>| i.is_some_and(|i| (0.012..0.016).contains(&i[0]));
         let stopped = f.rig.app.led_currents();
         assert!(near(stopped.get(&led)), "{stopped:?}");
 
@@ -5895,7 +5932,7 @@ mod tests {
             .app
             .led_currents()
             .get(&led)
-            .is_none_or(|i| *i <= crate::leds::MOST_CURRENT)
+            .is_none_or(|i| i[0] <= crate::leds::MOST_CURRENT)
         {
             assert!(started.elapsed().as_secs() < 30, "the change never showed");
             std::thread::sleep(std::time::Duration::from_millis(20));

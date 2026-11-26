@@ -255,7 +255,7 @@ impl Properties {
                         r
                     }
                     ComponentKind::LogicLed => false,
-                    ComponentKind::Led { colour } => {
+                    ComponentKind::Led { colour } | ComponentKind::LedBar { colour } => {
                         ui.label("Colour");
                         let before = *colour;
                         egui::ComboBox::from_id_salt(("led", id))
@@ -887,6 +887,7 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
         ComponentKind::LogicSwitch { .. } => "Logic switch",
         ComponentKind::LogicLed => "Logic LED",
         ComponentKind::Led { .. } => "LED",
+        ComponentKind::LedBar { .. } => "LED bar display",
         ComponentKind::Mcu { .. } => "Microcontroller (ATmega328P)",
         ComponentKind::OpAmp { .. } => "Operational amplifier",
         ComponentKind::Timer555 => "555 timer",

@@ -8,6 +8,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use dunbrec_core::{ComponentId, ComponentKind, LedColour, Netlist};
+use dunbrec_sim::Sample;
 use egui::Color32;
 
 /// The current (A) at which an LED is drawn at full brightness.
@@ -27,8 +28,9 @@ const LONGEST_WINDOW: f64 = 0.040;
 pub struct Lights {
     /// Logic LEDs whose input is high.
     pub logic: HashSet<ComponentId>,
-    /// The current through each LED, forwards positive (A).
-    pub leds: HashMap<ComponentId, f64>,
+    /// The current through each LED part, forwards positive (A): one for a
+    /// single LED, one per segment for a display.
+    pub leds: HashMap<ComponentId, Vec<f64>>,
 }
 
 /// How brightly an LED carrying `current` shines, from 0 to 1. The eye sees
@@ -101,48 +103,73 @@ impl Trace {
     }
 }
 
+/// One LED being followed.
+#[derive(Debug)]
+struct Lamp {
+    /// Its part: the netlist element and component.
+    element: usize,
+    component: ComponentId,
+    /// Which LED of a display; `None` for a single LED.
+    segment: Option<usize>,
+    trace: Trace,
+}
+
 /// Follows the current of every LED of a running circuit.
 #[derive(Debug, Default)]
 pub struct LedMeter {
-    /// The netlist elements that are LEDs: index and part.
-    leds: Vec<(usize, ComponentId)>,
-    traces: Vec<Trace>,
+    /// The LEDs of each part together, in segment order.
+    lamps: Vec<Lamp>,
 }
 
 impl LedMeter {
     /// Start afresh for a circuit.
     pub fn new(netlist: &Netlist) -> Self {
-        let leds: Vec<(usize, ComponentId)> = netlist
-            .elements
-            .iter()
-            .enumerate()
-            .filter(|(_, e)| matches!(e.kind, ComponentKind::Led { .. }))
-            .map(|(i, e)| (i, e.component))
-            .collect();
-        let traces = leds.iter().map(|_| Trace::default()).collect();
-        Self { leds, traces }
+        let mut lamps = Vec::new();
+        for (element, e) in netlist.elements.iter().enumerate() {
+            let lamp = |segment| Lamp {
+                element,
+                component: e.component,
+                segment,
+                trace: Trace::default(),
+            };
+            if matches!(e.kind, ComponentKind::Led { .. }) {
+                lamps.push(lamp(None));
+            }
+            if let Some((_, segments)) = e.kind.led_segments() {
+                lamps.extend((0..segments.len()).map(|k| lamp(Some(k))));
+            }
+        }
+        Self { lamps }
     }
 
-    /// Take in one time point: `currents` is by netlist element. `speed` is
-    /// in simulated seconds per real second: in slow motion the stretch that
-    /// is averaged shrinks with it, so that changes can be watched.
-    pub fn add(&mut self, time: f64, currents: &[f64], speed: f64) {
+    /// Take in one time point. `speed` is in simulated seconds per real
+    /// second: in slow motion the stretch that is averaged shrinks with it,
+    /// so that changes can be watched.
+    pub fn add(&mut self, sample: &Sample, speed: f64) {
         let window = (EYE * speed).clamp(0.0, LONGEST_WINDOW);
-        for (&(index, _), trace) in self.leds.iter().zip(&mut self.traces) {
-            if let Some(&current) = currents.get(index) {
-                trace.add(time, current, window);
+        for lamp in &mut self.lamps {
+            let current = match lamp.segment {
+                None => sample.currents.get(lamp.element),
+                Some(k) => sample
+                    .lamps
+                    .iter()
+                    .find(|(element, _)| *element == lamp.element)
+                    .and_then(|(_, currents)| currents.get(k)),
+            };
+            if let Some(&current) = current {
+                lamp.trace.add(sample.time, current, window);
             }
         }
     }
 
-    /// The current each LED looks to be carrying.
-    pub fn currents(&self) -> HashMap<ComponentId, f64> {
-        self.leds
-            .iter()
-            .zip(&self.traces)
-            .filter(|(_, t)| !t.past.is_empty())
-            .map(|(&(_, id), t)| (id, t.average()))
-            .collect()
+    /// The current each LED looks to be carrying, by part.
+    pub fn currents(&self) -> HashMap<ComponentId, Vec<f64>> {
+        let mut parts: HashMap<ComponentId, Vec<f64>> = HashMap::new();
+        for lamp in self.lamps.iter().filter(|l| !l.trace.past.is_empty()) {
+            let seen = lamp.trace.average();
+            parts.entry(lamp.component).or_default().push(seen);
+        }
+        parts
     }
 }
 
@@ -166,6 +193,16 @@ mod tests {
         (LedMeter::new(&netlist), id)
     }
 
+    /// A time point with these currents, by netlist element.
+    fn at(time: f64, currents: &[f64]) -> Sample {
+        Sample {
+            time,
+            voltages: Vec::new(),
+            currents: currents.to_vec(),
+            lamps: Vec::new(),
+        }
+    }
+
     /// Switch the LED between 20 mA and nothing, `on` of each `period`, for a
     /// tenth of a second, and return the greatest and least it looked once
     /// settled.
@@ -176,9 +213,9 @@ mod tests {
         for n in 0..(0.1 / step) as usize {
             let t = n as f64 * step;
             let current = if t % period < on * period { 0.020 } else { 0.0 };
-            meter.add(t, &[9.0, current], speed);
+            meter.add(&at(t, &[9.0, current]), speed);
             if t > 0.06 {
-                let seen = meter.currents()[&id];
+                let seen = meter.currents()[&id][0];
                 (low, high) = (low.min(seen), high.max(seen));
             }
         }
@@ -206,13 +243,30 @@ mod tests {
     fn a_steady_current_is_shown_at_once_and_a_restart_forgets() {
         let (mut meter, id) = one_led();
         assert!(meter.currents().is_empty());
-        meter.add(5.0, &[0.0, 0.012], 1.0);
-        assert_eq!(meter.currents()[&id], 0.012);
-        meter.add(5.001, &[0.0, 0.012], 1.0);
-        assert!((meter.currents()[&id] - 0.012).abs() < 1e-12);
+        meter.add(&at(5.0, &[0.0, 0.012]), 1.0);
+        assert_eq!(meter.currents()[&id], [0.012]);
+        meter.add(&at(5.001, &[0.0, 0.012]), 1.0);
+        assert!((meter.currents()[&id][0] - 0.012).abs() < 1e-12);
         // Time going back means the circuit started again.
-        meter.add(0.0, &[0.0, 0.0], 1.0);
-        assert_eq!(meter.currents()[&id], 0.0);
+        meter.add(&at(0.0, &[0.0, 0.0]), 1.0);
+        assert_eq!(meter.currents()[&id], [0.0]);
+    }
+
+    #[test]
+    fn each_led_of_a_display_is_followed_by_itself() {
+        let nets: Vec<String> = (0..20).map(|i| format!("n{i}")).collect();
+        let nets: Vec<&str> = nets.iter().map(String::as_str).collect();
+        let colour = LedColour::Green;
+        let netlist = NetlistBuilder::new()
+            .element("DS1", K::LedBar { colour }, &nets)
+            .build();
+        let id = netlist.elements[0].component;
+        let mut meter = LedMeter::new(&netlist);
+        let currents: Vec<f64> = (0..10).map(|k| f64::from(k) * 0.001).collect();
+        let mut sample = at(0.0, &[0.0]);
+        sample.lamps = vec![(0, currents.clone())];
+        meter.add(&sample, 1.0);
+        assert_eq!(meter.currents()[&id], currents);
     }
 
     #[test]

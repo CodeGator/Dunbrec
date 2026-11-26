@@ -243,6 +243,18 @@ fn write_netlist(
                 n[1],
                 colour.model().name
             ),
+            // A display is written as its LEDs, one diode each.
+            K::LedBar { colour } => {
+                let name = element_name('D', d);
+                let model = colour.model().name;
+                let segments = e.kind.led_segments().map_or(&[][..], |s| s.1);
+                let lines: Vec<String> = segments
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &(a, k))| format!("{name}_{} {} {} {model}", i + 1, n[a], n[k]))
+                    .collect();
+                lines.join("\n")
+            }
             K::Bjt { model, .. } => {
                 format!(
                     "{} {} {} {} {}",
@@ -383,10 +395,9 @@ fn write_netlist(
     let leds = LedColour::ALL
         .into_iter()
         .filter(|&c| {
-            netlist
-                .elements
-                .iter()
-                .any(|e| e.kind == K::Led { colour: c })
+            netlist.elements.iter().any(|e| {
+                e.kind == K::Led { colour: c } || e.kind.led_segments().is_some_and(|s| s.0 == c)
+            })
         })
         .map(LedColour::model);
     let leds: Vec<_> = leds.collect();
@@ -447,6 +458,21 @@ mod tests {
             .filter(|part| matches!(part.kind, K::Diode { .. }))
             .count();
         assert_eq!(diodes, 3);
+    }
+
+    #[test]
+    fn a_bar_display_is_written_as_its_ten_leds() {
+        let names: Vec<String> = (1..=10)
+            .map(|n| format!("a{n}"))
+            .chain((1..=10).map(|n| format!("k{n}")))
+            .collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let colour = LedColour::Yellow;
+        let text = export(&lone_part(K::LedBar { colour }, &names), "bar", &[]).unwrap();
+        assert!(text.contains("DS1_1 0 k1 DUNBREC_LED_YELLOW"), "{text}");
+        assert!(text.contains("DS1_10 a10 k10 DUNBREC_LED_YELLOW"), "{text}");
+        assert_eq!(text.matches(".model DUNBREC_LED_YELLOW D(").count(), 1);
+        assert_eq!(import(&text).unwrap().parts.len(), 10);
     }
 
     /// A part with every pin on its own labelled net, plus a ground.
