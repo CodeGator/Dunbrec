@@ -61,8 +61,10 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ),
     (
         "Drag a part from the palette",
-        "Drop it on the canvas to place it and start wiring",
+        "Drop it on the canvas to place it, then click to place more",
     ),
+    ("Hold Ctrl", "Wire for as long as the key is held"),
+    ("Hold Alt", "Select for as long as the key is held"),
     ("S", "Select tool"),
     ("W", "Wire tool"),
     ("L", "Net label tool"),
@@ -3625,7 +3627,7 @@ fn palette_ui(ui: &mut egui::Ui, canvas: &mut Canvas, search: &mut String) {
                 let kind = (entry.make)();
                 let active = matches!(&canvas.tool, Tool::Place { kind: k, .. } if *k == kind);
                 // Click to pick the part and place copies; drag it onto the
-                // canvas to place one and start wiring it.
+                // canvas to place one there and go on placing.
                 let part = ui.add(
                     egui::Button::selectable(active, entry.name)
                         .sense(egui::Sense::click_and_drag()),
