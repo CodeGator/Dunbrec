@@ -40,9 +40,6 @@
             </Extension>
           </ProgId>
         </Component>
-        <Component Id="Readme">
-          <File Id="ReadmeFile" Source="$(var.RootDir)\README.md" />
-        </Component>
       </Directory>
     </StandardDirectory>
 
@@ -63,7 +60,6 @@
 
     <Feature Id="Main" Title="Dunbrec">
       <ComponentRef Id="MainExecutable" />
-      <ComponentRef Id="Readme" />
       <ComponentRef Id="StartMenuShortcut" />
     </Feature>
   </Package>

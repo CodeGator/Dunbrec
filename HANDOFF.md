@@ -1,7 +1,12 @@
 # Dunbrec — handoff
 
-State of the project for whoever picks it up next. User-facing documentation is in
-[README.md](README.md); this file covers status, decisions and open work.
+State of the project for whoever picks it up next. Developer notes are in
+[docs/development.md](docs/development.md); this file covers status, decisions and open work.
+
+[README.md](README.md) is only a **summary** with screenshots (the user's decision): features at a
+high level, one line on what it is written in, no steps and no other technical detail. There is
+**no user guide**, by the user's decision: the project is too young and changes too much to keep
+one up to date.
 
 *Last updated: 2026-11-26, version 0.5.0 in progress (0.4.0 released: assistant, settings, message boxes, project behaviour). The multi-document editor, designed in [docs/multi-document-editor.md](docs/multi-document-editor.md), is built (all stages).*
 
@@ -31,7 +36,7 @@ drafts the GitHub release (see `.github/workflows/release.yml`).
 | 0.5.0 (in progress) | Projects screen (nothing else shown without a project); assistant draws new circuits with real wires and can add sine sources; no circuit open until one is opened; a central area that never collapses; closable schematic tab. See "0.5.0" below |
 | 0.4.0 | Settings dialog; Assistant (Ollama or Claude); pop-out instruments; text size; every confirmation a message box; Code panel tabs; project behaviour changes. See "0.4.0" below |
 
-Health at handoff: `cargo test --workspace` 508 passed, 0 failed (2 ignored: a real Recycle Bin check and an
+Health at handoff: `cargo test --workspace` 509 passed, 0 failed (2 ignored: a real Recycle Bin check and an
 emulator speed
 benchmark); `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --check`
 clean. Toolchain: Rust 1.99 (edition 2024, MSRV 1.90), Windows 11.
