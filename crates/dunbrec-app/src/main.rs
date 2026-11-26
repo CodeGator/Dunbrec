@@ -14,6 +14,7 @@ mod app;
 mod assistant;
 mod canvas;
 mod code_ui;
+mod cpp_tokens;
 mod debugger_ui;
 mod dialog;
 mod dock;

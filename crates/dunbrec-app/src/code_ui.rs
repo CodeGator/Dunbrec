@@ -24,6 +24,7 @@ use dunbrec_mcu::asm_text::{self, AsmError, Assembled, FLASH_WORDS};
 use egui::text::{CCursor, CCursorRange, LayoutJob, TextFormat};
 use egui::{Align, Color32, FontId, Id, RichText, Stroke, Ui};
 
+use crate::cpp_tokens;
 use crate::debugger_ui::Debugger;
 use crate::document::Document;
 use crate::live::LiveSim;
@@ -100,6 +101,10 @@ pub enum Kind {
     Constant,
     Number,
     Text,
+    /// A word of C++, in a sketch.
+    Keyword,
+    /// A function or object of Arduino, in a sketch.
+    Function,
 }
 
 /// The coloured pieces of one line of assembly. Gaps are plain.
@@ -208,7 +213,7 @@ impl Palette {
                 mnemonic: c(86, 156, 214),
                 register: c(156, 220, 254),
                 constant: c(78, 201, 176),
-                number: c(181, 206, 168),
+                number: c(255, 160, 50),
                 text: c(206, 145, 120),
             }
         } else {
@@ -220,7 +225,7 @@ impl Palette {
                 mnemonic: c(0, 0, 255),
                 register: c(0, 16, 128),
                 constant: c(38, 127, 153),
-                number: c(9, 134, 88),
+                number: c(194, 86, 0),
                 text: c(163, 21, 21),
             }
         }
@@ -231,8 +236,8 @@ impl Palette {
             Kind::Plain => self.plain,
             Kind::Comment => self.comment,
             Kind::Directive => self.directive,
-            Kind::Label => self.label,
-            Kind::Mnemonic => self.mnemonic,
+            Kind::Label | Kind::Function => self.label,
+            Kind::Mnemonic | Kind::Keyword => self.mnemonic,
             Kind::Register => self.register,
             Kind::Constant => self.constant,
             Kind::Number => self.number,
@@ -254,13 +259,15 @@ fn byte_of_column(line: &str, col: usize) -> usize {
 /// The text as a coloured layout, with the places of `errors` underlined.
 fn highlight(
     text: &str,
-    asm: bool,
+    language: SourceLanguage,
     font: &FontId,
     palette: &Palette,
     errors: &[AsmError],
 ) -> LayoutJob {
     let mut job = LayoutJob::default();
     job.text.reserve(text.len());
+    // Whether a sketch's block comment is still open from an earlier line.
+    let mut in_comment = false;
     for (index, raw) in text.split_inclusive('\n').enumerate() {
         let line = raw.strip_suffix('\n').unwrap_or(raw);
         let line = line.strip_suffix('\r').unwrap_or(line);
@@ -270,18 +277,22 @@ fn highlight(
             .filter(|e| e.line == index + 1)
             .map(|e| {
                 let start = byte_of_column(line, e.column);
-                let len = line[start..]
+                let word = line[start..]
                     .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-                    .unwrap_or(line.len() - start)
-                    .max(1);
-                start..(start + len).min(line.len().max(start + 1))
+                    .unwrap_or(line.len() - start);
+                // Not on a word: mark the one character there, all of it.
+                let one = line[start..].chars().next().map_or(1, char::len_utf8);
+                start..start + if word == 0 { one } else { word }
             })
             .collect();
 
         // Tokens, with the gaps between them filled in and the line ending.
         let mut pieces: Vec<(Range<usize>, Kind)> = Vec::new();
         let mut pos = 0;
-        let tokens = if asm { tokenize(line) } else { Vec::new() };
+        let tokens = match language {
+            SourceLanguage::Asm => tokenize(line),
+            SourceLanguage::Cpp => cpp_tokens::tokenize(line, &mut in_comment),
+        };
         for (range, kind) in tokens {
             if range.start > pos {
                 pieces.push((pos..range.start, Kind::Plain));
@@ -702,7 +713,8 @@ impl CodeEditor {
         let plain = ui.visuals().text_color();
         let palette = Palette::new(ui.visuals().dark_mode, plain);
         let weak = ui.visuals().weak_text_color();
-        let is_asm = file.language == SourceLanguage::Asm;
+        let language = file.language;
+        let is_asm = language == SourceLanguage::Asm;
         let mut text = file.text.clone();
 
         let mut jumped = None;
@@ -777,7 +789,7 @@ impl CodeEditor {
                         click.on_hover_text("Click to set or clear a breakpoint on this line");
                     }
                     let mut layouter = |ui: &Ui, buffer: &dyn egui::TextBuffer, _wrap: f32| {
-                        let job = highlight(buffer.as_str(), is_asm, &font, &palette, errors);
+                        let job = highlight(buffer.as_str(), language, &font, &palette, errors);
                         let galley: Arc<egui::Galley> = ui.fonts_mut(|f| f.layout_job(job));
                         galley
                     };
@@ -952,15 +964,75 @@ mod tests {
     fn the_highlight_keeps_every_character() {
         let font = FontId::monospace(13.0);
         let palette = Palette::new(true, Color32::WHITE);
-        for text in ["", "\n", "nop\n", "ldi r16, é\r\nbad ; c\n\nx:", "\"open"] {
-            let errors = [AsmError {
-                line: 1,
-                column: 2,
-                message: String::new(),
-            }];
-            let job = highlight(text, true, &font, &palette, &errors);
-            assert_eq!(job.text, text);
+        for text in [
+            "",
+            "\n",
+            "nop\n",
+            "ldi r16, é\r\nbad ; c\n\nx:",
+            "\"open",
+            "/* a\r\nb */ int x = 1; // é\n“smart”",
+        ] {
+            for language in [SourceLanguage::Asm, SourceLanguage::Cpp] {
+                // A mistake anywhere, including on a character of several
+                // bytes and past the end.
+                for (line, column) in (1..=3).flat_map(|l| (0..30).map(move |c| (l, c))) {
+                    let errors = [AsmError {
+                        line,
+                        column,
+                        message: String::new(),
+                    }];
+                    let job = highlight(text, language, &font, &palette, &errors);
+                    assert_eq!(job.text, text);
+                    for s in &job.sections {
+                        assert!(job.text.get(s.byte_range.clone()).is_some(), "{text:?}");
+                    }
+                }
+            }
         }
+    }
+
+    #[test]
+    fn numbers_are_orange_in_both_kinds_of_file() {
+        let font = FontId::monospace(13.0);
+        for dark in [false, true] {
+            let palette = Palette::new(dark, Color32::GRAY);
+            let orange = palette.color(Kind::Number);
+            assert!(
+                orange.r() > orange.g() && orange.g() > orange.b(),
+                "{orange:?}"
+            );
+            for (language, text) in [
+                (SourceLanguage::Asm, "ldi r16, 42"),
+                (SourceLanguage::Cpp, "delay(42);"),
+            ] {
+                let job = highlight(text, language, &font, &palette, &[]);
+                let number = job
+                    .sections
+                    .iter()
+                    .find(|s| &job.text[s.byte_range.clone()] == "42")
+                    .expect("the number is a piece of its own");
+                assert_eq!(number.format.color, orange);
+            }
+        }
+    }
+
+    #[test]
+    fn a_sketch_comment_over_two_lines_is_all_one_colour() {
+        let font = FontId::monospace(13.0);
+        let palette = Palette::new(false, Color32::BLACK);
+        let text = "/* one\nint two\n*/ int three;";
+        let job = highlight(text, SourceLanguage::Cpp, &font, &palette, &[]);
+        let colour_at = |word: &str| {
+            let at = text.find(word).unwrap();
+            let section = job
+                .sections
+                .iter()
+                .find(|s| s.byte_range.contains(&at))
+                .unwrap();
+            section.format.color
+        };
+        assert_eq!(colour_at("int two"), palette.color(Kind::Comment));
+        assert_eq!(colour_at("int three"), palette.color(Kind::Keyword));
     }
 
     /// A circuit with one source file.

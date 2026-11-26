@@ -31,7 +31,7 @@ drafts the GitHub release (see `.github/workflows/release.yml`).
 | 0.5.0 (in progress) | Projects screen (nothing else shown without a project); assistant draws new circuits with real wires and can add sine sources; no circuit open until one is opened; a central area that never collapses; closable schematic tab. See "0.5.0" below |
 | 0.4.0 | Settings dialog; Assistant (Ollama or Claude); pop-out instruments; text size; every confirmation a message box; Code panel tabs; project behaviour changes. See "0.4.0" below |
 
-Health at handoff: `cargo test --workspace` 488 passed, 0 failed (2 ignored: a real Recycle Bin check and an
+Health at handoff: `cargo test --workspace` 498 passed, 0 failed (2 ignored: a real Recycle Bin check and an
 emulator speed
 benchmark); `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --check`
 clean. Toolchain: Rust 1.99 (edition 2024, MSRV 1.90), Windows 11.
@@ -380,6 +380,8 @@ the demos look dead: blink changed every 12 s). `sync_speed` tells a running sim
 - *Menu bar and toolbar* are enlarged by `Settings::bar_size` (Small/Medium/Large, Medium by
   default; the user could hardly see them). The menus need the factor twice, on the bar and in
   their `MenuConfig`. The toolbar wraps in a narrow window.
+- *Source colouring:* `code_ui::tokenize` (assembly) and `cpp_tokens::tokenize` (sketches,
+  basic by the user's choice: word lists, no parsing, no library); one palette, numbers orange.
 - *Status bar* (the user could not read the old one): only `tool_hint` for a tool other than
   Select, and the zoom; nothing with no circuit. Mouse gestures are listed in Help > Keyboard
   shortcuts (`SHORTCUTS`).

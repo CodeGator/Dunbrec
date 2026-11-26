@@ -234,7 +234,9 @@ file's path, relative to the schematic (`main.asm`; older files say `source:<nam
 Macros, `.include` and data or EEPROM segments are not supported yet.
 
 **Writing Arduino C++.** *Source file → New Arduino sketch…* in a microcontroller's properties
-creates a sketch, and the demo programs include sketches. Sketches
+creates a sketch, and the demo programs include sketches. A sketch is coloured as you type:
+comments, C++ words, preprocessor lines, Arduino's functions and constants and the chip's register
+names, numbers (orange, as in assembly) and quoted text; your own names stay plain. Sketches
 are built by the Arduino command-line tool, which Dunbrec finds but does not include: install it
 (`winget install ArduinoSA.CLI` on Windows), then run `arduino-cli core install arduino:avr`.
 **Run** builds a sketch that has changed since it was last built and starts the simulation only if
