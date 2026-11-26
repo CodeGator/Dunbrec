@@ -8,7 +8,7 @@ high level, one line on what it is written in, no steps and no other technical d
 **no user guide**, by the user's decision: the project is too young and changes too much to keep
 one up to date.
 
-*Last updated: 2026-11-26, version 0.5.0 released (several circuits open at once, designed in [docs/multi-document-editor.md](docs/multi-document-editor.md) and built in all its stages; easier schematic editing; larger menus and toolbar; coloured sketches).*
+*Last updated: 2026-11-26, version 0.6.0 in progress, nothing new yet. Version 0.5.0 released (several circuits open at once, designed in [docs/multi-document-editor.md](docs/multi-document-editor.md) and built in all its stages; easier schematic editing; larger menus and toolbar; coloured sketches).*
 
 ## Status
 
@@ -17,8 +17,8 @@ plus Phase 12 (integrated circuits) and a fix for probes failing after opening a
 Version 0.3.0 was released on 2026-11-21 (tag `v0.3.0`, merged to `main`; 0.1.0 and 0.2.0 were
 released the same day). Version 0.4.0 was merged to `main` and pushed to `release` on 2026-11-22;
 the workflow drafts the GitHub release `v0.4.0`, which is published by hand. Version 0.5.0 was
-merged to `main` and pushed to `release` the same way on 2026-11-26. Work branches are named after
-the application version and merged into `main`. A release is cut by merging the branch into `main` and pushing `main:release`, which
+merged to `main`, pushed to `release` and published on 2026-11-26. Work branches are named after
+the application version and merged into `main`; this one is `0.6.0`. A release is cut by merging the branch into `main` and pushing `main:release`, which
 drafts the GitHub release (see `.github/workflows/release.yml`).
 
 | Phase | Content |
