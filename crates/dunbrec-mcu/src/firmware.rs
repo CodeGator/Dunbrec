@@ -24,7 +24,11 @@ pub fn resolve(reference: &str, base_dir: Option<&Path>) -> Option<PathBuf> {
 pub fn load(reference: &str, base_dir: Option<&Path>) -> Result<Vec<u8>, String> {
     let reference = reference.trim();
     if reference.is_empty() {
-        return Err("no firmware selected: choose a .hex file in the part's properties".into());
+        return Err(
+            "no firmware selected: choose a demo, a source file or a .hex file in \
+                    the chip's properties"
+                .into(),
+        );
     }
     if let Some(name) = reference.strip_prefix(BUILTIN_PREFIX) {
         return crate::programs::builtin(name)

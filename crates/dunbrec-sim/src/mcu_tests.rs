@@ -696,3 +696,41 @@ fn source_files_are_recognised_by_their_extension() {
     assert_eq!(source_language_of("blink.hex"), None);
     assert_eq!(source_language_of("builtin:blink"), None);
 }
+
+#[test]
+fn a_sketch_is_unbuilt_until_the_text_it_has_now_is_built() {
+    use dunbrec_core::{SourceFile, SourceLanguage};
+    let text = "void setup() {} void loop() {} // never built by another test";
+    let file = |language, text: &str| SourceFile {
+        language,
+        text: text.into(),
+    };
+    let sources = std::collections::BTreeMap::from([
+        ("a.ino".to_string(), file(SourceLanguage::Cpp, text)),
+        ("b.asm".to_string(), file(SourceLanguage::Asm, "nop")),
+        ("kept".to_string(), file(SourceLanguage::Cpp, text)),
+    ]);
+    let unbuilt = |reference: &str| crate::unbuilt_sketch(reference, None, &sources);
+    assert_eq!(unbuilt(" a.ino "), Some(("a.ino".into(), text.into())));
+    assert_eq!(unbuilt("source:kept"), Some(("kept".into(), text.into())));
+    // Nothing to build: assembly, a built-in, a .hex file, a missing file.
+    for other in [
+        "b.asm",
+        "builtin:blink",
+        "fw.hex",
+        "missing.ino",
+        "source:no",
+        "",
+    ] {
+        assert_eq!(unbuilt(other), None, "{other}");
+    }
+    // A sketch that is not open is read from disk.
+    let dir = std::env::temp_dir().join(format!("dunbrec-unbuilt-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("disk.ino"), text).unwrap();
+    assert!(crate::unbuilt_sketch("disk.ino", Some(&dir), &sources).is_some());
+    dunbrec_mcu::arduino::remember(text, vec![0, 0]);
+    assert_eq!(unbuilt("a.ino"), None, "built");
+    assert!(crate::unbuilt_sketch("disk.ino", Some(&dir), &sources).is_none());
+    std::fs::remove_dir_all(&dir).unwrap();
+}

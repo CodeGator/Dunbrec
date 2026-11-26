@@ -13,9 +13,9 @@
 //! arduino-cli core install arduino:avr
 //! ```
 //!
-//! Built images are remembered by the sketch text ([`cached_image`]), so
-//! running a circuit never waits for a compiler: a sketch is built on
-//! request, and the simulation uses the last build of exactly that text.
+//! Built images are remembered by the sketch text ([`cached_image`]), so a
+//! sketch is compiled only when it has changed: the simulation uses the build
+//! of exactly its text, which the application makes before it starts a run.
 
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;

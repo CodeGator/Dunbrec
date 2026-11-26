@@ -1,11 +1,12 @@
-//! The code panel: edit the firmware source files stored in the schematic.
+//! The editor of a circuit's firmware source files, one tab to a file.
 //!
 //! Each source file belongs to the schematic (`Schematic::sources`) and is
-//! picked by a microcontroller's firmware field as `source:<name>`. The
-//! panel highlights assembly as it is typed, builds it on every change so
-//! mistakes are marked on their line at once, and lists them below the
-//! text; clicking an error jumps to it. Running the circuit builds the same
-//! text again, so what the panel shows is what runs.
+//! picked by a microcontroller's firmware field. The editor highlights
+//! assembly as it is typed, builds it on every change so mistakes are marked
+//! on their line at once, and lists them below the text; clicking an error
+//! jumps to it. Running the circuit builds the same text again, so what the
+//! editor shows is what runs. A sketch is built by its Build button, or by
+//! Run if it has changed since it was last built.
 //!
 //! Typing edits the document directly. The first change of a typing session
 //! records one undo step (not one per key), so Ctrl+Z outside the text undoes
@@ -15,7 +16,6 @@ use std::collections::BTreeMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use dunbrec_core::{SourceFile, SourceLanguage};
@@ -24,8 +24,8 @@ use dunbrec_mcu::asm_text::{self, AsmError, Assembled, FLASH_WORDS};
 use egui::text::{CCursor, CCursorRange, LayoutJob, TextFormat};
 use egui::{Align, Color32, FontId, Id, RichText, Stroke, Ui};
 
+use crate::cpp_tokens;
 use crate::debugger_ui::Debugger;
-use crate::dialog::{self, Dialog};
 use crate::document::Document;
 use crate::live::LiveSim;
 
@@ -79,60 +79,12 @@ pub fn unused_file_name(
         .expect("some number is free")
 }
 
-/// The name a new source gets for what was typed: the typed name if it
-/// already says what kind of file it is, otherwise with the extension of
-/// the chosen language added. Returns the name and its language.
-pub fn file_key(typed: &str, chosen: SourceLanguage) -> (String, SourceLanguage) {
-    let typed = typed.trim();
-    match dunbrec_core::source_language_of(typed) {
-        Some(language) => (typed.to_string(), language),
-        None => {
-            let ext = match chosen {
-                SourceLanguage::Asm => "asm",
-                SourceLanguage::Cpp => "ino",
-            };
-            (format!("{typed}.{ext}"), chosen)
-        }
-    }
-}
-
-/// The tab to show after `closed` is closed: the one after it, else the one
-/// before, else none.
-fn after_closing(names: &[String], closed: &str) -> Option<String> {
-    let at = names.iter().position(|n| n == closed)?;
-    names
-        .get(at + 1)
-        .or_else(|| at.checked_sub(1).and_then(|before| names.get(before)))
-        .cloned()
-}
-
 /// The name Arduino's tool should give the sketch built from the source
 /// called `name`: the file's own name without its extension.
 fn sketch_name(name: &str) -> String {
     std::path::Path::new(name)
         .file_stem()
         .map_or_else(|| name.to_string(), |s| s.to_string_lossy().into_owned())
-}
-
-/// A new Arduino C++ sketch.
-pub fn new_sketch() -> SourceFile {
-    SourceFile {
-        language: SourceLanguage::Cpp,
-        text: STARTER_SKETCH.to_string(),
-    }
-}
-
-/// A new assembly source file: the starter program for the first file of a
-/// schematic, an empty one after that.
-pub fn new_file(sources: &BTreeMap<String, SourceFile>, name: &str) -> SourceFile {
-    SourceFile {
-        language: SourceLanguage::Asm,
-        text: if sources.is_empty() {
-            STARTER.to_string()
-        } else {
-            format!("; {name}\n")
-        },
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -149,6 +101,10 @@ pub enum Kind {
     Constant,
     Number,
     Text,
+    /// A word of C++, in a sketch.
+    Keyword,
+    /// A function or object of Arduino, in a sketch.
+    Function,
 }
 
 /// The coloured pieces of one line of assembly. Gaps are plain.
@@ -257,7 +213,7 @@ impl Palette {
                 mnemonic: c(86, 156, 214),
                 register: c(156, 220, 254),
                 constant: c(78, 201, 176),
-                number: c(181, 206, 168),
+                number: c(255, 160, 50),
                 text: c(206, 145, 120),
             }
         } else {
@@ -269,7 +225,7 @@ impl Palette {
                 mnemonic: c(0, 0, 255),
                 register: c(0, 16, 128),
                 constant: c(38, 127, 153),
-                number: c(9, 134, 88),
+                number: c(194, 86, 0),
                 text: c(163, 21, 21),
             }
         }
@@ -280,8 +236,8 @@ impl Palette {
             Kind::Plain => self.plain,
             Kind::Comment => self.comment,
             Kind::Directive => self.directive,
-            Kind::Label => self.label,
-            Kind::Mnemonic => self.mnemonic,
+            Kind::Label | Kind::Function => self.label,
+            Kind::Mnemonic | Kind::Keyword => self.mnemonic,
             Kind::Register => self.register,
             Kind::Constant => self.constant,
             Kind::Number => self.number,
@@ -303,13 +259,15 @@ fn byte_of_column(line: &str, col: usize) -> usize {
 /// The text as a coloured layout, with the places of `errors` underlined.
 fn highlight(
     text: &str,
-    asm: bool,
+    language: SourceLanguage,
     font: &FontId,
     palette: &Palette,
     errors: &[AsmError],
 ) -> LayoutJob {
     let mut job = LayoutJob::default();
     job.text.reserve(text.len());
+    // Whether a sketch's block comment is still open from an earlier line.
+    let mut in_comment = false;
     for (index, raw) in text.split_inclusive('\n').enumerate() {
         let line = raw.strip_suffix('\n').unwrap_or(raw);
         let line = line.strip_suffix('\r').unwrap_or(line);
@@ -319,18 +277,22 @@ fn highlight(
             .filter(|e| e.line == index + 1)
             .map(|e| {
                 let start = byte_of_column(line, e.column);
-                let len = line[start..]
+                let word = line[start..]
                     .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-                    .unwrap_or(line.len() - start)
-                    .max(1);
-                start..(start + len).min(line.len().max(start + 1))
+                    .unwrap_or(line.len() - start);
+                // Not on a word: mark the one character there, all of it.
+                let one = line[start..].chars().next().map_or(1, char::len_utf8);
+                start..start + if word == 0 { one } else { word }
             })
             .collect();
 
         // Tokens, with the gaps between them filled in and the line ending.
         let mut pieces: Vec<(Range<usize>, Kind)> = Vec::new();
         let mut pos = 0;
-        let tokens = if asm { tokenize(line) } else { Vec::new() };
+        let tokens = match language {
+            SourceLanguage::Asm => tokenize(line),
+            SourceLanguage::Cpp => cpp_tokens::tokenize(line, &mut in_comment),
+        };
         for (range, kind) in tokens {
             if range.start > pos {
                 pieces.push((pos..range.start, Kind::Plain));
@@ -417,7 +379,6 @@ fn char_index(text: &str, line: usize, column: usize) -> usize {
 // The panel
 
 struct Built {
-    name: String,
     hash: u64,
     result: Result<Assembled, Vec<AsmError>>,
 }
@@ -431,35 +392,29 @@ struct Building {
 
 /// How the last build of a sketch ended.
 struct CppBuild {
-    name: String,
     /// Hash of the text that was built.
     hash: u64,
     /// The size of the image, or why there is none.
     result: Result<usize, BuildError>,
 }
 
+/// What the editor remembers about a circuit's files. Several can be in view
+/// at once, so everything is kept by file name.
 #[derive(Default)]
 pub struct CodeEditor {
-    selected: Option<String>,
-    /// The name being typed for a new file, while the box is open.
-    new_name: Option<String>,
-    /// The name box just opened: select the suggested name.
-    new_fresh: bool,
-    /// Files made on disk since the app last asked, to list in the project.
-    created: Vec<PathBuf>,
-    /// Why a file could not be made, until the app has shown it.
-    problem: Option<String>,
-    /// A typing session has already recorded its undo step.
-    typing: bool,
-    built: Option<Built>,
-    /// New files are C++ sketches (the choice in the New… box).
-    new_cpp: bool,
+    /// The file whose typing session has already recorded its undo step.
+    typing: Option<String>,
+    /// The last assembly of each file.
+    built: BTreeMap<String, Built>,
     /// A sketch being compiled on a worker thread.
     building: Option<Building>,
-    /// The last finished sketch build.
-    cpp: Option<CppBuild>,
-    /// A place (line, column) to move the cursor to on the next frame.
-    jump: Option<(usize, usize)>,
+    /// The sketch whose Build button was pressed; the app saves the circuit
+    /// and then has it built.
+    wanted: Option<String>,
+    /// The last finished build of each sketch.
+    cpp: BTreeMap<String, CppBuild>,
+    /// A place (file, line, column) to move the cursor to on the next frame.
+    jump: Option<(String, usize, usize)>,
 }
 
 fn hash_of(text: &str) -> u64 {
@@ -469,8 +424,9 @@ fn hash_of(text: &str) -> u64 {
 }
 
 impl CodeEditor {
-    /// Collect a finished sketch build.
-    fn poll_build(&mut self, ctx: &egui::Context) {
+    /// Collect a finished sketch build. Called every frame, whether or not
+    /// the sketch is in view, so that it can be run as soon as it is built.
+    pub fn poll_build(&mut self, ctx: &egui::Context) {
         let Some(b) = &self.building else { return };
         let finished = match b.rx.try_recv() {
             Ok(result) => result,
@@ -488,21 +444,25 @@ impl CodeEditor {
             arduino::remember(&b.text, out.image);
             bytes
         });
-        self.cpp = Some(CppBuild {
-            hash: hash_of(&b.text),
-            name: b.name,
-            result,
-        });
+        self.cpp.insert(
+            b.name,
+            CppBuild {
+                hash: hash_of(&b.text),
+                result,
+            },
+        );
     }
 
     /// Compile sketch `name` on a worker thread.
     fn start_build(&mut self, ctx: &egui::Context, name: &str, text: &str) {
         let Some(cli) = arduino::find_cli(None) else {
-            self.cpp = Some(CppBuild {
-                name: name.to_string(),
-                hash: hash_of(text),
-                result: Err(BuildError::NoToolchain(arduino::SETUP_HELP.into())),
-            });
+            self.cpp.insert(
+                name.to_string(),
+                CppBuild {
+                    hash: hash_of(text),
+                    result: Err(BuildError::NoToolchain(arduino::SETUP_HELP.into())),
+                },
+            );
             return;
         };
         let (tx, rx) = std::sync::mpsc::channel();
@@ -518,84 +478,73 @@ impl CodeEditor {
         });
     }
 
-    /// Show `name` the next time the panel is drawn.
-    pub fn select(&mut self, name: &str) {
-        self.selected = Some(name.to_string());
+    /// The sketch the user asked to build, once.
+    pub fn take_build_request(&mut self) -> Option<String> {
+        self.wanted.take()
     }
 
-    /// The build of `file`, reusing the last one if the text is unchanged.
+    /// Whether a sketch is being compiled.
+    pub fn is_building(&self) -> bool {
+        self.building.is_some()
+    }
+
+    /// Why the last build of sketch `name` failed, if the text built was
+    /// `text`.
+    pub fn build_failure(&self, name: &str, text: &str) -> Option<String> {
+        let build = self.cpp.get(name).filter(|c| c.hash == hash_of(text))?;
+        build.result.as_ref().err().map(|e| e.to_string())
+    }
+
+    /// Forget that a build of `name` failed, so that it is tried again.
+    pub fn forget_failure(&mut self, name: &str) {
+        if self.cpp.get(name).is_some_and(|c| c.result.is_err()) {
+            self.cpp.remove(name);
+        }
+    }
+
+    /// Compile sketch `name` now, unless a build is already running.
+    pub fn build_sketch(&mut self, ctx: &egui::Context, name: &str, text: &str) {
+        if self.building.is_none() {
+            self.start_build(ctx, name, text);
+        }
+    }
+
+    /// The assembly of `file`, reusing the last one if the text is unchanged.
     fn build(&mut self, name: &str, file: &SourceFile) -> &Result<Assembled, Vec<AsmError>> {
         let hash = hash_of(&file.text);
-        let fresh = self
-            .built
-            .as_ref()
-            .is_some_and(|b| b.name == name && b.hash == hash);
-        if !fresh {
-            self.built = Some(Built {
-                name: name.to_string(),
-                hash,
-                result: asm_text::assemble(&file.text),
-            });
+        if self.built.get(name).is_none_or(|b| b.hash != hash) {
+            let result = asm_text::assemble(&file.text);
+            self.built.insert(name.to_string(), Built { hash, result });
         }
-        &self.built.as_ref().expect("just built").result
+        &self.built[name].result
     }
 
-    pub fn show(
+    /// Draw the tab of the source file `name`.
+    pub fn show_file(
         &mut self,
         ui: &mut Ui,
         doc: &mut Document,
         debugger: &mut Debugger,
         live: &mut Option<LiveSim>,
+        name: &str,
     ) {
         self.poll_build(ui.ctx());
-        let names: Vec<String> = doc.schematic().sources.keys().cloned().collect();
-        if self.selected.as_ref().is_none_or(|n| !names.contains(n)) {
-            self.selected = names.first().cloned();
-        }
-
-        self.new_file_dialog(ui.ctx(), doc, &names);
-
-        egui::TopBottomPanel::top("code_header").show_inside(ui, |ui| {
-            ui.add_space(2.0);
-            self.tabs(ui, doc, &names);
-            self.header(ui, doc);
-            self.location_note(ui, doc);
-            ui.add_space(2.0);
-        });
-
-        let Some(name) = self.selected.clone() else {
-            ui.add_space(12.0);
-            ui.label("This schematic has no firmware source files yet.");
-            ui.label(
-                RichText::new(
-                    "A source file is AVR assembly (.asm) or an Arduino sketch (.ino) kept as \
-                     a file beside the schematic. Dunbrec builds it each time the circuit \
-                     runs when a microcontroller's firmware is set to it. Open one from the \
-                     Project panel, or create one here.",
-                )
-                .weak(),
-            );
-            ui.add_space(6.0);
-            if ui.button("Create a source file").clicked() {
-                self.create(doc, "main");
-            }
+        let Some(file) = doc.schematic().sources.get(name).cloned() else {
             return;
         };
-        let file = doc.schematic().sources[&name].clone();
         let is_asm = file.language == SourceLanguage::Asm;
         let errors: Vec<AsmError> = if is_asm {
-            self.build(&name, &file)
+            self.build(name, &file)
                 .as_ref()
                 .err()
                 .cloned()
                 .unwrap_or_default()
         } else {
-            match &self.cpp {
+            match self.cpp.get(name) {
                 Some(CppBuild {
-                    name: n,
                     hash,
                     result: Err(BuildError::Failed { diagnostics, .. }),
-                }) if *n == name && *hash == hash_of(&file.text) => diagnostics
+                }) if *hash == hash_of(&file.text) => diagnostics
                     .iter()
                     .filter(|d| d.error)
                     .map(|d| AsmError {
@@ -608,8 +557,15 @@ impl CodeEditor {
             }
         };
 
+        egui::TopBottomPanel::top(Id::new(("code_header", name))).show_inside(ui, |ui| {
+            ui.add_space(2.0);
+            self.header(ui, name, &file);
+            location_note(ui, doc, name);
+            ui.add_space(2.0);
+        });
+
         if !errors.is_empty() {
-            egui::TopBottomPanel::bottom("code_errors")
+            egui::TopBottomPanel::bottom(Id::new(("code_errors", name)))
                 .resizable(true)
                 .default_height(86.0)
                 .show_inside(ui, |ui| {
@@ -628,7 +584,7 @@ impl CodeEditor {
                                     .on_hover_text("Go to this line")
                                     .clicked()
                                 {
-                                    self.jump = Some((e.line, e.column));
+                                    self.jump = Some((name.to_string(), e.line, e.column));
                                 }
                             }
                         });
@@ -638,251 +594,55 @@ impl CodeEditor {
         // full, not just flagged.
         if !is_asm
             && let Some(CppBuild {
-                name: n,
                 hash,
                 result: Err(e @ (BuildError::NoToolchain(_) | BuildError::Other(_))),
-            }) = &self.cpp
-            && *n == name
+            }) = self.cpp.get(name)
             && *hash == hash_of(&file.text)
         {
             let message = e.to_string();
-            egui::TopBottomPanel::bottom("code_build_note").show_inside(ui, |ui| {
-                ui.label(RichText::new(message).color(ERROR_RED));
-            });
+            egui::TopBottomPanel::bottom(Id::new(("code_build_note", name))).show_inside(
+                ui,
+                |ui| {
+                    ui.label(RichText::new(message).color(ERROR_RED));
+                },
+            );
         }
 
         egui::CentralPanel::default().show_inside(ui, |ui| {
-            self.editor(ui, doc, debugger, live, &name, &file, &errors);
+            self.editor(ui, doc, debugger, live, name, &file, &errors);
         });
     }
 
-    /// Files this panel has made on disk since the last call.
-    pub fn take_created(&mut self) -> Vec<PathBuf> {
-        std::mem::take(&mut self.created)
-    }
-
-    /// Why a file could not be made, once.
-    pub fn take_problem(&mut self) -> Option<String> {
-        self.problem.take()
-    }
-
-    /// Where the selected file lives, and whether it is on disk yet.
-    fn location_note(&self, ui: &mut Ui, doc: &Document) {
-        let Some(name) = &self.selected else { return };
-        if !crate::project::is_file_source(name) {
-            ui.label(
-                RichText::new(
-                    "Kept inside the circuit file (the older way). The Project panel's \
-                     “Move to files” makes it a file of its own.",
-                )
-                .weak(),
-            );
-            return;
-        }
-        let path = doc.path().and_then(|p| p.parent()).map(|d| d.join(name));
-        match path {
-            Some(path) if path.is_file() => {
-                ui.add(
-                    egui::Label::new(RichText::new(format!("📄 {}", path.display())).weak())
-                        .truncate(),
-                )
-                .on_hover_text(path.display().to_string());
-            }
-            Some(path) => {
-                ui.colored_label(
-                    WARNING_AMBER,
-                    format!(
-                        "Not on disk yet: it will be written to {} when you save the circuit.",
-                        path.display()
-                    ),
-                );
-            }
-            None => {
-                ui.colored_label(
-                    WARNING_AMBER,
-                    "Not saved yet: this circuit has no file, so this one will be written next \
-                     to it when you first save the circuit (Ctrl+S).",
-                );
-            }
-        }
-    }
-
-    /// The message box that asks for the name and kind of a new source file.
-    fn new_file_dialog(&mut self, ctx: &egui::Context, doc: &mut Document, names: &[String]) {
-        let Some(mut typed) = self.new_name.take() else {
-            return;
-        };
-        let mut cpp = self.new_cpp;
-        let mut fresh = std::mem::take(&mut self.new_fresh);
-        let (name, chosen) = (
-            typed.trim().to_string(),
-            if cpp {
-                SourceLanguage::Cpp
-            } else {
-                SourceLanguage::Asm
-            },
-        );
-        let (key, _) = file_key(&name, chosen);
-        let taken = names.contains(&key);
-        let ok = !name.is_empty() && crate::project::valid_name(&name) && !taken;
-        let folder = doc.path().and_then(|p| p.parent()).map(|d| d.to_path_buf());
-
-        let answer = Dialog {
-            id: "new_source",
-            kind: dialog::Kind::Question,
-            title: "New firmware file",
-            buttons: &["Create", "Cancel"],
-            default: 0,
-            cancel: Some(1),
-        }
-        .show(ctx, |ui| {
-            dialog::paragraph(ui, "Name of the new file:");
-            ui.add_space(6.0);
-            let response = ui.add(
-                egui::TextEdit::singleline(&mut typed)
-                    .font(egui::TextStyle::Heading)
-                    .desired_width(f32::INFINITY),
-            );
-            if std::mem::take(&mut fresh) {
-                crate::project_ui::select_all(ui, &response, &typed);
-            }
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.radio_value(&mut cpp, false, "Assembly");
-                ui.radio_value(&mut cpp, true, "Arduino C++");
-            });
-            ui.add_space(4.0);
-            ui.label(
-                RichText::new(match folder.as_deref() {
-                    Some(dir) => format!("It is created now, in {}.", dir.display()),
-                    None => "This circuit has not been saved, so the file is written when you \
-                             first save it."
-                        .to_string(),
-                })
-                .weak(),
-            );
-            if taken {
-                ui.add_space(4.0);
-                ui.colored_label(ERROR_RED, "A file with that name already exists.");
-            } else if !name.is_empty() && !crate::project::valid_name(&name) {
-                ui.add_space(4.0);
-                ui.colored_label(ERROR_RED, "That is not a name a file can have.");
-            }
-        });
-        self.new_cpp = cpp;
-        match answer {
-            Some(0) if ok => self.create_as(doc, &name, chosen),
-            // Not a usable name yet: keep asking.
-            Some(0) => self.new_name = Some(typed),
-            Some(_) => {}
-            None => self.new_name = Some(typed),
-        }
-        self.new_fresh = fresh;
-    }
-
-    /// One tab per source file of the circuit, with a button to add another.
-    /// Closing a tab that is a file only stops showing it here (it stays on
-    /// disk); closing one kept inside the circuit removes it. Either way
-    /// Ctrl+Z brings it back.
-    fn tabs(&mut self, ui: &mut Ui, doc: &mut Document, names: &[String]) {
-        let mut close = None;
+    /// What the file builds to: its size, or how many errors.
+    fn header(&mut self, ui: &mut Ui, name: &str, file: &SourceFile) {
         ui.horizontal(|ui| {
-            if ui
-                .button("＋ New…")
-                .on_hover_text("Add another source file to this schematic")
-                .clicked()
-            {
-                let free = unused_file_name(&doc.schematic().sources, "main", "asm");
-                self.new_name = Some(free.trim_end_matches(".asm").to_string());
-                self.new_fresh = true;
+            if file.language == SourceLanguage::Cpp {
+                self.build_controls(ui, name, &file.text);
+                return;
             }
-            ui.separator();
-            egui::ScrollArea::horizontal()
-                .id_salt("code_tabs")
-                .auto_shrink([false, true])
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        for name in names {
-                            let selected = self.selected.as_deref() == Some(name.as_str());
-                            let is_file = crate::project::is_file_source(name);
-                            let tab = ui.selectable_label(selected, name);
-                            if tab.clicked() && !selected {
-                                self.selected = Some(name.clone());
-                                self.typing = false;
-                            }
-                            if tab.middle_clicked() {
-                                close = Some(name.clone());
-                            }
-                            tab.on_hover_text(if is_file {
-                                "A file beside the circuit"
-                            } else {
-                                "Kept inside the circuit file"
-                            });
-                            if ui
-                                .small_button("✕")
-                                .on_hover_text(if is_file {
-                                    "Close this tab. The file stays on disk; delete it in the \
-                                     Project panel. (Ctrl+Z brings the tab back)"
-                                } else {
-                                    "Remove this file from the circuit (Ctrl+Z brings it back)"
-                                })
-                                .clicked()
-                            {
-                                close = Some(name.clone());
-                            }
-                            ui.add_space(6.0);
-                        }
-                    });
-                });
-        });
-        if let Some(name) = close {
-            let next = after_closing(names, &name);
-            doc.edit(|s| s.sources.remove(&name));
-            if self.selected.as_deref() == Some(name.as_str()) {
-                self.selected = next;
-                self.typing = false;
-            }
-        }
-    }
-
-    /// What the selected file builds to: its size, or how many errors.
-    fn header(&mut self, ui: &mut Ui, doc: &Document) {
-        ui.horizontal(|ui| {
-            if let Some(name) = self.selected.clone() {
-                let sketch = doc
-                    .schematic()
-                    .sources
-                    .get(&name)
-                    .filter(|f| f.language == SourceLanguage::Cpp)
-                    .map(|f| f.text.clone());
-                if let Some(text) = sketch {
-                    self.build_controls(ui, &name, &text);
-                    return;
+            match self.built.get(name) {
+                Some(Built { result: Ok(a), .. }) => {
+                    ui.label(
+                        RichText::new(format!(
+                            "{} bytes, {} of {} words of flash",
+                            a.image.len(),
+                            a.image.len() / 2,
+                            FLASH_WORDS
+                        ))
+                        .weak(),
+                    );
                 }
-                match self.built.as_ref().filter(|b| b.name == name) {
-                    Some(Built { result: Ok(a), .. }) => {
-                        ui.label(
-                            RichText::new(format!(
-                                "{} bytes, {} of {} words of flash",
-                                a.image.len(),
-                                a.image.len() / 2,
-                                FLASH_WORDS
-                            ))
-                            .weak(),
-                        );
-                    }
-                    Some(Built { result: Err(e), .. }) => {
-                        ui.label(
-                            RichText::new(format!(
-                                "{} error{}",
-                                e.len(),
-                                if e.len() == 1 { "" } else { "s" }
-                            ))
-                            .color(ERROR_RED),
-                        );
-                    }
-                    None => {}
+                Some(Built { result: Err(e), .. }) => {
+                    ui.label(
+                        RichText::new(format!(
+                            "{} error{}",
+                            e.len(),
+                            if e.len() == 1 { "" } else { "s" }
+                        ))
+                        .color(ERROR_RED),
+                    );
                 }
+                None => {}
             }
         });
     }
@@ -893,13 +653,12 @@ impl CodeEditor {
         if ui
             .add_enabled(!building, egui::Button::new("Build"))
             .on_hover_text(
-                "Compile this sketch with arduino-cli. The circuit runs the last build of \
-                 exactly this text, so build again after changing it.",
+                "Save the circuit, then compile this sketch with arduino-cli to check \
+                 it. Run also does this if the sketch has changed.",
             )
             .clicked()
         {
-            let ctx = ui.ctx().clone();
-            self.start_build(&ctx, name, text);
+            self.wanted = Some(name.to_string());
         }
         if building {
             ui.spinner();
@@ -910,11 +669,7 @@ impl CodeEditor {
             ui.label(RichText::new(format!("Built: {} bytes", image.len())).weak());
             return;
         }
-        match self
-            .cpp
-            .as_ref()
-            .filter(|c| c.name == name && c.hash == hash_of(text))
-        {
+        match self.cpp.get(name).filter(|c| c.hash == hash_of(text)) {
             Some(CppBuild {
                 result: Err(BuildError::Failed { diagnostics, .. }),
                 ..
@@ -938,62 +693,6 @@ impl CodeEditor {
         }
     }
 
-    fn create(&mut self, doc: &mut Document, name: &str) {
-        self.create_as(doc, name, SourceLanguage::Asm);
-    }
-
-    /// Add a source file called `typed` (an extension is added if it has
-    /// none). A file of that name already on disk is opened, not replaced.
-    fn create_as(&mut self, doc: &mut Document, typed: &str, language: SourceLanguage) {
-        let (key, language) = file_key(typed, language);
-        let dir = doc.path().and_then(|p| p.parent()).map(|d| d.to_path_buf());
-        let on_disk = dir.as_ref().is_some_and(|d| d.join(&key).is_file());
-        if on_disk
-            && let Some(dir) = &dir
-            && crate::project::attach(doc.schematic_mut(), dir, &key).is_ok()
-        {
-            self.selected = Some(key);
-            self.typing = false;
-            return;
-        }
-        // A circuit that has a file makes the new source file on disk now, as
-        // the Project panel does, rather than keeping it in memory until the
-        // next save.
-        if let Some(dir) = &dir {
-            let kind = match language {
-                SourceLanguage::Asm => crate::project::NewSource::Assembly,
-                SourceLanguage::Cpp => crate::project::NewSource::Sketch,
-            };
-            match crate::project::new_source(dir, &key, kind) {
-                Ok(path) => match crate::project::attach(doc.schematic_mut(), dir, &key) {
-                    Ok(()) => {
-                        self.created.push(path);
-                        self.selected = Some(key);
-                        self.typing = false;
-                        return;
-                    }
-                    Err(e) => {
-                        self.problem = Some(e);
-                        return;
-                    }
-                },
-                Err(e) => {
-                    self.problem = Some(e);
-                    return;
-                }
-            }
-        }
-        // An unsaved circuit has no folder yet: the file is written beside it
-        // when it is first saved.
-        let file = match language {
-            SourceLanguage::Asm => new_file(&doc.schematic().sources, &key),
-            SourceLanguage::Cpp => new_sketch(),
-        };
-        doc.edit(|s| s.sources.insert(key.clone(), file));
-        self.selected = Some(key);
-        self.typing = false;
-    }
-
     #[allow(clippy::too_many_arguments)] // the editor needs the document, the debugger and the file
     fn editor(
         &mut self,
@@ -1014,11 +713,12 @@ impl CodeEditor {
         let plain = ui.visuals().text_color();
         let palette = Palette::new(ui.visuals().dark_mode, plain);
         let weak = ui.visuals().weak_text_color();
-        let is_asm = file.language == SourceLanguage::Asm;
+        let language = file.language;
+        let is_asm = language == SourceLanguage::Asm;
         let mut text = file.text.clone();
 
         let mut jumped = None;
-        if let Some((line, column)) = self.jump.take() {
+        if let Some((_, line, column)) = self.jump.take_if(|(file, ..)| file == name) {
             let index = char_index(&text, line, column);
             let mut state = egui::TextEdit::load_state(ui.ctx(), id).unwrap_or_default();
             state
@@ -1089,7 +789,7 @@ impl CodeEditor {
                         click.on_hover_text("Click to set or clear a breakpoint on this line");
                     }
                     let mut layouter = |ui: &Ui, buffer: &dyn egui::TextBuffer, _wrap: f32| {
-                        let job = highlight(buffer.as_str(), is_asm, &font, &palette, errors);
+                        let job = highlight(buffer.as_str(), language, &font, &palette, errors);
                         let galley: Arc<egui::Galley> = ui.fonts_mut(|f| f.layout_job(job));
                         galley
                     };
@@ -1118,16 +818,55 @@ impl CodeEditor {
             debugger.toggle_source_line(live, name, &file.text, line);
         }
         if changed {
-            if !self.typing {
+            if self.typing.as_deref() != Some(name) {
                 doc.checkpoint();
-                self.typing = true;
+                self.typing = Some(name.to_string());
             }
             if let Some(f) = doc.schematic_mut().sources.get_mut(name) {
                 f.text = text;
             }
         }
-        if !has_focus {
-            self.typing = false;
+        if !has_focus && self.typing.as_deref() == Some(name) {
+            self.typing = None;
+        }
+    }
+}
+
+/// Where the file `name` lives, and whether it is on disk yet.
+fn location_note(ui: &mut Ui, doc: &Document, name: &str) {
+    if !crate::project::is_file_source(name) {
+        ui.label(
+            RichText::new(
+                "Kept inside the circuit file (the older way). The Project panel's \
+                 “Move to files” makes it a file of its own.",
+            )
+            .weak(),
+        );
+        return;
+    }
+    let path = doc.path().and_then(|p| p.parent()).map(|d| d.join(name));
+    match path {
+        Some(path) if path.is_file() => {
+            ui.add(
+                egui::Label::new(RichText::new(format!("📄 {}", path.display())).weak()).truncate(),
+            )
+            .on_hover_text(path.display().to_string());
+        }
+        Some(path) => {
+            ui.colored_label(
+                WARNING_AMBER,
+                format!(
+                    "Not on disk yet: it will be written to {} when you save the circuit.",
+                    path.display()
+                ),
+            );
+        }
+        None => {
+            ui.colored_label(
+                WARNING_AMBER,
+                "Not saved yet: this circuit has no file, so this one will be written next \
+                 to it when you first save the circuit (Ctrl+S).",
+            );
         }
     }
 }
@@ -1196,93 +935,18 @@ mod tests {
     }
 
     #[test]
-    fn names_for_new_files_are_unique_and_say_what_they_are() {
+    fn names_for_new_files_are_unique() {
         let mut sources = BTreeMap::new();
+        let file = SourceFile {
+            language: SourceLanguage::Asm,
+            text: String::new(),
+        };
         assert_eq!(unused_file_name(&sources, "main", "asm"), "main.asm");
-        sources.insert("main.asm".to_string(), new_file(&sources, "main.asm"));
-        assert_eq!(sources["main.asm"].text, STARTER);
+        sources.insert("main.asm".to_string(), file.clone());
         assert_eq!(unused_file_name(&sources, "main", "asm"), "main2.asm");
-        assert_eq!(new_file(&sources, "main2.asm").text, "; main2.asm\n");
-        sources.insert("main2.asm".to_string(), new_file(&sources, "main2.asm"));
+        sources.insert("main2.asm".to_string(), file);
         assert_eq!(unused_file_name(&sources, "main", "asm"), "main3.asm");
-        // What is typed decides the file name and, if it has an extension,
-        // the language.
-        assert_eq!(
-            file_key("blink", SourceLanguage::Asm),
-            ("blink.asm".into(), SourceLanguage::Asm)
-        );
-        assert_eq!(
-            file_key(" fade ", SourceLanguage::Cpp),
-            ("fade.ino".into(), SourceLanguage::Cpp)
-        );
-        assert_eq!(
-            file_key("x.cpp", SourceLanguage::Asm),
-            ("x.cpp".into(), SourceLanguage::Cpp)
-        );
-        assert_eq!(
-            file_key("x.S", SourceLanguage::Cpp),
-            ("x.S".into(), SourceLanguage::Asm)
-        );
         assert_eq!(sketch_name("fw/blink.ino"), "blink");
-    }
-
-    #[test]
-    fn closing_a_tab_shows_its_neighbour() {
-        let names: Vec<String> = ["a.asm", "b.asm", "c.asm"].map(String::from).to_vec();
-        assert_eq!(after_closing(&names, "a.asm").as_deref(), Some("b.asm"));
-        assert_eq!(after_closing(&names, "b.asm").as_deref(), Some("c.asm"));
-        assert_eq!(after_closing(&names, "c.asm").as_deref(), Some("b.asm"));
-        assert_eq!(after_closing(&names[..1], "a.asm"), None);
-        assert_eq!(after_closing(&names, "zzz"), None);
-    }
-
-    #[test]
-    fn a_new_file_never_replaces_one_on_disk() {
-        let dir = std::env::temp_dir().join(format!("dunbrec-code-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("main.asm"), "nop\nnop\n").unwrap();
-        let mut doc = Document::default();
-        doc.mark_saved(dir.join("x.dbr"));
-        let mut editor = CodeEditor::default();
-        editor.create(&mut doc, "main");
-        // The file that was there is opened as it is.
-        assert_eq!(doc.schematic().sources["main.asm"].text, "nop\nnop\n");
-        assert!(!doc.can_undo(), "opening a file is not an edit");
-        // A name nothing has yet makes a new file on disk straight away, and
-        // says so, so the app can list it in the project.
-        editor.create(&mut doc, "fresh");
-        let on_disk = std::fs::read_to_string(dir.join("fresh.asm")).unwrap();
-        assert_eq!(doc.schematic().sources["fresh.asm"].text, on_disk);
-        assert_eq!(editor.take_created(), vec![dir.join("fresh.asm")]);
-        assert!(editor.take_created().is_empty(), "reported once");
-        assert!(!doc.can_undo(), "a file on disk is not an undoable edit");
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn a_new_file_for_an_unsaved_circuit_waits_in_memory() {
-        let mut doc = Document::default();
-        let mut editor = CodeEditor::default();
-        editor.create(&mut doc, "fresh");
-        // The first file of a circuit starts as the blink program.
-        assert_eq!(doc.schematic().sources["fresh.asm"].text, STARTER);
-        assert!(doc.can_undo(), "it is an edit until the circuit is saved");
-        assert!(editor.take_created().is_empty());
-        assert_eq!(editor.take_problem(), None);
-    }
-
-    #[test]
-    fn a_file_that_cannot_be_made_is_reported() {
-        let dir = std::env::temp_dir().join(format!("dunbrec-code-gone-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let mut doc = Document::default();
-        // The circuit's folder does not exist, so the file cannot be written.
-        doc.mark_saved(dir.join("x.dbr"));
-        let mut editor = CodeEditor::default();
-        editor.create(&mut doc, "fresh");
-        assert!(editor.take_problem().is_some());
-        assert!(!doc.schematic().sources.contains_key("fresh.asm"));
-        assert!(editor.take_created().is_empty());
     }
 
     #[test]
@@ -1300,67 +964,140 @@ mod tests {
     fn the_highlight_keeps_every_character() {
         let font = FontId::monospace(13.0);
         let palette = Palette::new(true, Color32::WHITE);
-        for text in ["", "\n", "nop\n", "ldi r16, é\r\nbad ; c\n\nx:", "\"open"] {
-            let errors = [AsmError {
-                line: 1,
-                column: 2,
-                message: String::new(),
-            }];
-            let job = highlight(text, true, &font, &palette, &errors);
-            assert_eq!(job.text, text);
+        for text in [
+            "",
+            "\n",
+            "nop\n",
+            "ldi r16, é\r\nbad ; c\n\nx:",
+            "\"open",
+            "/* a\r\nb */ int x = 1; // é\n“smart”",
+        ] {
+            for language in [SourceLanguage::Asm, SourceLanguage::Cpp] {
+                // A mistake anywhere, including on a character of several
+                // bytes and past the end.
+                for (line, column) in (1..=3).flat_map(|l| (0..30).map(move |c| (l, c))) {
+                    let errors = [AsmError {
+                        line,
+                        column,
+                        message: String::new(),
+                    }];
+                    let job = highlight(text, language, &font, &palette, &errors);
+                    assert_eq!(job.text, text);
+                    for s in &job.sections {
+                        assert!(job.text.get(s.byte_range.clone()).is_some(), "{text:?}");
+                    }
+                }
+            }
         }
     }
 
     #[test]
-    fn the_panel_draws_and_typing_edits_the_document() {
+    fn numbers_are_orange_in_both_kinds_of_file() {
+        let font = FontId::monospace(13.0);
+        for dark in [false, true] {
+            let palette = Palette::new(dark, Color32::GRAY);
+            let orange = palette.color(Kind::Number);
+            assert!(
+                orange.r() > orange.g() && orange.g() > orange.b(),
+                "{orange:?}"
+            );
+            for (language, text) in [
+                (SourceLanguage::Asm, "ldi r16, 42"),
+                (SourceLanguage::Cpp, "delay(42);"),
+            ] {
+                let job = highlight(text, language, &font, &palette, &[]);
+                let number = job
+                    .sections
+                    .iter()
+                    .find(|s| &job.text[s.byte_range.clone()] == "42")
+                    .expect("the number is a piece of its own");
+                assert_eq!(number.format.color, orange);
+            }
+        }
+    }
+
+    #[test]
+    fn a_sketch_comment_over_two_lines_is_all_one_colour() {
+        let font = FontId::monospace(13.0);
+        let palette = Palette::new(false, Color32::BLACK);
+        let text = "/* one\nint two\n*/ int three;";
+        let job = highlight(text, SourceLanguage::Cpp, &font, &palette, &[]);
+        let colour_at = |word: &str| {
+            let at = text.find(word).unwrap();
+            let section = job
+                .sections
+                .iter()
+                .find(|s| s.byte_range.contains(&at))
+                .unwrap();
+            section.format.color
+        };
+        assert_eq!(colour_at("int two"), palette.color(Kind::Comment));
+        assert_eq!(colour_at("int three"), palette.color(Kind::Keyword));
+    }
+
+    /// A circuit with one source file.
+    fn with_file(name: &str, language: SourceLanguage, text: &str) -> Document {
         let mut doc = Document::default();
+        doc.edit(|s| {
+            s.sources.insert(
+                name.into(),
+                SourceFile {
+                    language,
+                    text: text.into(),
+                },
+            )
+        });
+        doc
+    }
+
+    #[test]
+    fn each_file_in_view_is_drawn_and_built_for_itself() {
+        let mut doc = with_file("good.asm", SourceLanguage::Asm, STARTER);
+        doc.edit(|s| {
+            s.sources.insert(
+                "bad.asm".into(),
+                SourceFile {
+                    language: SourceLanguage::Asm,
+                    text: "nop\nldi r16, nothing\n".into(),
+                },
+            )
+        });
         let mut editor = CodeEditor::default();
         let mut debugger = Debugger::default();
         let mut live = None;
         let ctx = egui::Context::default();
-        let mut frame = |doc: &mut Document, editor: &mut CodeEditor| {
+        // Side by side, as two tabs split in the circuit's row.
+        for _ in 0..3 {
             let _ = ctx.run(egui::RawInput::default(), |ctx| {
-                egui::CentralPanel::default()
-                    .show(ctx, |ui| editor.show(ui, doc, &mut debugger, &mut live));
+                egui::SidePanel::left("left").show(ctx, |ui| {
+                    editor.show_file(ui, &mut doc, &mut debugger, &mut live, "good.asm")
+                });
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    editor.show_file(ui, &mut doc, &mut debugger, &mut live, "bad.asm");
+                });
             });
-        };
-        // No files: the empty state draws.
-        frame(&mut doc, &mut editor);
-        editor.create(&mut doc, "main");
-        assert!(doc.schematic().sources.contains_key("main.asm"));
-        assert!(doc.can_undo());
-        // A file with a mistake draws, with its error list.
-        doc.schematic_mut()
-            .sources
-            .get_mut("main.asm")
-            .unwrap()
-            .text = "nop\nldi r16, nothing\n".into();
-        frame(&mut doc, &mut editor);
-        frame(&mut doc, &mut editor);
-        let built = editor.built.as_ref().unwrap();
-        assert_eq!(built.result.as_ref().unwrap_err()[0].line, 2);
-        // Deleting goes back to the empty state, and undo restores the file.
-        editor.selected = Some("main.asm".into());
-        doc.edit(|s| s.sources.remove("main.asm"));
-        frame(&mut doc, &mut editor);
-        assert!(doc.undo());
-        frame(&mut doc, &mut editor);
-        assert_eq!(editor.selected.as_deref(), Some("main.asm"));
+        }
+        assert!(editor.built["good.asm"].result.is_ok());
+        let errors = editor.built["bad.asm"].result.as_ref().unwrap_err();
+        assert_eq!(errors[0].line, 2);
+        // A file that has gone draws nothing.
+        doc.edit(|s| s.sources.clear());
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                editor.show_file(ui, &mut doc, &mut debugger, &mut live, "good.asm");
+            });
+        });
     }
 
     #[test]
-    fn a_sketch_builds_from_the_panel_and_the_result_is_kept() {
+    fn the_starter_sketch_builds_and_the_result_is_kept() {
         let Some(_) = arduino::find_cli(None) else {
             eprintln!("arduino-cli not installed: skipped");
             return;
         };
         let ctx = egui::Context::default();
         let mut editor = CodeEditor::default();
-        let mut doc = Document::default();
-        editor.create_as(&mut doc, "main", SourceLanguage::Cpp);
-        let text = doc.schematic().sources["main.ino"].text.clone();
-        assert_eq!(text, STARTER_SKETCH);
-        editor.start_build(&ctx, "main.ino", &text);
+        editor.build_sketch(&ctx, "main.ino", STARTER_SKETCH);
         assert!(editor.building.is_some());
         let started = std::time::Instant::now();
         while editor.building.is_some() {
@@ -1371,14 +1108,12 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(50));
             editor.poll_build(&ctx);
         }
-        let done = editor.cpp.as_ref().expect("a result");
+        let done = editor.cpp.get("main.ino").expect("a result");
         assert!(done.result.is_ok(), "{:?}", done.result);
-        assert!(arduino::cached_image(&text).is_some());
+        assert!(arduino::cached_image(STARTER_SKETCH).is_some());
         // A sketch with a mistake keeps its diagnostics for the error list.
-        let bad = "void setup() {}
-void loop() { oops(); }
-";
-        editor.start_build(&ctx, "main.ino", bad);
+        let bad = "void setup() {}\nvoid loop() { oops(); }\n";
+        editor.build_sketch(&ctx, "main.ino", bad);
         while editor.building.is_some() {
             std::thread::sleep(std::time::Duration::from_millis(50));
             editor.poll_build(&ctx);
@@ -1386,7 +1121,7 @@ void loop() { oops(); }
         let Some(CppBuild {
             result: Err(BuildError::Failed { diagnostics, .. }),
             ..
-        }) = &editor.cpp
+        }) = editor.cpp.get("main.ino")
         else {
             panic!("expected a failed build");
         };

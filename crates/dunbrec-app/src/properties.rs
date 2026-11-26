@@ -3,7 +3,8 @@
 use std::collections::HashMap;
 
 use dunbrec_core::{
-    ComponentId, ComponentKind, ModelKind, Polarity, Schematic, SwitchForm, Waveform,
+    ComponentId, ComponentKind, ModelKind, Polarity, Schematic, SourceLanguage, SwitchForm,
+    Waveform,
     units::{format_value, parse_eng, parse_spice},
 };
 use egui::{Color32, RichText, Ui};
@@ -23,9 +24,24 @@ pub struct Properties {
     /// Set while a slider is being dragged: changes apply live, and only
     /// the first frame of the drag records an undo step.
     continuous: bool,
-    /// A source file the user asked to edit; the app opens the Code panel
-    /// on it and clears this.
+    /// A source file the user asked to edit; the app shows its tab and
+    /// clears this.
     pub open_code: Option<String>,
+    /// A demo program the user asked to have a copy of; the app makes the
+    /// file and clears this.
+    pub demo: Option<DemoRequest>,
+    /// A microcontroller the user asked to give a new source file, and in
+    /// which language; the app makes it and clears this.
+    pub new_file: Option<(ComponentId, SourceLanguage)>,
+}
+
+/// A microcontroller asking for its own copy of a demo program.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DemoRequest {
+    pub chip: ComponentId,
+    /// The demo's name, as in [`dunbrec_mcu::demos`].
+    pub demo: &'static str,
+    pub language: SourceLanguage,
 }
 
 /// A change the panel wants to make; applied with an undo checkpoint.
@@ -116,9 +132,6 @@ impl Properties {
                 }
 
                 let mut k = c.kind.clone();
-                // Set when "New assembly file…" is picked: the file to add
-                // along with the firmware change.
-                let mut new_source: Option<String> = None;
                 let changed = match &mut k {
                     ComponentKind::Ground | ComponentKind::Junction => false,
                     ComponentKind::Resistor { resistance } => {
@@ -304,109 +317,125 @@ impl Properties {
                             *firmware = f.trim().to_string();
                             changed = true;
                         }
+                        // One control to a row, so that none is cut off in
+                        // a narrow panel.
                         ui.label("");
-                        ui.horizontal(|ui| {
-                            if ui
-                                .button("Browse…")
-                                .on_hover_text("Choose an Intel HEX file")
-                                .clicked()
-                                && let Some(path) = rfd::FileDialog::new()
-                                    .add_filter("Intel HEX", &["hex", "ihx"])
-                                    .add_filter("All files", &["*"])
-                                    .pick_file()
-                            {
-                                *firmware = path.display().to_string();
-                                changed = true;
-                            }
-                            egui::ComboBox::from_id_salt(("builtin", id))
-                                .selected_text("Built-in demo")
-                                .show_ui(ui, |ui| {
-                                    for (name, about) in dunbrec_mcu::programs::BUILTIN {
+                        if ui
+                            .button("Browse…")
+                            .on_hover_text("Choose an Intel HEX file")
+                            .clicked()
+                            && let Some(path) = rfd::FileDialog::new()
+                                .add_filter("Intel HEX", &["hex", "ihx"])
+                                .add_filter("All files", &["*"])
+                                .pick_file()
+                        {
+                            *firmware = path.display().to_string();
+                            changed = true;
+                        }
+                        ui.end_row();
+                        let builtin = builtin_demo(firmware).map(str::to_string);
+                        ui.label("Demo");
+                        egui::ComboBox::from_id_salt(("demo", id))
+                            .width(CONTROL_WIDTH)
+                            // The built-in program the chip runs, if it runs one.
+                            .selected_text(builtin.as_deref().unwrap_or("Choose…"))
+                            .show_ui(ui, |ui| {
+                                for (name, about) in dunbrec_mcu::programs::BUILTIN {
+                                    for &(language, label) in DEMO_LANGUAGES {
+                                        let hint = format!(
+                                            "{about}.\nMakes your own copy, as a file you \
+                                             can change."
+                                        );
                                         if ui
-                                            .selectable_label(false, *name)
-                                            .on_hover_text(*about)
+                                            .selectable_label(false, format!("{name} ({label})"))
+                                            .on_hover_text(hint)
                                             .clicked()
                                         {
-                                            *firmware = format!(
-                                                "{}{name}",
-                                                dunbrec_mcu::firmware::BUILTIN_PREFIX
-                                            );
-                                            changed = true;
+                                            self.demo = Some(DemoRequest {
+                                                chip: id,
+                                                demo: name,
+                                                language,
+                                            });
                                         }
                                     }
-                                });
-                        });
+                                }
+                            });
                         ui.end_row();
                         ui.label("");
-                        ui.horizontal(|ui| {
-                            egui::ComboBox::from_id_salt(("source", id))
-                                .selected_text("Source file")
-                                .show_ui(ui, |ui| {
-                                    for name in schematic.sources.keys() {
-                                        let reference = source_reference(name);
-                                        if ui
-                                            .selectable_label(*firmware == reference, name)
-                                            .clicked()
-                                        {
-                                            *firmware = reference;
-                                            changed = true;
-                                        }
-                                    }
-                                    if ui.selectable_label(false, "New assembly file…").clicked()
+                        egui::ComboBox::from_id_salt(("source", id))
+                            .width(CONTROL_WIDTH)
+                            .selected_text("Source file")
+                            .show_ui(ui, |ui| {
+                                for name in schematic.sources.keys() {
+                                    let reference = source_reference(name);
+                                    if ui
+                                        .selectable_label(*firmware == reference, name)
+                                        .clicked()
                                     {
-                                        let name = crate::code_ui::unused_file_name(
-                                            &schematic.sources,
-                                            "main",
-                                            "asm",
-                                        );
-                                        *firmware = source_reference(&name);
-                                        self.open_code = Some(name.clone());
-                                        new_source = Some(name);
+                                        *firmware = reference;
                                         changed = true;
                                     }
-                                });
-                            if let Some(name) = source_name(firmware)
-                                && ui
-                                    .button("Edit")
-                                    .on_hover_text("Open this source file in the Code panel")
-                                    .clicked()
+                                }
+                                for (language, label) in [
+                                    (SourceLanguage::Cpp, "New Arduino sketch…"),
+                                    (SourceLanguage::Asm, "New assembly file…"),
+                                ] {
+                                    if ui.selectable_label(false, label).clicked() {
+                                        self.new_file = Some((id, language));
+                                    }
+                                }
+                            });
+                        ui.end_row();
+                        if let Some(name) = source_name(firmware) {
+                            ui.label("");
+                            if ui
+                                .button("Edit code")
+                                .on_hover_text("Show this source file's tab")
+                                .clicked()
                             {
                                 self.open_code = Some(name);
                             }
-                        });
-                        ui.end_row();
+                            ui.end_row();
+                        } else if let Some(demo) =
+                            builtin.as_deref().and_then(dunbrec_mcu::demos::demo)
+                        {
+                            ui.label("");
+                            ui.menu_button("Edit code", |ui| {
+                                for &(language, label) in DEMO_LANGUAGES {
+                                    if ui.button(format!("Copy as {label}")).clicked() {
+                                        self.demo = Some(DemoRequest {
+                                            chip: id,
+                                            demo: demo.name,
+                                            language,
+                                        });
+                                        ui.close();
+                                    }
+                                }
+                            })
+                            .response
+                            .on_hover_text(
+                                "A built-in demo has no file: make your own copy to change",
+                            );
+                            ui.end_row();
+                        }
                         let clock_changed = self.value(ui, id, "Clock", "Hz", clock);
                         ui.label("");
-                        ui.label(
-                            egui::RichText::new(
-                                "A source file (.asm, .ino) is a file beside this schematic, \
-                                 built each time the simulation starts; the Project panel \
-                                 lists the files of a project. For a compiled program: \
-                                 Arduino IDE, Sketch → Export Compiled Binary, then pick the \
-                                 .hex without \"with_bootloader\"; it is reloaded each time \
-                                 too.",
-                            )
-                            .small()
-                            .weak(),
-                        );
+                        ui.vertical(|ui| {
+                            ui.set_max_width(CONTROL_WIDTH);
+                            let help = "A source file is a file beside this circuit. Assembly \
+                                        (.asm) and sketches (.ino) are built when you press \
+                                        Run, sketches only if changed. For a program \
+                                        compiled elsewhere: Arduino IDE, Sketch > Export \
+                                        Compiled Binary, then pick the .hex without \
+                                        \"with_bootloader\".";
+                            ui.add(egui::Label::new(RichText::new(help).small().weak()).wrap());
+                        });
                         ui.end_row();
                         changed | clock_changed
                     }
                 };
                 if changed {
-                    edit = match new_source {
-                        Some(name) => {
-                            let kind = k.clone();
-                            Some(Box::new(move |s: &mut Schematic| {
-                                let file = crate::code_ui::new_file(&s.sources, &name);
-                                s.sources.entry(name).or_insert(file);
-                                if let Some(c) = s.component_mut(id) {
-                                    c.kind = kind;
-                                }
-                            }))
-                        }
-                        None => set_kind(k),
-                    };
+                    edit = set_kind(k);
                 }
             });
 
@@ -685,7 +714,7 @@ impl Properties {
                         *buffer = format_value(*value, "");
                     }
                     if ui
-                        .small_button("✕")
+                        .small_button("×")
                         .on_hover_text("Remove (use the default)")
                         .clicked()
                     {
@@ -751,6 +780,22 @@ fn parse_pwl(text: &str) -> Option<Vec<(f64, f64)>> {
     }
     let rising = points.windows(2).all(|w| w[1].0 > w[0].0);
     (!points.is_empty() && rising).then_some(points)
+}
+
+/// The languages a demo program comes in, and what to call them.
+const DEMO_LANGUAGES: &[(SourceLanguage, &str)] = &[
+    (SourceLanguage::Cpp, "Arduino"),
+    (SourceLanguage::Asm, "assembly"),
+];
+
+/// Width of the controls under a microcontroller's firmware field.
+const CONTROL_WIDTH: f32 = 140.0;
+
+/// The name of the built-in program a firmware setting selects, if it does.
+fn builtin_demo(firmware: &str) -> Option<&str> {
+    firmware
+        .trim()
+        .strip_prefix(dunbrec_mcu::firmware::BUILTIN_PREFIX)
 }
 
 /// The firmware reference that selects the source called `name`: its path,

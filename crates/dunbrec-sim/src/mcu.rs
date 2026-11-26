@@ -18,6 +18,7 @@
 //! is exact to the clock cycle. Nothing the chip did between those points
 //! could affect the circuit, because it had no event there.
 
+use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -284,28 +285,61 @@ pub fn load_firmware(
     base_dir: Option<&Path>,
     sources: &BTreeMap<String, SourceFile>,
 ) -> Result<Vec<u8>, String> {
+    match find_source(reference, base_dir, sources) {
+        Some(found) => {
+            let (name, file) = found?;
+            build_source(&name, &file)
+        }
+        None => dunbrec_mcu::firmware::load(reference, base_dir),
+    }
+}
+
+/// The Arduino sketch a firmware reference names, if it has not been built
+/// since it last changed: its name and text. It has to be built (see
+/// [`dunbrec_mcu::arduino`]) before [`load_firmware`] can give its image.
+/// References are resolved as `load_firmware` does.
+pub fn unbuilt_sketch(
+    reference: &str,
+    base_dir: Option<&Path>,
+    sources: &BTreeMap<String, SourceFile>,
+) -> Option<(String, String)> {
+    let (name, file) = find_source(reference, base_dir, sources)?.ok()?;
+    let unbuilt = file.language == SourceLanguage::Cpp
+        && dunbrec_mcu::arduino::cached_image(&file.text).is_none();
+    unbuilt.then(|| (name, file.into_owned().text))
+}
+
+/// The source file a firmware reference names, with its name; `None` if it
+/// names something else (a built-in program or a `.hex` file).
+fn find_source<'a>(
+    reference: &str,
+    base_dir: Option<&Path>,
+    sources: &'a BTreeMap<String, SourceFile>,
+) -> Option<Result<(String, Cow<'a, SourceFile>), String>> {
     let trimmed = reference.trim();
     if let Some(name) = trimmed.strip_prefix(SOURCE_PREFIX) {
         let name = name.trim();
-        let file = sources.get(name).ok_or_else(|| {
-            if name.is_empty() {
-                "no source file selected for this microcontroller".to_string()
-            } else {
-                format!("this schematic has no source file called '{name}'")
+        return Some(match sources.get(name) {
+            Some(file) => Ok((name.to_string(), Cow::Borrowed(file))),
+            None if name.is_empty() => {
+                Err("no source file selected for this microcontroller".to_string())
             }
-        })?;
-        return build_source(name, file);
+            None => Err(format!("this schematic has no source file called '{name}'")),
+        });
     }
-    if let Some(language) = dunbrec_core::source_language_of(trimmed) {
-        if let Some(file) = sources.get(trimmed) {
-            return build_source(trimmed, file);
-        }
-        let path = dunbrec_mcu::firmware::resolve(trimmed, base_dir).expect("not a built-in");
-        let text = std::fs::read_to_string(&path)
-            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-        return build_source(trimmed, &SourceFile { language, text });
+    let language = dunbrec_core::source_language_of(trimmed)?;
+    if let Some(file) = sources.get(trimmed) {
+        return Some(Ok((trimmed.to_string(), Cow::Borrowed(file))));
     }
-    dunbrec_mcu::firmware::load(reference, base_dir)
+    let path = dunbrec_mcu::firmware::resolve(trimmed, base_dir).expect("not a built-in");
+    Some(
+        std::fs::read_to_string(&path)
+            .map(|text| {
+                let file = SourceFile { language, text };
+                (trimmed.to_string(), Cow::Owned(file))
+            })
+            .map_err(|e| format!("cannot read {}: {e}", path.display())),
+    )
 }
 
 /// Build a source file into a flash image.
@@ -330,7 +364,7 @@ fn build_source(name: &str, file: &SourceFile) -> Result<Vec<u8>, String> {
         SourceLanguage::Cpp => dunbrec_mcu::arduino::cached_image(&file.text).ok_or_else(|| {
             format!(
                 "'{name}' is a C++ sketch that has not been built since it last changed: \
-                 press Build in the Code panel first"
+                 Run builds it, or press Build in its tab"
             )
         }),
     }

@@ -4,7 +4,7 @@
 use crate::float::{self, Spec};
 use std::collections::BTreeMap;
 
-use egui::{Color32, FontId, RichText};
+use egui::{RichText, TextStyle};
 
 /// Most characters kept per microcontroller.
 const MAX_CHARS: usize = 64 * 1024;
@@ -139,10 +139,13 @@ impl SerialMonitor {
                                 .weak(),
                             );
                         } else {
+                            // The theme's strongest text, to be easy to read
+                            // on its background, light or dark.
+                            let colour = ui.visuals().strong_text_color();
                             ui.label(
                                 RichText::new(text)
-                                    .font(FontId::monospace(12.0))
-                                    .color(Color32::from_rgb(200, 230, 210)),
+                                    .text_style(TextStyle::Monospace)
+                                    .color(colour),
                             );
                         }
                     });
@@ -154,6 +157,43 @@ impl SerialMonitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn what_arrives_stands_out_in_both_themes() {
+        let brightness = |c: egui::Color32| {
+            (0.2126 * f32::from(c.r()) + 0.7152 * f32::from(c.g()) + 0.0722 * f32::from(c.b()))
+                / 255.0
+        };
+        for theme in [egui::Theme::Light, egui::Theme::Dark] {
+            let mut m = SerialMonitor::default();
+            m.push("U1", b"Reading = 511");
+            let ctx = egui::Context::default();
+            ctx.set_theme(theme);
+            let mut behind = egui::Color32::TRANSPARENT;
+            let mut out = Default::default();
+            for _ in 0..2 {
+                out = ctx.run(egui::RawInput::default(), |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        behind = ui.visuals().panel_fill;
+                        m.ui(ui);
+                    });
+                });
+            }
+            let out: egui::FullOutput = out;
+            let ink = out
+                .shapes
+                .iter()
+                .find_map(|c| match &c.shape {
+                    egui::Shape::Text(t) if t.galley.text() == "Reading = 511" => {
+                        Some(t.galley.job.sections[0].format.color)
+                    }
+                    _ => None,
+                })
+                .expect("the text is drawn");
+            let apart = (brightness(ink) - brightness(behind)).abs();
+            assert!(apart > 0.6, "{theme:?}: {ink:?} on {behind:?}");
+        }
+    }
 
     #[test]
     fn decoding_and_limits() {

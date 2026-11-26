@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 pub const STORAGE_KEY: &str = "dunbrec.settings";
 /// Most recent files remembered.
 const RECENT_LIMIT: usize = 8;
+/// Most projects the Projects screen remembers (it shows them in pages).
+pub const RECENT_PROJECT_LIMIT: usize = 50;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum Theme {
@@ -22,6 +24,37 @@ impl Theme {
             Theme::System => egui::ThemePreference::System,
             Theme::Light => egui::ThemePreference::Light,
             Theme::Dark => egui::ThemePreference::Dark,
+        }
+    }
+}
+
+/// How large the menu bar, its menus and the toolbar are drawn, compared with
+/// the rest of the interface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum BarSize {
+    Small,
+    #[default]
+    Medium,
+    Large,
+}
+
+impl BarSize {
+    pub const ALL: [BarSize; 3] = [BarSize::Small, BarSize::Medium, BarSize::Large];
+
+    /// What their text and buttons are multiplied by, on top of the text size.
+    pub fn factor(self) -> f32 {
+        match self {
+            BarSize::Small => 1.0,
+            BarSize::Medium => 1.35,
+            BarSize::Large => 1.7,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            BarSize::Small => "Small",
+            BarSize::Medium => "Medium",
+            BarSize::Large => "Large",
         }
     }
 }
@@ -69,6 +102,7 @@ impl TextSize {
 pub struct Settings {
     pub theme: Theme,
     pub text_size: TextSize,
+    pub bar_size: BarSize,
     /// Most recent first.
     pub recent: Vec<PathBuf>,
     /// Project folders, most recent first.
@@ -93,7 +127,7 @@ impl Settings {
     pub fn remember_project(&mut self, path: &Path) {
         self.recent_projects.retain(|p| p != path);
         self.recent_projects.insert(0, path.to_path_buf());
-        self.recent_projects.truncate(RECENT_LIMIT);
+        self.recent_projects.truncate(RECENT_PROJECT_LIMIT);
     }
 
     /// Empty the recent-files list.
@@ -108,6 +142,15 @@ impl Settings {
 
     pub fn forget_project(&mut self, path: &Path) {
         self.recent_projects.retain(|p| p != path);
+    }
+
+    /// A project file was renamed: its entry in the list follows it.
+    pub fn rename_project(&mut self, from: &Path, to: &Path) {
+        for p in &mut self.recent_projects {
+            if p == from {
+                *p = to.to_path_buf();
+            }
+        }
     }
 }
 
@@ -144,9 +187,21 @@ mod tests {
         assert_eq!(s.recent_projects, [PathBuf::from("a"), PathBuf::from("b")]);
         s.forget_project(Path::new("a"));
         assert_eq!(s.recent_projects, [PathBuf::from("b")]);
+        s.rename_project(Path::new("b"), Path::new("b2"));
+        assert_eq!(s.recent_projects, [PathBuf::from("b2")]);
+        s.rename_project(Path::new("b2"), Path::new("b"));
         s.remember_project(Path::new("c"));
         s.clear_recent_projects();
         assert!(s.recent_projects.is_empty());
+        for i in 0..RECENT_PROJECT_LIMIT + 5 {
+            s.remember_project(Path::new(&format!("p{i}")));
+        }
+        assert_eq!(s.recent_projects.len(), RECENT_PROJECT_LIMIT);
+        assert_eq!(
+            s.recent_projects[0],
+            PathBuf::from(format!("p{}", RECENT_PROJECT_LIMIT + 4))
+        );
+        s.clear_recent_projects();
         s.remember(Path::new("f.dbr"));
         s.clear_recent();
         assert!(s.recent.is_empty());
@@ -166,6 +221,18 @@ mod tests {
         assert_eq!(s.theme, Theme::Dark);
         assert_eq!(s.text_size, TextSize::Normal);
         assert!(s.recent.is_empty());
+    }
+
+    #[test]
+    fn menu_and_toolbar_sizes_grow_from_the_plain_one() {
+        let factors: Vec<f32> = BarSize::ALL.iter().map(|b| b.factor()).collect();
+        assert_eq!(factors[0], 1.0);
+        assert!(factors.windows(2).all(|w| w[0] < w[1]));
+        // Settings saved before there was a choice get the middle one.
+        let s: Settings = ron::from_str("(text_size: Large)").unwrap();
+        assert_eq!(s.bar_size, BarSize::Medium);
+        let s: Settings = ron::from_str("(bar_size: Large)").unwrap();
+        assert_eq!(s.bar_size, BarSize::Large);
     }
 
     #[test]

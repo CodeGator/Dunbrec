@@ -135,6 +135,13 @@ impl Document {
         self.saved_state_id = self.state_id;
     }
 
+    /// Count the document as having unsaved changes, with nothing to undo:
+    /// it differs from its file from the start. Only saving clears this.
+    pub fn mark_unsaved(&mut self) {
+        // No state ever has this id.
+        self.saved_state_id = u64::MAX;
+    }
+
     /// File name for the window title, e.g. "amp.dbr" or "Untitled".
     pub fn display_name(&self) -> String {
         self.path

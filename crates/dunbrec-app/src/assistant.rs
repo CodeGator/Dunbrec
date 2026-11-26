@@ -63,6 +63,18 @@ automatic name such as N001); any other name is a new net that only the new part
 R5 resistor 10k VOUT 0
 C3 capacitor 100n VOUT 0
 Q2 npn 2N3904 NODEC NODEB 0
+V2 vsource 9 VCC 0
+```
+Every part needs one net per pin, with none left out: a source has two (V2 above is + then -, \
+so ground is written as 0 for its second pin). For example, a complete common-emitter stage:
+```dunbrec-add
+V1 vsource 9 VCC 0
+R1 resistor 220k VCC BASE
+R2 resistor 2.2k VCC COL
+R3 resistor 470 EMIT 0
+C1 capacitor 10u IN BASE
+C2 capacitor 100u EMIT 0
+Q1 npn 2N3904 COL BASE EMIT
 ```
 Kinds, what the value means, and the order of the pins (list the nets in that order):
 {PARTS}
@@ -73,6 +85,15 @@ wires; any other part goes below the drawing, joined by net labels.
 
 4. To remove parts, write a fenced block tagged dunbrec-remove with one designator per \
 line. Wires the user drew to a part stay where they are.
+
+A new part, including an input signal, is always added with dunbrec-add (an AC source is \
+vsine with the value amplitude@frequency, such as 0.01@1k); dunbrec-set only changes the \
+value of a part already in the circuit, one NAME = value per line. \
+Use the kind words exactly as listed (a voltage source is vsource, not voltage), and \
+give every part a line; one unknown kind rejects the whole block. To build a circuit, put every part in dunbrec-add blocks (and any value changes in \
+dunbrec-set); a netlist or description in an ordinary code fence adds nothing. Never say \
+you have created, added or changed anything: nothing happens until the user presses \
+Apply on the card, so say you are suggesting it and ask them to press Apply.
 
 Use ordinary code fences, with no dunbrec tag, for examples that are not meant to be \
 applied. The current document follows.";

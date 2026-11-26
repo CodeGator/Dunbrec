@@ -35,6 +35,7 @@ use dunbrec_core::{
     NodeId, OPAMP_PARTS, Point, Polarity, Rotation, Schematic, Waveform, build_netlist,
 };
 use dunbrec_io::layout::{self, Part, STUB, is_ground, outward};
+use dunbrec_io::tidy;
 
 use crate::canvas::NodeMap;
 use crate::library::{
@@ -148,6 +149,7 @@ const KINDS: &[(&str, &str, &str)] = &[
     ("potentiometer", "10k", "total ohms"),
     ("switch", "open", "open or closed"),
     ("vsource", "5", "DC volts"),
+    ("vsine", "0.1@1k", "sine source: peak volts@hertz"),
     ("isource", "1m", "DC amps"),
     ("diode", "generic", "generic, or a model such as 1N4148"),
     ("npn", "generic", "generic, or 2N3904"),
@@ -196,6 +198,18 @@ fn build_kind(word: &str, value: &str) -> Result<(K, String), String> {
                 Err("the value must be above zero.".to_string())
             }
         })
+    };
+    // Words a model often uses for the kinds listed in KINDS.
+    let word = match word {
+        "voltage" | "battery" | "dc" | "supply" | "vdc" | "voltagesource" => "vsource",
+        "current" | "currentsource" => "isource",
+        "sine" | "ac" | "vac" | "vsin" | "sinesource" | "signal" => "vsine",
+        "cap" => "capacitor",
+        "res" => "resistor",
+        "ind" => "inductor",
+        "pot" => "potentiometer",
+        "bjt" | "npn_bjt" => "npn",
+        other => other,
     };
     Ok(match word {
         "resistor" => {
@@ -258,6 +272,33 @@ fn build_kind(word: &str, value: &str) -> Result<(K, String), String> {
                     waveform: Waveform::Dc(v),
                 },
                 format!("DC voltage source {}", format_value(v, "V")),
+            )
+        }
+        "vsine" => {
+            let (amp, freq) = value
+                .split_once('@')
+                .ok_or("write the value as amplitude@frequency, such as 0.1@1k.")?;
+            let amplitude = parse_eng(amp).map_err(|e| e.to_string())?;
+            let frequency = parse_eng(freq).map_err(|e| e.to_string())?;
+            if !(amplitude.is_finite() && frequency > 0.0 && frequency.is_finite()) {
+                return Err("the amplitude must be a number and the frequency above zero.".into());
+            }
+            (
+                K::VoltageSource {
+                    waveform: Waveform::Sine {
+                        offset: 0.0,
+                        amplitude,
+                        frequency,
+                        delay: 0.0,
+                        damping: 0.0,
+                        phase: 0.0,
+                    },
+                },
+                format!(
+                    "sine source {} peak at {}",
+                    format_value(amplitude, "V"),
+                    format_value(frequency, "Hz")
+                ),
             )
         }
         "isource" => {
@@ -499,7 +540,7 @@ pub fn add_parts(s: &mut Schematic, parts: &[NewPart]) -> Result<Vec<String>, St
             None => leftover.push(p),
         }
     }
-    if !leftover.is_empty() {
+    if !leftover.is_empty() && !place_tidy(s, &before, &nets, &leftover, &mut notes) {
         place_with_labels(s, &before, &nets, &leftover, &mut notes);
     }
     for p in parts {
@@ -579,22 +620,7 @@ fn place_with_labels(
             rotation: Rotation::R0,
         })
         .collect();
-    let placed = layout::layout(&layout_parts, ModelLibrary::new());
-    let (dx, dy) = free_space_below(s);
-    let shift = |p: Point| Point::new(p.x + dx, p.y + dy);
-    for c in &placed.components {
-        let id = s.add_component_named(c.kind.clone(), c.designator.clone(), shift(c.position));
-        if let Some(new) = s.component_mut(id) {
-            new.rotation = c.rotation;
-            new.mirrored = c.mirrored;
-        }
-    }
-    for w in &placed.wires {
-        s.add_wire(shift(w.a), shift(w.b));
-    }
-    for l in &placed.labels {
-        s.add_label(l.name.clone(), shift(l.position));
-    }
+    paste(s, &layout::layout(&layout_parts, ModelLibrary::new()));
 
     for a in &anchors {
         let Some(c) = s.component(a.component) else {
@@ -622,6 +648,74 @@ fn place_with_labels(
             " (move them if you want it tidier)"
         }
     ));
+}
+
+/// Copy a drawing made on its own into `s`, in the free space below what is
+/// already drawn.
+fn paste(s: &mut Schematic, placed: &Schematic) {
+    let (dx, dy) = free_space_below(s);
+    let shift = |p: Point| Point::new(p.x + dx, p.y + dy);
+    for c in &placed.components {
+        let id = s.add_component_named(c.kind.clone(), c.designator.clone(), shift(c.position));
+        if let Some(new) = s.component_mut(id) {
+            new.rotation = c.rotation;
+            new.mirrored = c.mirrored;
+        }
+    }
+    for w in &placed.wires {
+        s.add_wire(shift(w.a), shift(w.b));
+    }
+    for l in &placed.labels {
+        s.add_label(l.name.clone(), shift(l.position));
+    }
+}
+
+/// Draw parts that only join each other (and ground) the way a person would:
+/// rails, columns and real wires. Only used when the result passes the same
+/// check as everything else; otherwise `s` is left alone and false returned.
+fn place_tidy(
+    s: &mut Schematic,
+    before: &Netlist,
+    nets: &HashMap<String, Net>,
+    parts: &[&NewPart],
+    notes: &mut Vec<String>,
+) -> bool {
+    let only_new = parts
+        .iter()
+        .flat_map(|p| &p.nets)
+        .all(|n| is_ground(n) || matches!(nets.get(n), Some(Net::New)));
+    if !only_new {
+        return false;
+    }
+    let layout_parts: Vec<Part> = parts
+        .iter()
+        .map(|p| Part {
+            designator: p.designator.clone(),
+            kind: p.kind.clone(),
+            nets: p.nets.clone(),
+            position: None,
+            rotation: Rotation::R0,
+        })
+        .collect();
+    let Some(drawing) = tidy::tidy(&layout_parts, ModelLibrary::new()) else {
+        return false;
+    };
+    let mut trial = s.clone();
+    paste(&mut trial, &drawing);
+    for p in parts {
+        library::ensure_model(&mut trial, &p.kind);
+    }
+    let owned: Vec<NewPart> = parts.iter().map(|p| (*p).clone()).collect();
+    if verify(&trial, before, &owned, nets).is_err() {
+        return false;
+    }
+    *s = trial;
+    let names: Vec<&str> = parts.iter().map(|p| p.designator.as_str()).collect();
+    notes.push(format!(
+        "{} drawn below the drawing with wires, a supply rail and ground symbols.",
+        names.join(", ")
+    ));
+    true
 }
 
 /// Where the labelled parts start: under everything that is drawn, at its left.
@@ -1238,6 +1332,177 @@ mod tests {
         assert_eq!(node_of(&s, "U1", 0), "VOUT");
         assert_eq!(node_of(&s, "U1", 4), "OUTX");
         assert_eq!(node_of(&s, "R1", 1), "VOUT");
+    }
+
+    /// Draw the schematic as text: wires `-` `|`, pins and parts by the first
+    /// letter of their designator, ground `G`, labels in lower case.
+    fn ascii(s: &Schematic) -> String {
+        let mut cells: std::collections::BTreeMap<(i32, i32), char> = Default::default();
+        for w in &s.wires {
+            let (dx, dy) = ((w.b.x - w.a.x).signum(), (w.b.y - w.a.y).signum());
+            let mut p = w.a;
+            loop {
+                let ch = if dy == 0 { '-' } else { '|' };
+                let e = cells.entry((p.x, p.y)).or_insert(ch);
+                if *e != ch && *e != '+' {
+                    *e = '+';
+                }
+                if p == w.b {
+                    break;
+                }
+                p = Point::new(p.x + dx, p.y + dy);
+            }
+        }
+        for c in &s.components {
+            let ch = if matches!(c.kind, K::Ground) {
+                'G'
+            } else {
+                c.designator.chars().next().unwrap_or('?')
+            };
+            for (_, at) in c.pin_positions() {
+                cells.insert((at.x, at.y), 'o');
+            }
+            cells.insert((c.position.x, c.position.y), ch);
+        }
+        for l in &s.labels {
+            for (i, ch) in l.name.chars().enumerate() {
+                cells.insert(
+                    (l.position.x + 1 + i as i32, l.position.y),
+                    ch.to_ascii_lowercase(),
+                );
+            }
+        }
+        let (x1, y1) = (
+            cells.keys().map(|k| k.0).max().unwrap_or(0),
+            cells.keys().map(|k| k.1).max().unwrap_or(0),
+        );
+        let (x0, y0) = (
+            cells.keys().map(|k| k.0).min().unwrap_or(0),
+            cells.keys().map(|k| k.1).min().unwrap_or(0),
+        );
+        let mut out = String::new();
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                out.push(*cells.get(&(x, y)).unwrap_or(&' '));
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn a_new_amplifier_is_drawn_with_wires_and_the_right_nets() {
+        let mut s = Schematic::new();
+        let parts = parse_add(
+            "V1 vsource 9 VCC 0
+R1 resistor 220k VCC BASE
+R2 resistor 22k BASE 0
+             Rc resistor 2.2k VCC COL
+Re resistor 470 EMIT 0
+C1 capacitor 10u INPUT BASE
+             C2 capacitor 100u EMIT 0
+Q1 npn 2N3904 COL BASE EMIT",
+        )
+        .unwrap();
+        let notes = add_parts(&mut s, &parts).unwrap();
+        println!(
+            "{}
+{notes:?}",
+            ascii(&s)
+        );
+        assert!(notes.iter().any(|n| n.contains("with wires")), "{notes:?}");
+        for (d, pin, net) in [
+            ("V1", 0, "VCC"),
+            ("R1", 1, "BASE"),
+            ("R2", 0, "BASE"),
+            ("Rc", 1, "COL"),
+            ("Re", 0, "EMIT"),
+            ("C1", 0, "INPUT"),
+            ("C2", 0, "EMIT"),
+            ("Q1", 0, "COL"),
+            ("Q1", 1, "BASE"),
+            ("Q1", 2, "EMIT"),
+        ] {
+            assert_eq!(node_of(&s, d, pin), net, "{d} pin {pin}");
+        }
+        assert_eq!(node_of(&s, "Re", 1), "0");
+    }
+
+    #[test]
+    fn other_new_circuits_are_drawn_and_stay_correct() {
+        for (name, text, checks) in [
+            (
+                "pnp",
+                "V1 vsource 9 VCC 0
+Re resistor 1k VCC E
+Q1 pnp 2N3906 C B E
+                 Rb resistor 100k B 0
+Rc resistor 2.2k C 0",
+                vec![("Q1", 2, "E"), ("Q1", 0, "C"), ("Rb", 0, "B")],
+            ),
+            (
+                "opamp",
+                "V1 vsource 12 VCC 0
+V2 vsource 5 IN 0
+U1 opamp uA741 0 INV VCC 0 OUT
+                 R1 resistor 10k IN INV
+R2 resistor 100k INV OUT",
+                vec![("U1", 1, "INV"), ("R2", 1, "OUT")],
+            ),
+            (
+                "555",
+                "V1 vsource 9 VCC 0
+U1 timer555 default 0 TRIG OUT VCC CTL THR DIS VCC
+                 R1 resistor 1k VCC DIS
+R2 resistor 10k DIS THR
+C1 capacitor 10u THR 0
+                 D1 diode generic OUT LED",
+                vec![("R2", 1, "THR"), ("C1", 0, "THR")],
+            ),
+        ] {
+            let mut s = Schematic::new();
+            let parts = parse_add(text).unwrap();
+            let notes = add_parts(&mut s, &parts).unwrap_or_else(|e| panic!("{name}: {e}"));
+            println!(
+                "== {name}: {notes:?}
+{}",
+                ascii(&s)
+            );
+            for (d, pin, net) in checks {
+                assert_eq!(node_of(&s, d, pin), net, "{name}: {d} pin {pin}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_sine_source_is_added_to_an_existing_input() {
+        let mut s = Schematic::new();
+        let amp = parse_add(
+            "V1 vsource 9 VCC 0
+R1 resistor 220k VCC BASE
+R2 resistor 22k BASE 0
+             Rc resistor 2.2k VCC COL
+Re resistor 470 EMIT 0
+C1 capacitor 10u INPUT BASE
+             Q1 npn 2N3904 COL BASE EMIT",
+        )
+        .unwrap();
+        add_parts(&mut s, &amp).unwrap();
+        let src = parse_add("Vin ac 10m@1k INPUT 0").unwrap();
+        assert!(matches!(
+            src[0].kind,
+            K::VoltageSource { waveform: Waveform::Sine { amplitude, frequency, .. } }
+                if (amplitude - 0.01).abs() < 1e-12 && (frequency - 1000.0).abs() < 1e-9
+        ));
+        let notes = add_parts(&mut s, &src).unwrap();
+        println!(
+            "{}
+{notes:?}",
+            ascii(&s)
+        );
+        assert_eq!(node_of(&s, "Vin", 0), "INPUT");
+        assert_eq!(node_of(&s, "Vin", 1), "0");
+        assert!(parse_add("Vin vsine 5 INPUT 0").is_err());
     }
 
     #[test]

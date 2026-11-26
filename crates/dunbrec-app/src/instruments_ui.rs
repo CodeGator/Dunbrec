@@ -65,7 +65,9 @@ pub enum ProbeTarget {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Speed {
-    /// About four screen-widths of the scope per second.
+    /// Real time for a microcontroller circuit being watched without a
+    /// time-based instrument, otherwise about four screen-widths of the
+    /// scope per second (see [`Bench::run_speed`]).
     Auto,
     /// Simulated seconds per real second.
     Fixed(f64),
@@ -155,6 +157,19 @@ impl Bench {
     /// Largest simulation step for the scope to draw smooth traces.
     pub fn max_step(&self) -> f64 {
         self.scope.window() / 250.0
+    }
+
+    /// Simulated seconds per real second to run at.
+    ///
+    /// On "Auto" a circuit with a microcontroller runs in real time, as the
+    /// board would, unless the oscilloscope or logic analyser is open: their
+    /// traces need it slow enough to follow.
+    pub fn run_speed(&self, has_mcu: bool) -> f64 {
+        let watching = self.show_scope || self.show_logic;
+        match self.speed {
+            Speed::Auto if has_mcu && !watching => 1.0,
+            speed => speed.value(&self.scope),
+        }
     }
 
     pub fn clear_readings(&mut self) {
@@ -752,7 +767,11 @@ impl Bench {
             .selected_text(self.speed.label())
             .show_ui(ui, |ui| {
                 ui.selectable_value(&mut self.speed, Speed::Auto, Speed::Auto.label())
-                    .on_hover_text("About four oscilloscope screens per second");
+                    .on_hover_text(
+                        "About four oscilloscope screens per second. A circuit with a \
+                         microcontroller runs in real time while the oscilloscope and logic \
+                         analyser are closed.",
+                    );
                 for s in [1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 0.1, 1.0] {
                     let sp = Speed::Fixed(s);
                     ui.selectable_value(&mut self.speed, sp, sp.label());
@@ -931,6 +950,28 @@ mod tests {
         assert_eq!(v.last().copied(), Some(50.0));
         assert_eq!(v.len(), 15);
         assert!(v.windows(2).all(|w| w[1] > w[0]));
+    }
+
+    #[test]
+    fn auto_runs_a_microcontroller_in_real_time_unless_traces_are_watched() {
+        let mut bench = Bench::default();
+        let slow = 4.0 * bench.scope.window();
+        assert!(slow < 0.1);
+        assert_eq!(bench.run_speed(true), 1.0);
+        assert_eq!(bench.run_speed(false), slow, "an analog circuit");
+        bench.show_scope = true;
+        assert_eq!(bench.run_speed(true), slow);
+        bench.show_scope = false;
+        bench.show_logic = true;
+        assert_eq!(bench.run_speed(true), slow);
+        bench.show_logic = false;
+        // The multimeter has no time base to follow.
+        bench.show_meter = true;
+        assert_eq!(bench.run_speed(true), 1.0);
+        // A chosen speed is kept either way.
+        bench.speed = Speed::Fixed(0.01);
+        assert_eq!(bench.run_speed(true), 0.01);
+        assert_eq!(bench.run_speed(false), 0.01);
     }
 
     #[test]

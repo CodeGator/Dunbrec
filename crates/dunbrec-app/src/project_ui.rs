@@ -1,38 +1,35 @@
-//! The Project panel: the open project's folder as a tree of schematics and
-//! source files, with the commands to make, rename and delete them. The panel
-//! only asks; the app does the work (see `DunbrecApp::run_project_command`).
+//! The Project panel: the open project's circuits and other files as a tree,
+//! with each circuit's source files under it (and those no circuit uses
+//! under "Not used"), and the commands to make, rename and delete them. The
+//! panel only asks; the app does the work (see
+//! `DunbrecApp::run_project_command`).
 
 use std::path::{Path, PathBuf};
 
+use dunbrec_core::ComponentId;
 use egui::{Color32, RichText, Ui};
 
 use crate::dialog::{self, Dialog};
-use crate::project::{Entry, EntryKind, Project, path_eq, relative_to, valid_name};
+use crate::project::{
+    CircuitCode, Entry, EntryKind, Project, Use, path_eq, relative_to, valid_name,
+};
 
 /// What a new item is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Create {
+    /// A circuit, in a folder of the project.
     Schematic,
+    /// A source file for a microcontroller: assembly or an Arduino sketch.
     Assembly,
     Sketch,
-    Folder,
 }
 
 impl Create {
-    /// Everything the panel can add, in menu order.
-    const ALL: [Create; 4] = [
-        Create::Schematic,
-        Create::Assembly,
-        Create::Sketch,
-        Create::Folder,
-    ];
-
     fn title(self) -> &'static str {
         match self {
             Create::Schematic => "New circuit",
             Create::Assembly => "New assembly file",
             Create::Sketch => "New Arduino sketch",
-            Create::Folder => "New folder",
         }
     }
 
@@ -42,29 +39,13 @@ impl Create {
             Create::Schematic => ("Circuit", "dbr"),
             Create::Assembly => ("main", "asm"),
             Create::Sketch => ("sketch", "ino"),
-            Create::Folder => ("New folder", ""),
         };
-        let taken = |name: &str| {
-            let file = if ext.is_empty() {
-                name.to_string()
-            } else {
-                format!("{name}.{ext}")
-            };
-            dir.join(file).exists()
-        };
-        // Circuits are numbered from 1 ("Circuit 1"); the rest only get a
-        // number when the plain name is taken ("main2", "New folder 2").
-        let spaced = matches!(self, Create::Schematic | Create::Folder);
-        let numbered = |n: usize| {
-            if spaced {
-                format!("{base} {n}")
-            } else {
-                format!("{base}{n}")
-            }
-        };
+        let taken = |name: &str| dir.join(format!("{name}.{ext}")).exists();
+        // Circuits are numbered from 1 ("Circuit 1"); source files only get a
+        // number when the plain name is taken ("main2").
         if self == Create::Schematic {
             return (1..)
-                .map(numbered)
+                .map(|n| format!("{base} {n}"))
                 .find(|n| !taken(n))
                 .expect("a free number");
         }
@@ -72,19 +53,9 @@ impl Create {
             return base.to_string();
         }
         (2..)
-            .map(numbered)
+            .map(|n| format!("{base}{n}"))
             .find(|n| !taken(n))
             .expect("a free number")
-    }
-
-    /// The menu entry.
-    fn menu_label(self) -> &'static str {
-        match self {
-            Create::Schematic => "Circuit…",
-            Create::Assembly => "Assembly source file…",
-            Create::Sketch => "Arduino sketch…",
-            Create::Folder => "Folder…",
-        }
     }
 }
 
@@ -96,15 +67,26 @@ pub enum Command {
     OpenProjectPath(PathBuf),
     CloseProject,
     OpenSchematic(PathBuf),
-    OpenSource(PathBuf),
-    /// The user chose to add something; the app asks for its name (see
-    /// [`NamePrompt`]) and then sends [`Command::Create`].
-    AskCreate {
-        dir: PathBuf,
-        what: Create,
+    /// Open a circuit and show the tab of one of its source files.
+    OpenCircuitSource {
+        circuit: PathBuf,
+        name: String,
     },
-    Create {
+    /// The user picked a source file no circuit uses; the app asks which
+    /// microcontroller should run it.
+    AskAssign(PathBuf),
+    /// The user chose to add a circuit in a folder; the app asks for its name
+    /// (see [`NamePrompt`]) and then sends [`Command::CreateCircuit`].
+    AskCircuit(PathBuf),
+    CreateCircuit {
         dir: PathBuf,
+        name: String,
+    },
+    /// Make a new source file for a microcontroller (asked for in the chip's
+    /// properties, and named in a [`NamePrompt`]).
+    CreateForChip {
+        circuit: PathBuf,
+        chip: ComponentId,
         name: String,
         what: Create,
     },
@@ -131,6 +113,12 @@ pub enum Command {
 /// What the panel shows, borrowed for one frame.
 pub struct View<'a> {
     pub project: Option<&'a Project>,
+    /// What each of the project's circuits runs, the open ones as they are
+    /// now, saved or not.
+    pub code: &'a [CircuitCode],
+    /// The files of the circuits that are open. Problems with a circuit's
+    /// files are pointed out only once it is.
+    pub open: &'a [PathBuf],
     pub recent: &'a [PathBuf],
     /// The schematic open in the app.
     pub current: Option<&'a Path>,
@@ -181,13 +169,13 @@ impl ProjectPanel {
                 project.file.display()
             ))
             .context_menu(|ui| {
-                if let Some(command) = self.root_menu(ui, &project.root) {
+                if let Some(command) = root_menu(ui, &project.root) {
                     out = Some(command);
                 }
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
-                    .small_button("✕")
+                    .small_button("×")
                     .on_hover_text("Close the project (no file is touched)")
                     .clicked()
                 {
@@ -201,7 +189,7 @@ impl ProjectPanel {
                     out = Some(Command::Refresh);
                 }
                 ui.menu_button("＋ Add", |ui| {
-                    if let Some(command) = self.new_menu(ui, &project.root) {
+                    if let Some(command) = add_menu(ui, &project.root) {
                         out = Some(command);
                     }
                 });
@@ -239,7 +227,7 @@ impl ProjectPanel {
             egui::Sense::click(),
         )
         .context_menu(|ui| {
-            if let Some(command) = self.root_menu(ui, &project.root) {
+            if let Some(command) = root_menu(ui, &project.root) {
                 out = Some(command);
             }
         });
@@ -251,55 +239,53 @@ impl ProjectPanel {
                         RichText::new("Nothing here yet. Right-click to add a circuit.").weak(),
                     );
                 }
-                if let Some(command) = self.tree(ui, &project.entries, view.current) {
+                if let Some(command) = self.tree(ui, project, &project.entries, view) {
+                    out = Some(command);
+                }
+                if let Some(command) = self.not_used(ui, project, view) {
                     out = Some(command);
                 }
             });
         out
     }
 
-    fn tree(&mut self, ui: &mut Ui, entries: &[Entry], current: Option<&Path>) -> Option<Command> {
+    /// The folders, circuits and other files. Source files are not shown
+    /// here: each is under the circuit that uses it, or under "Not used".
+    fn tree(
+        &mut self,
+        ui: &mut Ui,
+        project: &Project,
+        entries: &[Entry],
+        view: &View,
+    ) -> Option<Command> {
         let mut out = None;
         for e in entries {
+            if !listed_in_tree(project, e) {
+                continue;
+            }
             if e.kind == EntryKind::Folder {
                 let header = egui::CollapsingHeader::new(format!("{} {}", icon(e.kind), e.name))
                     .id_salt(&e.path)
                     .default_open(true)
-                    .show(ui, |ui| self.tree(ui, &e.children, current));
+                    .show(ui, |ui| self.tree(ui, project, &e.children, view));
                 if let Some(Some(command)) = header.body_returned {
                     out = Some(command);
                 }
                 header.header_response.context_menu(|ui| {
-                    if let Some(command) = self.new_menu(ui, &e.path) {
-                        out = Some(command);
-                    }
-                    ui.separator();
-                    if let Some(command) = self.rename_delete(ui, e) {
+                    if let Some(command) = item_menu(ui, &e.path, None, true) {
                         out = Some(command);
                     }
                 });
                 continue;
             }
-            let selected = current.is_some_and(|c| same(c, &e.path));
+            let selected = view.current.is_some_and(|c| same(c, &e.path));
             if e.missing {
-                // Listed, but not on the disk: all that can be done is to
-                // take it out of the project.
-                let row = ui
-                    .selectable_label(
-                        false,
-                        RichText::new(format!("⚠ {}", e.name))
-                            .color(Color32::from_rgb(225, 70, 70)),
-                    )
-                    .on_hover_text("This file is in the project but not on the disk");
-                row.context_menu(|ui| {
-                    if ui.button("Remove from project").clicked() {
-                        out = Some(Command::RemoveFromProject(e.path.clone()));
-                        ui.close();
-                    }
-                });
+                if let Some(command) = missing_row(ui, e, &e.name) {
+                    out = Some(command);
+                }
                 continue;
             }
-            let openable = matches!(e.kind, EntryKind::Schematic | EntryKind::Source(_));
+            let openable = e.kind == EntryKind::Schematic;
             let mut label = RichText::new(format!("{} {}", icon(e.kind), shown_name(e)));
             if !openable {
                 label = label.weak();
@@ -310,88 +296,256 @@ impl ProjectPanel {
             } else {
                 row
             };
-            let open = match e.kind {
-                EntryKind::Schematic => Some(Command::OpenSchematic(e.path.clone())),
-                EntryKind::Source(_) => Some(Command::OpenSource(e.path.clone())),
-                _ => None,
-            };
+            let open = openable.then(|| Command::OpenSchematic(e.path.clone()));
             if row.double_clicked()
                 && let Some(command) = open.clone()
             {
                 out = Some(command);
             }
             row.context_menu(|ui| {
-                if let Some(command) = open.clone()
-                    && ui.button("Open").clicked()
-                {
-                    out = Some(command);
-                    ui.close();
-                }
-                if let Some(command) = self.rename_delete(ui, e) {
+                if let Some(command) = item_menu(ui, &e.path, open.clone(), true) {
                     out = Some(command);
                 }
             });
-        }
-        out
-    }
-
-    /// The entries that add something to the project, in the folder `dir`:
-    /// a new file or folder, or a file that exists already.
-    fn new_menu(&mut self, ui: &mut Ui, dir: &Path) -> Option<Command> {
-        let mut out = None;
-        for what in Create::ALL {
-            if ui.button(what.menu_label()).clicked() {
-                out = Some(Command::AskCreate {
-                    dir: dir.to_path_buf(),
-                    what,
+            // Only a circuit with source files has anything under it.
+            if let Some(code) = view.code.iter().find(|c| same(&c.circuit, &e.path))
+                && !code.uses.is_empty()
+            {
+                ui.indent(("code", &e.path), |ui| {
+                    for u in by_chip(&code.uses) {
+                        if let Some(command) = self.used_row(ui, code, u, view) {
+                            out = Some(command);
+                        }
+                    }
                 });
-                ui.close();
             }
         }
-        ui.separator();
-        if ui
-            .button("Add existing file…")
-            .on_hover_text("List files that are already on the disk as part of the project")
-            .clicked()
-        {
-            out = Some(Command::AddExisting);
-            ui.close();
-        }
         out
     }
 
-    /// The menu of the project's name and of empty space.
-    fn root_menu(&mut self, ui: &mut Ui, root: &Path) -> Option<Command> {
-        let mut out = self.new_menu(ui, root);
-        ui.separator();
-        if ui.button("Close project").clicked() {
-            out = Some(Command::CloseProject);
-            ui.close();
-        }
-        out
-    }
-
-    /// Rename, take out of the project, and delete from the disk.
-    fn rename_delete(&mut self, ui: &mut Ui, e: &Entry) -> Option<Command> {
+    /// A source file under the circuit that uses it.
+    fn used_row(
+        &mut self,
+        ui: &mut Ui,
+        code: &CircuitCode,
+        u: &Use,
+        view: &View,
+    ) -> Option<Command> {
         let mut out = None;
-        if ui.button("Rename…").clicked() {
-            out = Some(Command::AskRename(e.path.clone()));
-            ui.close();
+        let title = format!("{}: {}", u.chips.join(", "), u.name);
+        // Only circuits from before files belonged to one circuit do this.
+        let others: Vec<String> = view
+            .code
+            .iter()
+            .filter(|c| !same(&c.circuit, &code.circuit) && c.use_of(&u.path).is_some())
+            .map(CircuitCode::name)
+            .collect();
+        let exists = u.path.is_file();
+        let opened = view.open.iter().any(|f| same(f, &code.circuit));
+        let (text, hint) = if opened && !exists {
+            (
+                RichText::new(format!("⚠ {title}")).color(MISSING),
+                format!(
+                    "{} is not on the disk. Right-click to remove it, or choose another \
+                     file in the chip's properties.",
+                    u.path.display()
+                ),
+            )
+        } else if !opened || others.is_empty() {
+            (
+                RichText::new(format!("📝 {title}")),
+                "Double-click to open".to_string(),
+            )
+        } else {
+            (
+                RichText::new(format!("⚠ {title}")).color(SHARED),
+                format!(
+                    "{} also uses this file. Circuits should each have their own: opening \
+                     one offers to make a copy.",
+                    others.join(", ")
+                ),
+            )
+        };
+        let open = Command::OpenCircuitSource {
+            circuit: code.circuit.clone(),
+            name: u.name.clone(),
+        };
+        let row = ui.selectable_label(false, text).on_hover_text(hint);
+        if row.double_clicked() {
+            out = Some(open.clone());
         }
-        if ui
-            .button("Remove from project")
-            .on_hover_text("The file stays on the disk")
-            .clicked()
-        {
-            out = Some(Command::RemoveFromProject(e.path.clone()));
-            ui.close();
-        }
-        if ui.button("Delete from disk…").clicked() {
-            out = Some(Command::AskDelete(e.path.clone()));
-            ui.close();
-        }
+        row.context_menu(|ui| {
+            if let Some(command) = item_menu(ui, &u.path, Some(open.clone()), exists) {
+                out = Some(command);
+            }
+        });
         out
     }
+
+    /// The source files of the project that no circuit's chip runs.
+    fn not_used(&mut self, ui: &mut Ui, project: &Project, view: &View) -> Option<Command> {
+        let unused: Vec<&Entry> = sources(&project.entries)
+            .into_iter()
+            .filter(|e| view.code.iter().all(|c| c.use_of(&e.path).is_none()))
+            .collect();
+        if unused.is_empty() {
+            return None;
+        }
+        let mut out = None;
+        ui.add_space(4.0);
+        egui::CollapsingHeader::new("Not used")
+            .id_salt("not used")
+            .default_open(true)
+            .show(ui, |ui| {
+                for e in unused {
+                    let name = relative_to(&project.root, &e.path);
+                    if e.missing {
+                        if let Some(command) = missing_row(ui, e, &name) {
+                            out = Some(command);
+                        }
+                        continue;
+                    }
+                    let assign = Command::AskAssign(e.path.clone());
+                    let row = ui
+                        .selectable_label(false, format!("{} {name}", icon(e.kind)))
+                        .on_hover_text("Double-click to choose a microcontroller to run it");
+                    if row.double_clicked() {
+                        out = Some(assign.clone());
+                    }
+                    row.context_menu(|ui| {
+                        if let Some(command) = item_menu(ui, &e.path, Some(assign.clone()), true) {
+                            out = Some(command);
+                        }
+                    });
+                }
+            });
+        out
+    }
+}
+
+/// The menu of a circuit, file or folder: the same four for each, with those
+/// that cannot be done greyed. `there` is false for one the disk has lost.
+fn item_menu(ui: &mut Ui, path: &Path, open: Option<Command>, there: bool) -> Option<Command> {
+    let mut out = None;
+    if ui
+        .add_enabled(there && open.is_some(), egui::Button::new("Open"))
+        .clicked()
+    {
+        out = open;
+        ui.close();
+    }
+    ui.separator();
+    if ui
+        .add_enabled(there, egui::Button::new("Rename…"))
+        .clicked()
+    {
+        out = Some(Command::AskRename(path.to_path_buf()));
+        ui.close();
+    }
+    if ui
+        .button("Remove from project")
+        .on_hover_text("Nothing is deleted from the disk")
+        .clicked()
+    {
+        out = Some(Command::RemoveFromProject(path.to_path_buf()));
+        ui.close();
+    }
+    if ui
+        .add_enabled(there, egui::Button::new("Delete from disk…"))
+        .on_hover_text("To the Recycle Bin, after asking")
+        .clicked()
+    {
+        out = Some(Command::AskDelete(path.to_path_buf()));
+        ui.close();
+    }
+    out
+}
+
+/// What can be added to the project, in the folder `dir`: a circuit, or a file
+/// that exists already. (A source file is made from the chip that is to run
+/// it.)
+fn add_menu(ui: &mut Ui, dir: &Path) -> Option<Command> {
+    let mut out = None;
+    if ui.button("New circuit…").clicked() {
+        out = Some(Command::AskCircuit(dir.to_path_buf()));
+        ui.close();
+    }
+    if ui
+        .button("Add existing file…")
+        .on_hover_text("List files that are already on the disk as part of the project")
+        .clicked()
+    {
+        out = Some(Command::AddExisting);
+        ui.close();
+    }
+    out
+}
+
+/// The menu of the project's name and of empty space.
+fn root_menu(ui: &mut Ui, root: &Path) -> Option<Command> {
+    let mut out = add_menu(ui, root);
+    ui.separator();
+    if ui.button("Close project").clicked() {
+        out = Some(Command::CloseProject);
+        ui.close();
+    }
+    out
+}
+
+/// A circuit's source files in the order of the chips that run them.
+fn by_chip(uses: &[Use]) -> Vec<&Use> {
+    // U2 before U10.
+    let first = |u: &Use| u.chips.iter().map(|d| (d.len(), d.clone())).min();
+    let mut out: Vec<&Use> = uses.iter().collect();
+    out.sort_by_key(|u| first(u));
+    out
+}
+
+/// A file the disk no longer has.
+const MISSING: Color32 = Color32::from_rgb(225, 70, 70);
+/// A file two circuits use.
+const SHARED: Color32 = Color32::from_rgb(220, 150, 30);
+
+/// A listed file that is not on the disk: all that can be done is to take it
+/// out of the project.
+fn missing_row(ui: &mut Ui, e: &Entry, name: &str) -> Option<Command> {
+    let mut out = None;
+    let row = ui
+        .selectable_label(false, RichText::new(format!("⚠ {name}")).color(MISSING))
+        .on_hover_text("This file is in the project but not on the disk");
+    row.context_menu(|ui| {
+        if let Some(command) = item_menu(ui, &e.path, None, false) {
+            out = Some(command);
+        }
+    });
+    out
+}
+
+/// Whether an entry has a row in the tree of folders: everything but source
+/// files, and the folders that hold nothing else unless the project was given
+/// them as folders.
+fn listed_in_tree(project: &Project, e: &Entry) -> bool {
+    match e.kind {
+        EntryKind::Source(_) => false,
+        EntryKind::Folder => {
+            e.children.is_empty()
+                || e.children.iter().any(|c| listed_in_tree(project, c))
+                || project.lists_folder(&e.path)
+        }
+        _ => true,
+    }
+}
+
+/// Every source file under `entries`.
+fn sources(entries: &[Entry]) -> Vec<&Entry> {
+    entries
+        .iter()
+        .flat_map(|e| match e.kind {
+            EntryKind::Source(_) => vec![e],
+            EntryKind::Folder => sources(&e.children),
+            _ => Vec::new(),
+        })
+        .collect()
 }
 
 /// A message box asking for the name of something new, or the new name of
@@ -404,16 +558,41 @@ pub struct NamePrompt {
 }
 
 enum PromptKind {
-    Create { dir: PathBuf, what: Create },
-    Rename { path: PathBuf },
+    Circuit {
+        dir: PathBuf,
+    },
+    Source {
+        circuit: PathBuf,
+        chip: ComponentId,
+        who: String,
+        what: Create,
+    },
+    Rename {
+        path: PathBuf,
+    },
 }
 
 impl NamePrompt {
-    pub fn create(dir: &Path, what: Create) -> Self {
+    /// A new circuit in the folder `dir`.
+    pub fn circuit(dir: &Path) -> Self {
+        NamePrompt {
+            name: Create::Schematic.suggest(dir),
+            kind: PromptKind::Circuit {
+                dir: dir.to_path_buf(),
+            },
+            fresh: true,
+        }
+    }
+
+    /// A new source file beside `circuit` for the microcontroller `chip`.
+    pub fn source(circuit: &Path, chip: ComponentId, who: &str, what: Create) -> Self {
+        let dir = circuit.parent().unwrap_or(Path::new(""));
         NamePrompt {
             name: what.suggest(dir),
-            kind: PromptKind::Create {
-                dir: dir.to_path_buf(),
+            kind: PromptKind::Source {
+                circuit: circuit.to_path_buf(),
+                chip,
+                who: who.to_string(),
                 what,
             },
             fresh: true,
@@ -438,8 +617,18 @@ impl NamePrompt {
             return None;
         }
         match &self.kind {
-            PromptKind::Create { dir, what } => Some(Command::Create {
+            PromptKind::Circuit { dir } => Some(Command::CreateCircuit {
                 dir: dir.clone(),
+                name: name.to_string(),
+            }),
+            PromptKind::Source {
+                circuit,
+                chip,
+                what,
+                ..
+            } => Some(Command::CreateForChip {
+                circuit: circuit.clone(),
+                chip: *chip,
                 name: name.to_string(),
                 what: *what,
             }),
@@ -454,30 +643,28 @@ impl NamePrompt {
     /// cancelled; `Some(Some(command))` when they accepted a good name.
     pub fn show(&mut self, ctx: &egui::Context, project: &Project) -> Option<Option<Command>> {
         let (title, ok_label) = match &self.kind {
-            PromptKind::Create { what, .. } => (what.title(), "Create"),
+            PromptKind::Circuit { .. } => (Create::Schematic.title(), "Create"),
+            PromptKind::Source { what, .. } => (what.title(), "Create"),
             PromptKind::Rename { .. } => ("Rename", "Rename"),
         };
         let heading = match &self.kind {
-            PromptKind::Create { dir, what } => {
+            PromptKind::Circuit { dir } => {
                 let place = relative_to(&project.root, dir);
                 let place = if place.is_empty() {
                     project.name()
                 } else {
                     format!("{}/{place}", project.name())
                 };
-                let noun = match what {
-                    Create::Folder => "folder",
-                    _ => "file",
-                };
-                format!("Name of the new {noun}, in {place}:")
+                format!("Name of the new circuit, in {place}:")
             }
+            PromptKind::Source { who, .. } => format!("Name of the new file for {who}:"),
             PromptKind::Rename { path } => format!("New name for “{}”:", file_name_of(path)),
         };
         let note = match &self.kind {
             PromptKind::Rename { .. } => {
                 Some("Schematics that use it are updated to the new name.")
             }
-            PromptKind::Create { .. } => None,
+            _ => None,
         };
         let name = &mut self.name;
         let fresh = &mut self.fresh;
@@ -585,7 +772,7 @@ fn no_project(ui: &mut Ui, recent: &[PathBuf]) -> Option<Command> {
                     out = Some(Command::OpenProjectPath(path.clone()));
                 }
                 if ui
-                    .small_button("✕")
+                    .small_button("×")
                     .on_hover_text("Remove from the list (the folder is not touched)")
                     .clicked()
                 {
@@ -633,6 +820,8 @@ mod tests {
         let recent = vec![PathBuf::from("a"), PathBuf::from("b")];
         let none = View {
             project: None,
+            code: &[],
+            open: &[],
             recent: &recent,
             current: None,
             embedded: 0,
@@ -651,6 +840,8 @@ mod tests {
             .unwrap();
         let view = View {
             project: Some(&project),
+            code: &project.code,
+            open: &[],
             recent: &recent,
             current: Some(&dir.join("a.dbr")),
             embedded: 2,
@@ -659,7 +850,13 @@ mod tests {
 
         // The name boxes draw, and a bad or unchanged name asks for nothing.
         for mut prompt in [
-            NamePrompt::create(&dir, Create::Assembly),
+            NamePrompt::circuit(&dir),
+            NamePrompt::source(
+                &dir.join("a.dbr"),
+                ComponentId(1),
+                "U1 in a",
+                Create::Sketch,
+            ),
             NamePrompt::rename(&dir.join("a.dbr")),
         ] {
             let ctx = egui::Context::default();
@@ -672,19 +869,140 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// The labels the panel shows for `project`, top to bottom, with the
+    /// circuits in `open` open.
+    fn labels(project: &Project, open: &[PathBuf]) -> Vec<String> {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut found: Vec<(f64, String)> = Vec::new();
+        for _ in 0..4 {
+            let view = View {
+                project: Some(project),
+                code: &project.code,
+                open,
+                recent: &[],
+                current: None,
+                embedded: 0,
+            };
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(500.0, 900.0),
+                )),
+                ..Default::default()
+            };
+            let out = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| ProjectPanel.show(ui, &view));
+            });
+            if let Some(update) = out.platform_output.accesskit_update {
+                found = update
+                    .nodes
+                    .iter()
+                    .filter_map(|(_, n)| {
+                        let text = n.label().or_else(|| n.value())?.to_string();
+                        Some((n.bounds()?.y0, text))
+                    })
+                    .collect();
+            }
+        }
+        found.sort_by(|a, b| a.0.total_cmp(&b.0));
+        found.into_iter().map(|(_, text)| text).collect()
+    }
+
+    #[test]
+    fn source_files_sit_under_the_circuit_that_uses_them() {
+        let dir = std::env::temp_dir().join(format!("dunbrec-tree-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("fw")).unwrap();
+        let circuit = |name: &str, firmware: &[&str]| {
+            let mut s = dunbrec_core::Schematic::new();
+            for firmware in firmware {
+                s.add_component(
+                    dunbrec_core::ComponentKind::Mcu {
+                        firmware: (*firmware).into(),
+                        clock: 16e6,
+                    },
+                    Default::default(),
+                );
+            }
+            let path = dir.join(name);
+            dunbrec_io::dbr::save(&s, &path).unwrap();
+            path
+        };
+        for file in ["fw/blink.ino", "old.asm", "shared.asm", "notes.txt"] {
+            std::fs::write(dir.join(file), "").unwrap();
+        }
+        let files = [
+            circuit("Blink.dbr", &["fw/blink.ino", "gone.asm"]),
+            circuit("Fader.dbr", &["shared.asm", "shared.asm"]),
+            circuit("Other.dbr", &["shared.asm"]),
+            circuit("Plain.dbr", &["builtin:blink", "", "fw.hex"]),
+            dir.join("fw").join("blink.ino"),
+            dir.join("old.asm"),
+            dir.join("shared.asm"),
+            dir.join("notes.txt"),
+        ];
+        let (mut project, _) = Project::create(&dir.join("P")).unwrap();
+        project.add_files(&files).unwrap();
+        // Nothing is pointed out in circuits that have not been opened.
+        let quiet = labels(&project, &[]);
+        assert!(!quiet.iter().any(|t| t.starts_with('⚠')), "{quiet:?}");
+        assert!(quiet.iter().any(|t| t == "📝 U2: gone.asm"));
+        let shown = labels(&project, &files[..4]);
+        let rows: Vec<&str> = shown
+            .iter()
+            .map(String::as_str)
+            .skip_while(|t| !t.ends_with("Blink"))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                "⚡ Blink",
+                "📝 U1: fw/blink.ino",
+                "⚠ U2: gone.asm",
+                "⚡ Circuit 1",
+                "⚡ Fader",
+                "⚠ U1, U2: shared.asm",
+                "· notes.txt",
+                "⚡ Other",
+                "⚠ U1: shared.asm",
+                // Chips with no source file add nothing to see.
+                "⚡ Plain",
+                "Not used",
+                "📝 old.asm",
+            ],
+            "{shown:?}"
+        );
+        // The folder that held only a source file has no row.
+        assert!(!shown.iter().any(|t| t.ends_with(" fw")));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn a_name_prompt_accepts_only_good_names() {
         let dir = PathBuf::from("proj");
-        let mut p = NamePrompt::create(&dir, Create::Assembly);
+        let mut p = NamePrompt::source(
+            &dir.join("a.dbr"),
+            ComponentId(1),
+            "U1 in a",
+            Create::Assembly,
+        );
         assert!(matches!(
             p.command(),
-            Some(Command::Create {
+            Some(Command::CreateForChip {
                 what: Create::Assembly,
                 ..
             })
         ));
         p.name = "  led.asm  ".into();
-        assert!(matches!(p.command(), Some(Command::Create { name, .. }) if name == "led.asm"));
+        assert!(matches!(
+            p.command(),
+            Some(Command::CreateForChip { name, .. }) if name == "led.asm"
+        ));
+        assert!(matches!(
+            NamePrompt::circuit(&dir).command(),
+            Some(Command::CreateCircuit { .. })
+        ));
         for bad in ["", "   ", "bad/name", "a:b", ".."] {
             p.name = bad.into();
             assert_eq!(p.command(), None, "{bad:?}");
@@ -726,15 +1044,12 @@ mod tests {
         assert_eq!(Create::Schematic.suggest(&dir), "Circuit 1");
         assert_eq!(Create::Assembly.suggest(&dir), "main");
         assert_eq!(Create::Sketch.suggest(&dir), "sketch");
-        assert_eq!(Create::Folder.suggest(&dir), "New folder");
         for f in ["Circuit 1.dbr", "Circuit 2.dbr", "main.asm", "sketch.ino"] {
             std::fs::write(dir.join(f), "").unwrap();
         }
-        std::fs::create_dir(dir.join("New folder")).unwrap();
         assert_eq!(Create::Schematic.suggest(&dir), "Circuit 3");
         assert_eq!(Create::Assembly.suggest(&dir), "main2");
         assert_eq!(Create::Sketch.suggest(&dir), "sketch2");
-        assert_eq!(Create::Folder.suggest(&dir), "New folder 2");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

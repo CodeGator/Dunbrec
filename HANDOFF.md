@@ -1,9 +1,14 @@
 # Dunbrec — handoff
 
-State of the project for whoever picks it up next. User-facing documentation is in
-[README.md](README.md); this file covers status, decisions and open work.
+State of the project for whoever picks it up next. Developer notes are in
+[docs/development.md](docs/development.md); this file covers status, decisions and open work.
 
-*Last updated: 2026-11-22, version 0.4.0 released (assistant, settings, message boxes, project behaviour).*
+[README.md](README.md) is only a **summary** with screenshots (the user's decision): features at a
+high level, one line on what it is written in, no steps and no other technical detail. There is
+**no user guide**, by the user's decision: the project is too young and changes too much to keep
+one up to date.
+
+*Last updated: 2026-11-26, version 0.5.0 released (several circuits open at once, designed in [docs/multi-document-editor.md](docs/multi-document-editor.md) and built in all its stages; easier schematic editing; larger menus and toolbar; coloured sketches).*
 
 ## Status
 
@@ -11,8 +16,9 @@ All eleven planned phases are done and committed on `main` (one commit per phase
 plus Phase 12 (integrated circuits) and a fix for probes failing after opening a document.
 Version 0.3.0 was released on 2026-11-21 (tag `v0.3.0`, merged to `main`; 0.1.0 and 0.2.0 were
 released the same day). Version 0.4.0 was merged to `main` and pushed to `release` on 2026-11-22;
-the workflow drafts the GitHub release `v0.4.0`, which is published by hand. Work branches are
-named after the application version and merged into `main`; the next one (0.5.0) is not started. A release is cut by merging the branch into `main` and pushing `main:release`, which
+the workflow drafts the GitHub release `v0.4.0`, which is published by hand. Version 0.5.0 was
+merged to `main` and pushed to `release` the same way on 2026-11-26. Work branches are named after
+the application version and merged into `main`. A release is cut by merging the branch into `main` and pushing `main:release`, which
 drafts the GitHub release (see `.github/workflows/release.yml`).
 
 | Phase | Content |
@@ -28,9 +34,11 @@ drafts the GitHub release (see `.github/workflows/release.yml`).
 | 13 | Dockable panels: every panel is an `egui_dock` tab; layout saved between sessions |
 | 0.2.0 | Switches group: SPST, SPDT, DPST, DPDT (`ComponentKind::MultiSwitch`, `SwitchContacts` device) and hold-to-press push buttons (`Switch { momentary }`, `Canvas::push_buttons`) |
 | 0.3.0 | Projects (a `.dbrproj` file listing circuits and firmware files), Junction and hops, J key, CD4066, Linear group |
+| 0.5.0 | Projects screen (nothing else shown without a project); assistant draws new circuits with real wires and can add sine sources; no circuit open until one is opened; a central area that never collapses; closable schematic tab. See "0.5.0" below |
 | 0.4.0 | Settings dialog; Assistant (Ollama or Claude); pop-out instruments; text size; every confirmation a message box; Code panel tabs; project behaviour changes. See "0.4.0" below |
 
-Health at handoff: `cargo test --workspace` 413 passed, 0 failed (1 ignored: an emulator speed
+Health at handoff: `cargo test --workspace` 509 passed, 0 failed (2 ignored: a real Recycle Bin check and an
+emulator speed
 benchmark); `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --check`
 clean. Toolchain: Rust 1.99 (edition 2024, MSRV 1.90), Windows 11.
 
@@ -74,8 +82,8 @@ UI layout (`dock.rs`, `PaneViewer` in `app.rs`):
   the new panel for `split_left` despite the crate's wording. `dock.rs` has a test on the real
   proportions.
 - The layout is saved under `dunbrec.layout.v1` in eframe storage, separate from `Settings`,
-  and restored through `sanitize` (retired tabs dropped, duplicates removed, no schematic means
-  default). Bump the key suffix if panes change in a way old layouts cannot express.
+  and restored through `sanitize` (retired tabs dropped, duplicates removed; a layout with neither
+  the schematic nor the empty central area `Pane::Workspace` means default). Bump the key suffix if panes change in a way old layouts cannot express.
 
 Key mechanisms worth knowing before changing the engine:
 
@@ -270,8 +278,145 @@ Other 0.4.0 behaviour:
   a circuit the project does not list stays open (`circuit_belongs_to`, `leaves_circuit`).
   Deleting the open circuit's file asks about unsaved changes, then the delete, then closes it
   (blank Untitled circuit).
-- **There is always a document.** With nothing open you see a blank "Untitled" circuit (File >
-  New does the same). A real "no document" state was considered and rejected as too invasive.
+- **There is always a document.** *Superseded in 0.5.0: see "0.5.0". A `Document` still always
+  exists in memory, but `circuit_open` says whether it is shown.*
+
+## 0.5.0
+
+Built on the `0.5.0` branch. What it adds, and the decisions behind it (all agreed with the user):
+
+**Assistant builds circuits properly.**
+
+- `dunbrec-io/src/tidy.rs`: a new circuit made only of new nets is drawn like a schematic, not on
+  labels: supply rails along the top (nets a voltage source's + pin is on, or named VCC/VDD/...),
+  a ground symbol on each ground pin, parts in three rows (rail side, middle, ground side) in
+  columns that follow the signal (BFS from an input net). A transistor gets the part on its
+  collector above and on its emitter below; a resistor to the rail and one to ground that share
+  a net form one column (a divider). Wires come from an orthogonal router (Dijkstra over grid
+  cells, bend and crossing costs; never through a body; crosses another net only straight across
+  a plain wire, since crossing wires do not connect and an end on a wire does). Every net gets a
+  label so it keeps its name (`verify` looks nets up by name).
+- `part_edits::place_tidy` tries it on a copy and runs the same `verify` as everything else; on
+  any failure it falls back to the old label layout (`place_with_labels`). It is only used when
+  every new net is new or ground; parts added to existing nets still use `try_wire` or labels.
+- New part kind **`vsine`** (value `amplitude@frequency`, e.g. `10m@1k`; sine, no offset) and
+  aliases for kind words models tend to use (`voltage`, `battery`, `ac`, `cap`, ...). The prompt now
+  tells the model never to claim it changed anything, to list every pin's net, to add new parts
+  (including sources) with `dunbrec-add` only, and shows a full common-emitter stage as an example.
+
+**Projects screen** (`projects_screen.rs`). With no project open it is the whole window (no menu,
+toolbar, panels or instrument windows): New project, Open project, Recent projects (open, Rename,
+Show folder, remove, Clear list) with search, sort (recent, name, folder), a filter (all /
+available / file missing) and paging (10 per page; `RECENT_PROJECT_LIMIT` is 50), Settings, Quit.
+A circuit file given on the command line waits there with an offer to make a project for it
+(`waiting_circuit`; `Project::create_for` lists it where it is, nothing is copied). A project's whole box opens it (`recent_row` senses the box before its buttons). Renaming
+changes only the project file (`project::rename_file`); `Settings::rename_project` keeps the list.
+Closing a project closes its circuit (`close_circuit`). File > New is a submenu (circuit, assembly
+file, sketch, folder) that creates in the project, and the Project panel's right-click menus have
+the same New submenu. The File menu keeps only Close project for projects. The close icon is a
+plain "x" (U+00D7): the dingbat "x" had no glyph in egui's fonts.
+
+**No circuit until one is opened.** `circuit_open` is true only after a circuit is opened, made or
+imported (`replace`), false after `close_circuit`. Opening or making a project opens no circuit.
+While it is false, Save, Export, Edit, Simulate, Instruments, the run toolbar and all shortcuts
+except Ctrl+N and Ctrl+O are disabled, and the title shows the project name.
+
+**Central area that never collapses.** egui_dock deletes an area when its last tab goes, and its
+neighbours spread into the space. `Pane::Workspace` is an uncloseable, invisible tab (styled in
+`tab_style_override`) that holds the central area while no circuit is open;
+`dock::sync_documents(dock, circuit_open)` (called from `dock_area`) swaps it with the schematic
+and closes the Code tab (its files belong to the circuit). `Pane::floats()` keeps the schematic and
+workspace from being dragged into windows. The schematic tab has a close button; middle-click and
+the tab's right-click Close come through `TabViewer::on_close`, which asks to close the circuit
+(`Pending::CloseCircuit`, with the unsaved-changes question). File > Close circuit, Ctrl+W.
+
+**Demo programs are files** (`dunbrec-mcu/demos/*.asm` and `*.ino`, listed in `demos.rs`).
+Choosing one in a chip's properties (`Properties::demo`, then `DunbrecApp::use_demo` and
+`OpenCircuit::add_demo`) writes a new file beside the circuit with `project::new_source_copy`
+(never overwrites), points the chip at it, lists it in the project, opens the Code panel and, for
+a sketch, starts a build. The compiled-in `builtin:` programs (`programs.rs`) remain for new
+chips, the examples and older circuits; *Edit code* on such a chip makes a copy. Keep a demo's
+two sources and its compiled-in program behaving alike (tests in `demos.rs`).
+
+**Scrolling the schematic.** The wheel scrolls (Shift: sideways, which egui does itself), Ctrl or
+a pinch zooms, middle-drag and the two scroll bars move the view (`Canvas::scroll_bars`; the bars
+cover `scroll_extent`: the drawing plus half a screen, and what is in view).
+
+**Build and Run save first** (`save_before_build`, the user's choice): `run_pressed` for every
+run the user asks for, `build_pressed` for the Build button. The app's own restarts
+(`sync_live`) and the build a new demo starts save nothing.
+
+**Run builds sketches first.** `start_sim_with` finds unbuilt ones (`unbuilt_sketches`,
+`dunbrec_sim::unbuilt_sketch`) and sets `run_after_build`; `continue_run` builds them one by one
+through the circuit's `CodeEditor`, then starts, or shows the failing file and a message.
+
+**Speed "Auto"** (`Bench::run_speed`) is real time for a circuit with a microcontroller while the
+oscilloscope and logic analyser are closed, otherwise four scope screens per second (which made
+the demos look dead: blink changed every 12 s). `sync_speed` tells a running simulation.
+
+**Several circuits, two rows of tabs** (design and decisions:
+[docs/multi-document-editor.md](docs/multi-document-editor.md)).
+
+- *Top row:* each open circuit is `Pane::Circuit(id)` in the central area, which the invisible
+  `Pane::Workspace` tab marks permanently. `dock::sync_documents` keeps the tabs matching the open
+  circuits and puts a dragged-away one back; the app passes `AllowedSplits::None` while a circuit
+  tab is being dragged. `Pane::Schematic` is now an alias of `Workspace` (old layouts), and the
+  Code panel is gone.
+- *Second row:* each `OpenCircuit` has a `DockState<DocTab>` (schematic and source files), drawn by
+  a nested `DockArea` (`DocViewer` in `app.rs`). `hidden` holds closed file tabs. `code_ui.rs`
+  draws one file (`CodeEditor::show_file`); builds are polled every frame.
+- *Active circuit:* `circuits` is never empty (a blank, unshown one when none is open, with
+  `circuit_open` false), so code that reads "the document" always has one. `switch_to` stops the
+  simulation, swaps the instruments, debugger, serial monitor and assistant (`Tools`) between the
+  app and the circuits, keeps which windows are shown and the speed, and carries the clipboard.
+  `add_circuit` and `close_circuit_at` are the only ways circuits come and go.
+- *Unsaved changes:* `at_risk(&Pending)` lists them; one gets `dialog::unsaved_changes`, several
+  `dialog::unsaved_list`.
+- *No shared source files:* `shared_sources` is checked when a circuit is opened (offering copies,
+  `open_with_copies`) and when it is saved elsewhere. It only knows about *open* circuits. The
+  assistant's new-file suggestions are not checked.
+- *Project panel (stage 3):* `project::code_of` says what a circuit's chips run (`CircuitCode`);
+  `Project::refresh` reads it from every listed circuit file, and `DunbrecApp::project_code`
+  overrides the open ones with their live state. The panel shows each circuit's files under it and
+  unused ones under "Not used". Each frame `check_new_code` notices files a chip has come to use
+  (opens them; asks if another circuit uses them) and `list_used_files` adds them to the project.
+  `ask_assign` / `assign` give an unused file to a chip, moving any unsaved text with it.
+- *No close-all buttons* on the outer dock's tab bars (the user found them confusing: they closed
+  a whole group). Each tab keeps its own close button; the collapse triangle stays.
+- *Menu bar and toolbar* are enlarged by `Settings::bar_size` (Small/Medium/Large, Medium by
+  default; the user could hardly see them). The menus need the factor twice, on the bar and in
+  their `MenuConfig`. The toolbar wraps in a narrow window.
+- *Source colouring:* `code_ui::tokenize` (assembly) and `cpp_tokens::tokenize` (sketches,
+  basic by the user's choice: word lists, no parsing, no library); one palette, numbers orange.
+- *Placing* (the user's decision): dropping a part leaves `Tool::Place` for that part, never
+  Wire; the newest part, dropped or clicked, is selected.
+- *Label tool pointer:* `canvas::label_cursor`, a tag (the user's choice, to tell it from Wire).
+- *Held keys* (`Canvas::hold_tool`): Ctrl lends Wire, Alt lends Select. The user chose that
+  letting go of Ctrl drops an unfinished wire. A lent tool never switches itself to another.
+- *Dragging* takes along only what was joined when the drag began (`Joined`); passing over a
+  wire end connects nothing. Letting go with a pin on a wire still connects, by position.
+- *Opening* a circuit centres its drawing at 100% (`Canvas::centre_drawing`), once.
+- *Status bar* (the user could not read the old one): only `tool_hint` for a tool other than
+  Select, and the zoom; nothing with no circuit. Mouse gestures are listed in Help > Keyboard
+  shortcuts (`SHORTCUTS`).
+- *Menus:* circuits, files and folders share `project_ui::item_menu` (Open, Rename, Remove from
+  project, Delete from disk). Under a circuit are only its source files (the user's decision: a
+  chip without one is not worth showing). New files are made from the chip's properties
+  (`new_source_for`); there is no "New folder" or File > New submenu.
+- *Removing and deleting:* `project::removal` says which source files go with a circuit (those no
+  other circuit uses). Deleting uses the `trash` crate (Recycle Bin; tests remove for real instead,
+  see `discard`). Either way the chips that ran a file that goes are cleared
+  (`project::forget_sources`, `forget_in_circuits`): an undoable edit in an open circuit, written
+  straight to a closed circuit's file, as renaming does. `DeleteAsk` is the question for both.
+- *Nothing is reported about unopened circuits* (the user's decision): the red "lost file" and
+  amber "shared" marks show only for open circuits (`project_ui::View::open`), and with none open
+  Properties, Checks and Values say "No circuit open" instead of describing the blank placeholder.
+- *Moving between circuits (stage 5):* Ctrl+Tab is taken from the raw input
+  (`raw_input_hook`, so egui neither moves focus nor types a tab) and applied by `shortcuts`
+  unless a question is up. `window_menu`; `Pending::CloseAll` / `CloseOthers`.
+- *Not wanted* (the user, 2026-11-26): reopening the last project or its circuits.
+- *Not done:* the assistant's new-file suggestions can still write over a file of the same
+  name.
 
 ## Gotchas
 
@@ -282,5 +427,7 @@ Other 0.4.0 behaviour:
   continuations into literal characters. Prefer direct file edits for strings with escapes. In a
   Python script, a single `\` at the end of a line inside a normal string is a continuation and
   silently joins the lines, which is how stray runs of spaces got into a Rust string once.
+- A long Python edit script inline in a Git Bash heredoc can fail to parse (the shell choked on
+  it once, applying nothing); write the script to a file in the scratchpad and run that.
 - Rebuilding while the app is running fails (the exe is locked). Close it normally first, so the
   unsaved-changes prompt still appears; do not kill it.

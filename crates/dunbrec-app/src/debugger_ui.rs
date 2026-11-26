@@ -578,7 +578,7 @@ impl Debugger {
             if ui
                 .add_enabled(
                     count > 0,
-                    egui::Button::new(format!("✖ Clear all breakpoints ({count})")),
+                    egui::Button::new(format!("× Clear all breakpoints ({count})")),
                 )
                 .on_hover_text("Remove the breakpoints on every microcontroller")
                 .clicked()

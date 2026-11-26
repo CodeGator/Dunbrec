@@ -77,7 +77,7 @@ pub fn outward(offset: Point) -> Point {
 }
 
 /// Rotation that points a ground symbol (drawn downwards) along `dir`.
-fn ground_rotation(dir: Point) -> Rotation {
+pub fn ground_rotation(dir: Point) -> Rotation {
     match (dir.x, dir.y) {
         (-1, 0) => Rotation::R90,
         (0, -1) => Rotation::R180,

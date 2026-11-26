@@ -13,7 +13,7 @@
 //! schematic's own folder, with `/` separators (`main.asm`, `fw/blink.ino`).
 //! A microcontroller's firmware field holds that path, and while the schematic
 //! is open the file's text sits in [`Schematic::sources`] under the same
-//! name, where the Code panel, the debugger and the simulator find it. The
+//! name, where the editor, the debugger and the simulator find it. The
 //! `.dbr` file does not store those texts (see [`for_saving`]); saving writes
 //! them to their files ([`write_sources`]). Sources kept inside a schematic
 //! by older versions (`source:<name>`) still work, and [`extract_embedded`]
@@ -23,7 +23,8 @@ use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 
 use dunbrec_core::{
-    ComponentKind, SOURCE_PREFIX, Schematic, SourceFile, SourceLanguage, source_language_of,
+    ComponentId, ComponentKind, SOURCE_PREFIX, Schematic, SourceFile, SourceLanguage,
+    source_language_of,
 };
 use serde::{Deserialize, Serialize};
 
@@ -109,6 +110,9 @@ pub struct Project {
     pub root: PathBuf,
     data: ProjectData,
     pub entries: Vec<Entry>,
+    /// What each listed circuit's microcontrollers run, as its file on the
+    /// disk says (read again by [`refresh`](Self::refresh)).
+    pub code: Vec<CircuitCode>,
 }
 
 /// True if `path` is `base` or inside it, by reading the paths.
@@ -123,6 +127,7 @@ impl Project {
             root: file.parent().unwrap_or(Path::new("")).to_path_buf(),
             data,
             entries: Vec::new(),
+            code: Vec::new(),
         };
         p.tidy();
         p.refresh();
@@ -175,10 +180,9 @@ impl Project {
         Ok(Self::from_data(file, data))
     }
 
-    /// Make a new project: write the project file `file` (`.dbrproj` is added
-    /// if missing) and a first, empty circuit beside it, `Circuit 1.dbr` or the
-    /// next name nothing there has. Returns the project and the circuit.
-    pub fn create(file: &Path) -> Result<(Self, PathBuf), String> {
+    /// The project file a name stands for: the project extension is added if
+    /// missing, the name must be usable, and nothing may be there already.
+    fn new_file_path(file: &Path) -> Result<PathBuf, String> {
         let mut file = file.to_path_buf();
         if file
             .extension()
@@ -197,6 +201,14 @@ impl Project {
             return Err(format!("“{name}” cannot be used as a file name"));
         }
         ensure_free(&file).map_err(|e| format!("{e}. Use Open project to open it."))?;
+        Ok(file)
+    }
+
+    /// Make a new project: write the project file `file` (the extension is
+    /// added if missing) and a first, empty circuit beside it, `Circuit 1` or
+    /// the next name nothing there has. Returns the project and the circuit.
+    pub fn create(file: &Path) -> Result<(Self, PathBuf), String> {
+        let file = Self::new_file_path(file)?;
         let dir = file.parent().unwrap_or(Path::new("")).to_path_buf();
         let circuit = free_circuit_in(&dir);
         dunbrec_io::dbr::save(&Schematic::new(), &circuit).map_err(|e| e.to_string())?;
@@ -209,6 +221,26 @@ impl Project {
         );
         project.add_file(&circuit)?;
         Ok((project, circuit))
+    }
+
+    /// Make a new project around a circuit file that exists already: the
+    /// project file `file` is written and lists `circuit` where it is. The
+    /// circuit file is not moved or copied, and no new circuit is made.
+    pub fn create_for(file: &Path, circuit: &Path) -> Result<Self, String> {
+        if !circuit.is_file() {
+            return Err(format!("{} does not exist", circuit.display()));
+        }
+        let file = Self::new_file_path(file)?;
+        let mut project = Self::from_data(
+            &file,
+            ProjectData {
+                version: FORMAT_VERSION,
+                ..ProjectData::default()
+            },
+        );
+        project.add_file(circuit)?;
+        project.save()?;
+        Ok(project)
     }
 
     /// Write the project file.
@@ -279,7 +311,9 @@ impl Project {
         Ok(self.add_files(&[path.to_path_buf()])? > 0)
     }
 
-    /// Show a folder, even while nothing in it is listed.
+    /// Show a folder, even while nothing in it is listed. Nothing makes such
+    /// folders any more, but older projects have them.
+    #[cfg(test)]
     pub fn add_folder(&mut self, path: &Path) -> Result<(), String> {
         let listed = self.listed(path);
         if !self.data.folders.contains(&listed) {
@@ -362,6 +396,22 @@ impl Project {
         }
         sort_entries(&mut entries);
         self.entries = entries;
+        self.code = self
+            .schematics()
+            .into_iter()
+            .filter_map(|path| {
+                let s = dunbrec_io::dbr::load(&path).ok()?;
+                Some(code_of(&s, &path))
+            })
+            .collect();
+    }
+
+    /// True if the project was given `path` as a folder to show, even empty.
+    pub fn lists_folder(&self, path: &Path) -> bool {
+        self.data
+            .folders
+            .iter()
+            .any(|f| path_eq(&self.absolute(f), path))
     }
 
     /// Read the project file again (it was edited by hand or by another
@@ -545,6 +595,177 @@ pub fn valid_name(name: &str) -> bool {
     )
 }
 
+// ------------------------------------------- circuits and their code ---
+
+/// A source file a circuit's microcontrollers run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Use {
+    /// The name the circuit knows it by: its path from the circuit's folder.
+    pub name: String,
+    /// Where it is.
+    pub path: PathBuf,
+    /// The designators of the chips that run it.
+    pub chips: Vec<String>,
+}
+
+/// A microcontroller and what it is set to run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Chip {
+    pub id: ComponentId,
+    pub designator: String,
+    pub firmware: String,
+}
+
+/// The microcontrollers of a circuit file and the source files they run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CircuitCode {
+    /// The circuit file.
+    pub circuit: PathBuf,
+    /// In the order of their names.
+    pub uses: Vec<Use>,
+    pub chips: Vec<Chip>,
+}
+
+impl CircuitCode {
+    /// The circuit's name, as the Project panel and its tab show it.
+    pub fn name(&self) -> String {
+        self.circuit.file_stem().map_or_else(
+            || self.circuit.display().to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        )
+    }
+
+    /// How the circuit uses the file at `path`, if it does.
+    pub fn use_of(&self, path: &Path) -> Option<&Use> {
+        self.uses.iter().find(|u| path_eq(&u.path, path))
+    }
+}
+
+/// What the circuit `s`, whose file is `circuit`, runs. The chips' firmware
+/// settings are the one link between a circuit and a source file.
+pub fn code_of(s: &Schematic, circuit: &Path) -> CircuitCode {
+    let dir = circuit.parent().unwrap_or(Path::new(""));
+    let chips: Vec<Chip> = s
+        .components
+        .iter()
+        .filter_map(|c| match &c.kind {
+            ComponentKind::Mcu { firmware, .. } => Some(Chip {
+                id: c.id,
+                designator: c.designator.clone(),
+                firmware: firmware.trim().to_string(),
+            }),
+            _ => None,
+        })
+        .collect();
+    let uses = referenced_files(s)
+        .into_iter()
+        .map(|name| Use {
+            path: normalize(&dir.join(&name)),
+            chips: chips
+                .iter()
+                .filter(|c| c.firmware == name)
+                .map(|c| c.designator.clone())
+                .collect(),
+            name,
+        })
+        .collect();
+    CircuitCode {
+        circuit: circuit.to_path_buf(),
+        uses,
+        chips,
+    }
+}
+
+/// Give `s`, a circuit in the folder `dir`, a copy of its own of each source
+/// file in `names`: the file is copied beside it under a free name, and the
+/// chips that ran the old one run the copy. Returns the new files.
+pub fn copy_sources(
+    s: &mut Schematic,
+    dir: &Path,
+    names: &[String],
+) -> Result<Vec<PathBuf>, String> {
+    let mut made = Vec::new();
+    for name in names {
+        attach(s, dir, name)?;
+        let (Some(file), Some((base, extension))) =
+            (s.sources.get(name).cloned(), name.rsplit_once('.'))
+        else {
+            continue;
+        };
+        let taken = |n: &str| s.sources.keys().any(|k| k.eq_ignore_ascii_case(n));
+        let copy = new_source_copy(dir, base, extension, &file.text, taken)?;
+        for firmware in firmware_refs(s) {
+            if firmware.trim() == name {
+                firmware.clone_from(&copy);
+            }
+        }
+        s.sources.remove(name);
+        s.sources.insert(copy.clone(), file);
+        made.push(dir.join(copy));
+    }
+    Ok(made)
+}
+
+/// Take the source file `gone`, or every one in the folder `gone`, away from
+/// `s`, a circuit in the folder `dir`: the chips that ran one are left with no
+/// program. Returns how many chips that was.
+pub fn forget_sources(s: &mut Schematic, dir: &Path, gone: &Path) -> usize {
+    let gone = normalize(gone);
+    let lost =
+        |name: &str| is_file_source(name) && starts_with_ci(&normalize(&dir.join(name)), &gone);
+    let mut chips = 0;
+    for firmware in firmware_refs(s) {
+        if lost(firmware.trim()) {
+            firmware.clear();
+            chips += 1;
+        }
+    }
+    s.sources.retain(|name, _| !lost(name));
+    chips
+}
+
+/// What goes along when circuits leave the project or the disk.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Removal {
+    /// Source files that only those circuits use, which go with them.
+    pub extra: Vec<PathBuf>,
+    /// Source files of theirs that stay, each with the names of the other
+    /// circuits that use it.
+    pub kept: Vec<(PathBuf, Vec<String>)>,
+}
+
+/// What goes with the circuits in `going` (a circuit file, or a folder holding
+/// some), given what every circuit runs. Files inside `going` go anyway, and
+/// are in neither list.
+pub fn removal(code: &[CircuitCode], going: &Path) -> Removal {
+    let going = normalize(going);
+    let leaves = |path: &Path| starts_with_ci(path, &going);
+    let mut out = Removal::default();
+    for u in code
+        .iter()
+        .filter(|c| leaves(&c.circuit))
+        .flat_map(|c| &c.uses)
+        .filter(|u| !leaves(&u.path))
+    {
+        let known = out.extra.iter().any(|p| path_eq(p, &u.path))
+            || out.kept.iter().any(|(p, _)| path_eq(p, &u.path));
+        if known {
+            continue;
+        }
+        let others: Vec<String> = code
+            .iter()
+            .filter(|c| !leaves(&c.circuit) && c.use_of(&u.path).is_some())
+            .map(CircuitCode::name)
+            .collect();
+        if others.is_empty() {
+            out.extra.push(u.path.clone());
+        } else {
+            out.kept.push((u.path.clone(), others));
+        }
+    }
+    out
+}
+
 // -------------------------------------------------------- creating ---
 
 /// What a new source file starts as.
@@ -597,6 +818,34 @@ fn ensure_free(path: &Path) -> Result<(), String> {
     }
 }
 
+/// Rename the project file `file` to `name` (the extension is added if
+/// missing), in the same folder. Only the project's own file changes: the
+/// circuit files it lists, and their folder, are left alone. Returns the new
+/// path.
+pub fn rename_file(file: &Path, name: &str) -> Result<PathBuf, String> {
+    let name = with_extension(name, EXTENSION);
+    if !valid_name(&name) {
+        return Err(format!("“{name}” cannot be used as a file name"));
+    }
+    if !file.is_file() {
+        return Err(format!("{} no longer exists", file.display()));
+    }
+    let to = file.with_file_name(&name);
+    if file == to {
+        return Ok(to);
+    }
+    // A different spelling of the same name (only the case changes) is fine
+    // on a case-insensitive disk; anything else must not exist already.
+    let case_only = file
+        .file_name()
+        .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case(&name));
+    if !case_only {
+        ensure_free(&to)?;
+    }
+    std::fs::rename(file, &to).map_err(|e| format!("cannot rename {}: {e}", file.display()))?;
+    Ok(to)
+}
+
 /// Create an empty schematic `name` (`.dbr` added) in `dir`.
 pub fn new_schematic(dir: &Path, name: &str) -> Result<PathBuf, String> {
     if !valid_name(name) {
@@ -627,22 +876,42 @@ pub fn new_source(dir: &Path, name: &str, kind: NewSource) -> Result<PathBuf, St
     Ok(path)
 }
 
+/// Write `text` to a new source file in `dir` called `base.extension`, or
+/// `base2.extension` and so on: never over a file that exists, nor under a
+/// name that is `taken`. Returns the file's name.
+pub fn new_source_copy(
+    dir: &Path,
+    base: &str,
+    extension: &str,
+    text: &str,
+    taken: impl Fn(&str) -> bool,
+) -> Result<String, String> {
+    use std::io::Write;
+    for n in 1u32.. {
+        let number = if n == 1 { String::new() } else { n.to_string() };
+        let name = format!("{base}{number}.{extension}");
+        if taken(&name) {
+            continue;
+        }
+        let path = dir.join(&name);
+        let failed = |e| format!("cannot write {}: {e}", path.display());
+        match std::fs::File::create_new(&path) {
+            Ok(mut file) => {
+                file.write_all(text.as_bytes()).map_err(failed)?;
+                return Ok(name);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(failed(e)),
+        }
+    }
+    unreachable!("some number is free")
+}
+
 fn has_source(dir: &Path) -> bool {
     std::fs::read_dir(dir).is_ok_and(|r| {
         r.flatten()
             .any(|e| source_language_of(&e.file_name().to_string_lossy()).is_some())
     })
-}
-
-/// Create the folder `name` in `dir`.
-pub fn new_folder(dir: &Path, name: &str) -> Result<PathBuf, String> {
-    if !valid_name(name) {
-        return Err(format!("“{}” cannot be used as a folder name", name.trim()));
-    }
-    let path = dir.join(name.trim());
-    ensure_free(&path)?;
-    std::fs::create_dir(&path).map_err(|e| format!("cannot create {}: {e}", path.display()))?;
-    Ok(path)
 }
 
 // ---------------------------------------------- sources and schematics ---
@@ -828,7 +1097,7 @@ pub fn rename(
     project: &mut Project,
     from: &Path,
     to: &Path,
-    open: Option<&Path>,
+    open: &[PathBuf],
 ) -> Result<Renamed, String> {
     ensure_free(to)?;
     if let Some(parent) = to.parent() {
@@ -839,7 +1108,7 @@ pub fn rename(
     let (from_n, to_n) = (normalize(from), normalize(to));
     let mut out = Renamed::default();
     for dbr_new in project.schematics() {
-        if open.is_some_and(|o| path_eq(o, &dbr_new)) {
+        if open.iter().any(|o| path_eq(o, &dbr_new)) {
             continue;
         }
         // Where this schematic was before the rename (it moves with a
@@ -862,20 +1131,39 @@ pub fn rename(
             out.rewritten.push(dbr_new);
         }
     }
+    // Those circuits now name the file differently.
+    project.refresh();
     Ok(out)
 }
 
-/// Delete a file, or a folder with everything in it, from the disk, and take
-/// it out of the project.
+/// Delete a file, or a folder with everything in it (if it is still there),
+/// by moving it to the Recycle Bin, and take it out of the project. The
+/// circuits that used it are the caller's to change (see [`forget_sources`]).
 pub fn delete(project: &mut Project, path: &Path) -> Result<(), String> {
+    if path.exists() {
+        discard(path)?;
+    }
+    project.remove(path)?;
+    Ok(())
+}
+
+/// Move a file or folder to the system's Recycle Bin, from which it can be got
+/// back. One that cannot go there is not deleted.
+#[cfg(not(test))]
+fn discard(path: &Path) -> Result<(), String> {
+    trash::delete(path)
+        .map_err(|e| format!("cannot move {} to the Recycle Bin: {e}", path.display()))
+}
+
+/// Tests must not fill the Recycle Bin of whoever runs them.
+#[cfg(test)]
+fn discard(path: &Path) -> Result<(), String> {
     let result = if path.is_dir() {
         std::fs::remove_dir_all(path)
     } else {
         std::fs::remove_file(path)
     };
-    result.map_err(|e| format!("cannot delete {}: {e}", path.display()))?;
-    project.remove(path)?;
-    Ok(())
+    result.map_err(|e| format!("cannot delete {}: {e}", path.display()))
 }
 
 /// Move the sources kept inside `s` by older versions into files in `dir`:
@@ -940,6 +1228,53 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn a_project_is_made_around_a_circuit_file_where_it_is() {
+        let dir = scratch("around");
+        let circuit_dir = dir.join("circuits");
+        std::fs::create_dir_all(&circuit_dir).unwrap();
+        let circuit = circuit_dir.join("amp.dbr");
+        dunbrec_io::dbr::save(&Schematic::new(), &circuit).unwrap();
+        // The project goes in another folder; the circuit file is not moved.
+        let file = dir.join("work").join("Amp project");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let project = Project::create_for(&file, &circuit).unwrap();
+        assert!(circuit.is_file());
+        assert_eq!(project.name(), "Amp project");
+        assert!(project.contains(&circuit));
+        assert_eq!(project.files().len(), 1, "no new circuit is made");
+        // Opening it again lists the same circuit.
+        let again = Project::open(&project.file).unwrap();
+        assert_eq!(again.schematics(), vec![normalize(&circuit)]);
+        // Not over an existing project, and not around a file that is not there.
+        assert!(Project::create_for(&file, &circuit).is_err());
+        assert!(Project::create_for(&dir.join("x"), &dir.join("nope.dbr")).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn renaming_a_project_file_leaves_its_circuits_alone() {
+        let dir = scratch("rename-file");
+        let (project, circuit) = Project::create(&dir.join("Old")).unwrap();
+        let new = rename_file(&project.file, "New name").unwrap();
+        assert_eq!(new, dir.join("New name.dbrproj"));
+        assert!(new.is_file() && !project.file.is_file());
+        assert!(circuit.is_file());
+        assert_eq!(Project::open(&new).unwrap().name(), "New name");
+        // Not onto a file that exists, and not to an unusable name.
+        let (other, _) = Project::create(&dir.join("Other")).unwrap();
+        assert!(rename_file(&new, "Other").is_err());
+        assert!(rename_file(&new, "a/b").is_err());
+        assert!(other.file.is_file() && new.is_file());
+        // Only the case changing works too.
+        let upper = rename_file(&new, "NEW NAME").unwrap();
+        assert_eq!(
+            upper.file_name().unwrap().to_string_lossy(),
+            "NEW NAME.dbrproj"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     fn mcu(firmware: &str) -> ComponentKind {
@@ -1020,8 +1355,6 @@ mod tests {
         let d = new_schematic(&root, "amp").unwrap();
         assert_eq!(d, root.join("amp.dbr"));
         assert!(new_schematic(&root, "amp.dbr").is_err());
-        assert!(new_folder(&root, "fw").unwrap().is_dir());
-        assert!(new_folder(&root, "fw").is_err());
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -1414,7 +1747,7 @@ loop: rjmp loop
             &mut project,
             &root.join("main.asm"),
             &root.join("blink.asm"),
-            Some(&top),
+            std::slice::from_ref(&top),
         )
         .unwrap();
         assert!(root.join("blink.asm").is_file() && !root.join("main.asm").exists());
@@ -1498,7 +1831,7 @@ loop: rjmp loop
             ])
             .unwrap();
 
-        let r = rename(&mut project, &root.join("fw"), &root.join("firmware"), None).unwrap();
+        let r = rename(&mut project, &root.join("fw"), &root.join("firmware"), &[]).unwrap();
         assert_eq!(r.rewritten, std::slice::from_ref(&outside));
         assert_eq!(
             firmware_of(&dunbrec_io::dbr::load(&outside).unwrap()),
@@ -1518,9 +1851,161 @@ loop: rjmp loop
                 &mut project,
                 &root.join("a.dbr"),
                 &root.join("firmware"),
-                None
+                &[]
             )
             .is_err()
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_circuit_takes_the_files_only_it_uses() {
+        let circuit = |name: &str, files: &[&str]| CircuitCode {
+            circuit: PathBuf::from("p").join(name),
+            uses: files
+                .iter()
+                .map(|f| Use {
+                    name: f.to_string(),
+                    path: normalize(&PathBuf::from("p").join(f)),
+                    chips: vec!["U1".into()],
+                })
+                .collect(),
+            chips: Vec::new(),
+        };
+        let code = [
+            circuit("a.dbr", &["own.asm", "both.asm"]),
+            circuit("b.dbr", &["both.asm", "other.asm"]),
+            circuit("sub/c.dbr", &["sub/in.asm", "far.asm"]),
+        ];
+        let p = |f: &str| normalize(&PathBuf::from("p").join(f));
+        let a = removal(&code, &p("a.dbr"));
+        assert_eq!(a.extra, [p("own.asm")]);
+        assert_eq!(a.kept, [(p("both.asm"), vec!["b".to_string()])]);
+        // A folder: what is inside it goes anyway.
+        let folder = removal(&code, &p("sub"));
+        assert_eq!(folder.extra, [p("far.asm")]);
+        assert!(folder.kept.is_empty());
+        // A source file takes nothing with it.
+        assert_eq!(removal(&code, &p("own.asm")), Removal::default());
+    }
+
+    /// Puts a file of its own in the real Recycle Bin and takes it out again;
+    /// run by hand: `cargo test -p dunbrec-app recycle -- --ignored`.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "uses the real Recycle Bin"]
+    fn a_file_goes_to_the_recycle_bin() {
+        let name = format!("dunbrec-recycle-test-{}.txt", std::process::id());
+        let file = std::env::temp_dir().join(&name);
+        std::fs::write(&file, "a test of deleting to the Recycle Bin").unwrap();
+        trash::delete(&file).unwrap();
+        assert!(!file.exists());
+        let mine: Vec<_> = trash::os_limited::list()
+            .unwrap()
+            .into_iter()
+            .filter(|item| item.name.to_string_lossy().contains(&name))
+            .collect();
+        let found = mine.len();
+        trash::os_limited::purge_all(mine).unwrap();
+        assert_eq!(found, 1, "it is in the bin");
+    }
+
+    #[test]
+    fn a_deleted_file_is_taken_from_the_chips_that_ran_it() {
+        let dir = Path::new("proj");
+        let mut s = Schematic::new();
+        for firmware in ["a.asm", "fw/b.ino", "fw/c.ino", "builtin:blink"] {
+            s.add_component(
+                ComponentKind::Mcu {
+                    firmware: firmware.into(),
+                    clock: 16e6,
+                },
+                Default::default(),
+            );
+        }
+        for name in ["a.asm", "fw/b.ino", "kept"] {
+            let file = SourceFile {
+                language: SourceLanguage::Asm,
+                text: "nop".into(),
+            };
+            s.sources.insert(name.into(), file);
+        }
+        let ran = |s: &Schematic| -> Vec<String> {
+            code_of(s, Path::new("proj/x.dbr"))
+                .chips
+                .into_iter()
+                .map(|c| c.firmware)
+                .collect()
+        };
+        assert_eq!(forget_sources(&mut s, dir, &dir.join("other.asm")), 0);
+        assert_eq!(forget_sources(&mut s, dir, &dir.join("a.asm")), 1);
+        assert_eq!(ran(&s), ["", "fw/b.ino", "fw/c.ino", "builtin:blink"]);
+        // A folder takes everything in it.
+        assert_eq!(forget_sources(&mut s, dir, &dir.join("fw")), 2);
+        assert_eq!(ran(&s), ["", "", "", "builtin:blink"]);
+        assert_eq!(s.sources.keys().collect::<Vec<_>>(), ["kept"]);
+    }
+
+    #[test]
+    fn the_chips_say_which_circuit_a_source_file_belongs_to() {
+        let root = scratch("code");
+        let chip = |firmware: &str| ComponentKind::Mcu {
+            firmware: firmware.into(),
+            clock: 16e6,
+        };
+        let mut s = Schematic::new();
+        for firmware in [
+            " main.asm ",
+            "main.asm",
+            "fw/b.ino",
+            "builtin:blink",
+            "x.hex",
+        ] {
+            s.add_component(chip(firmware), Default::default());
+        }
+        let circuit = root.join("a.dbr");
+        let code = code_of(&s, &circuit);
+        assert_eq!(code.name(), "a");
+        assert_eq!(code.chips.len(), 5);
+        let uses: Vec<(&str, Vec<&str>)> = code
+            .uses
+            .iter()
+            .map(|u| {
+                (
+                    u.name.as_str(),
+                    u.chips.iter().map(String::as_str).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            uses,
+            [("fw/b.ino", vec!["U3"]), ("main.asm", vec!["U1", "U2"])]
+        );
+        assert!(code.use_of(&root.join("fw").join("b.ino")).is_some());
+        assert!(code.use_of(&root.join("b.ino")).is_none());
+
+        // A project reads this from the circuit files it lists.
+        std::fs::create_dir_all(&root).unwrap();
+        dunbrec_io::dbr::save(&s, &circuit).unwrap();
+        let (mut project, _) = Project::create(&root.join("P")).unwrap();
+        project.add_file(&circuit).unwrap();
+        let read = project.code.iter().find(|c| c.name() == "a").unwrap();
+        assert_eq!(read, &code);
+        assert!(!project.lists_folder(&root.join("fw")));
+        project.add_folder(&root.join("fw")).unwrap();
+        assert!(project.lists_folder(&root.join("fw")));
+
+        // A copy of its own for a shared file, without writing over any.
+        std::fs::write(root.join("main.asm"), "nop\n").unwrap();
+        std::fs::write(root.join("main2.asm"), "mine\n").unwrap();
+        let made = copy_sources(&mut s, &root, &["main.asm".to_string()]).unwrap();
+        assert_eq!(made, [root.join("main3.asm")]);
+        assert_eq!(s.sources["main3.asm"].text, "nop\n");
+        assert!(!s.sources.contains_key("main.asm"));
+        assert_eq!(code_of(&s, &circuit).uses[1].name, "main3.asm");
+        assert_eq!(
+            std::fs::read_to_string(root.join("main2.asm")).unwrap(),
+            "mine\n"
         );
         std::fs::remove_dir_all(&root).unwrap();
     }

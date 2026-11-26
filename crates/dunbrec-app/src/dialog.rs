@@ -196,6 +196,37 @@ pub fn unsaved_changes(ctx: &Context, name: &str, can_save: bool) -> Option<Unsa
     })
 }
 
+/// The same question about several circuits at once, listing them. "Save"
+/// saves them all.
+pub fn unsaved_list(ctx: &Context, names: &[String], can_save: bool) -> Option<Unsaved> {
+    let (buttons, default): (&[&str], usize) = if can_save {
+        (&["Save all", "Discard all", "Cancel"], 0)
+    } else {
+        (&["Discard all", "Cancel"], 1)
+    };
+    let keep = buttons.len() - 1;
+    let answer = Dialog {
+        id: "unsaved_list",
+        kind: Kind::Warning,
+        title: "Unsaved changes",
+        buttons,
+        default,
+        cancel: Some(keep),
+    }
+    .show(ctx, |ui| {
+        paragraph(ui, "These circuits have unsaved changes:");
+        ui.add_space(6.0);
+        for name in names {
+            paragraph(ui, &format!("•  {name}"));
+        }
+    })?;
+    Some(match (can_save, answer) {
+        (true, 0) => Unsaved::Save,
+        (_, i) if i == keep => Unsaved::KeepEditing,
+        _ => Unsaved::Discard,
+    })
+}
+
 /// The body text of a dialog: readable size, wrapped to the dialog's width.
 pub fn paragraph(ui: &mut Ui, text: &str) {
     ui.label(RichText::new(text).size(14.5));
@@ -277,6 +308,24 @@ mod tests {
         assert_eq!(run(key(Key::Enter), true), Some(Unsaved::Save));
         assert_eq!(run(key(Key::Escape), true), Some(Unsaved::KeepEditing));
         // Without one, neither key can throw the changes away.
+        assert_eq!(run(key(Key::Enter), false), Some(Unsaved::KeepEditing));
+        assert_eq!(run(key(Key::Escape), false), Some(Unsaved::KeepEditing));
+    }
+
+    #[test]
+    fn several_unsaved_circuits_are_asked_about_together() {
+        let names = ["Circuit 1".to_string(), "Circuit 2".to_string()];
+        let run = |input: egui::RawInput, can_save: bool| {
+            let ctx = Context::default();
+            let mut answer = None;
+            let _ = ctx.run(input, |ctx| {
+                answer = unsaved_list(ctx, &names, can_save);
+            });
+            answer
+        };
+        assert_eq!(run(egui::RawInput::default(), true), None);
+        assert_eq!(run(key(Key::Enter), true), Some(Unsaved::Save));
+        assert_eq!(run(key(Key::Escape), true), Some(Unsaved::KeepEditing));
         assert_eq!(run(key(Key::Enter), false), Some(Unsaved::KeepEditing));
         assert_eq!(run(key(Key::Escape), false), Some(Unsaved::KeepEditing));
     }

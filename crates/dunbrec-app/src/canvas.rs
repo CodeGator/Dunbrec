@@ -85,13 +85,24 @@ fn to_pos(p: Point) -> Pos2 {
     pos2(p.x as f32, p.y as f32)
 }
 
+/// What a drag takes along besides what it was begun on: whatever was joined
+/// to it at that moment. Nothing it passes over later is picked up.
+#[derive(Debug, Default)]
+struct Joined {
+    /// Wire ends, each as the wire and whether it is the wire's `a` end.
+    ends: Vec<(WireId, bool)>,
+    /// Net labels.
+    labels: Vec<LabelId>,
+}
+
 enum Drag {
-    /// Moving the selection; `last` is the grid point of the previous frame.
-    Move { last: Point, started: bool },
+    /// Moving the selection; `last` is the grid point of the previous frame,
+    /// and `joined` is set by the first step.
+    Move { last: Point, joined: Option<Joined> },
     /// Rubber-band selection from a screen position.
     Rubber { start: Pos2 },
     /// Dragging a wire corner or free end, which is now at `at`.
-    Vertex { at: Point, started: bool },
+    Vertex { at: Point, joined: Option<Joined> },
 }
 
 /// Text placed on the canvas by an analysis, e.g. node voltages.
@@ -237,8 +248,28 @@ pub fn node_tag_positions(s: &Schematic, netlist: &Netlist) -> Vec<TagPlace> {
     out
 }
 
+/// A scroll bar's thumb being dragged.
+#[derive(Clone, Copy)]
+struct ScrollDrag {
+    axis: usize,
+    /// How far along the thumb it was taken hold of, in points.
+    grab: f32,
+    /// What the bars covered when the drag began; kept for the whole drag so
+    /// that the thumb stays under the pointer.
+    extent: Rect,
+}
+
+/// A tool in use only while its key is held.
+struct Borrowed {
+    /// What to go back to when the key is let go.
+    from: Tool,
+    /// The tool the key gives.
+    to: Tool,
+}
+
 pub struct Canvas {
     pub camera: Camera,
+    scrolling: Option<ScrollDrag>,
     pub tool: Tool,
     pub selection: BTreeSet<Item>,
     wire_start: Option<Point>,
@@ -255,12 +286,18 @@ pub struct Canvas {
     /// The push button being held down. Pressing flips it from its resting
     /// state and releasing flips it back, without an undo step.
     held_button: Option<ComponentId>,
+    /// Set while Ctrl or Alt lends another tool.
+    borrowed: Option<Borrowed>,
+    /// Set until the drawing has been put in the middle of a new view: the
+    /// size of the view it was last centred in.
+    centring: Option<Vec2>,
 }
 
 impl Default for Canvas {
     fn default() -> Self {
         Self {
             camera: Camera::default(),
+            scrolling: None,
             tool: Tool::Select,
             selection: BTreeSet::new(),
             wire_start: None,
@@ -268,6 +305,8 @@ impl Default for Canvas {
             label_request: None,
             probe_request: None,
             held_button: None,
+            borrowed: None,
+            centring: Some(Vec2::ZERO),
             clipboard: None,
             paste_count: 0,
         }
@@ -338,6 +377,30 @@ pub fn segment_distance(p: Pos2, a: Pos2, b: Pos2) -> f32 {
 }
 
 /// Approximate extent of a net label (in grid units).
+/// Width of the schematic's scroll bars.
+const SCROLLBAR: f32 = 14.0;
+/// The shortest a scroll bar's thumb gets, so it can be taken hold of.
+const MIN_THUMB: f32 = 28.0;
+
+/// The area the drawing takes up, in grid units; `None` if there is nothing.
+pub fn drawing_bounds(s: &Schematic) -> Option<Rect> {
+    let parts = s.components.iter().map(symbols::bounds);
+    let wires = s
+        .wires
+        .iter()
+        .map(|w| Rect::from_two_pos(to_pos(w.a), to_pos(w.b)));
+    let labels = s.labels.iter().map(|l| label_rect(l.position, &l.name));
+    parts.chain(wires).chain(labels).reduce(Rect::union)
+}
+
+/// What the scroll bars cover, in grid units: the drawing with half a screen
+/// of room around it, so that there is always space to add to it at the edges,
+/// and whatever is in view now.
+fn scroll_extent(drawing: Option<Rect>, visible: Rect) -> Rect {
+    let drawing = drawing.unwrap_or_else(|| Rect::from_min_size(visible.center(), Vec2::ZERO));
+    drawing.expand2(visible.size() / 2.0).union(visible)
+}
+
 fn label_rect(position: Point, name: &str) -> Rect {
     let p = to_pos(position);
     Rect::from_min_max(
@@ -504,9 +567,10 @@ pub fn route(a: Point, b: Point) -> Vec<(Point, Point)> {
         .collect()
 }
 
-/// Move the selected items by `d`. Unselected wire ends attached to moved
-/// pins, wire ends or labels follow, so connections are kept.
-pub fn move_items(s: &mut Schematic, items: &BTreeSet<Item>, d: Point) {
+/// The unselected wire ends attached to the selected pins, wire ends and
+/// labels: those that follow when the selection moves, so that connections are
+/// kept. To be asked once, before the move begins.
+fn joined_to(s: &Schematic, items: &BTreeSet<Item>) -> Joined {
     let mut moving: Vec<Point> = Vec::new();
     for item in items {
         match *item {
@@ -527,6 +591,25 @@ pub fn move_items(s: &mut Schematic, items: &BTreeSet<Item>, d: Point) {
             }
         }
     }
+    let mut ends = Vec::new();
+    for w in &s.wires {
+        // A selected wire moves as a whole.
+        if !items.contains(&Item::Wire(w.id)) {
+            for (is_a, p) in [(true, w.a), (false, w.b)] {
+                if moving.contains(&p) {
+                    ends.push((w.id, is_a));
+                }
+            }
+        }
+    }
+    Joined {
+        ends,
+        labels: Vec::new(),
+    }
+}
+
+/// Move the selected items by `d`, and the wire ends `joined` to them.
+fn move_items(s: &mut Schematic, items: &BTreeSet<Item>, joined: &Joined, d: Point) {
     for c in &mut s.components {
         if items.contains(&Item::Component(c.id)) {
             c.position = c.position + d;
@@ -542,10 +625,10 @@ pub fn move_items(s: &mut Schematic, items: &BTreeSet<Item>, d: Point) {
             w.a = w.a + d;
             w.b = w.b + d;
         } else {
-            if moving.contains(&w.a) {
+            if joined.ends.contains(&(w.id, true)) {
                 w.a = w.a + d;
             }
-            if moving.contains(&w.b) {
+            if joined.ends.contains(&(w.id, false)) {
                 w.b = w.b + d;
             }
         }
@@ -751,19 +834,38 @@ fn vertex_near(s: &Schematic, p: Pos2, radius: f32) -> Option<Point> {
         .map(|(v, _)| v)
 }
 
-/// Move the point `from` to `to`: every wire end there, and every net label
-/// there, so what was connected stays connected.
-fn move_vertex(s: &mut Schematic, from: Point, to: Point) {
+/// Every wire end and net label at the point `at`: what dragging that point
+/// takes along, so that what is connected there stays connected. To be asked
+/// once, before the drag begins.
+fn joined_at(s: &Schematic, at: Point) -> Joined {
+    let ends = s
+        .wires
+        .iter()
+        .flat_map(|w| [(w.id, true, w.a), (w.id, false, w.b)])
+        .filter(|(.., p)| *p == at)
+        .map(|(id, is_a, _)| (id, is_a))
+        .collect();
+    let labels = s
+        .labels
+        .iter()
+        .filter(|l| l.position == at)
+        .map(|l| l.id)
+        .collect();
+    Joined { ends, labels }
+}
+
+/// Put the wire ends and labels of `joined` at `to`.
+fn move_vertex(s: &mut Schematic, joined: &Joined, to: Point) {
     for w in &mut s.wires {
-        if w.a == from {
+        if joined.ends.contains(&(w.id, true)) {
             w.a = to;
         }
-        if w.b == from {
+        if joined.ends.contains(&(w.id, false)) {
             w.b = to;
         }
     }
     for l in &mut s.labels {
-        if l.position == from {
+        if joined.labels.contains(&l.id) {
             l.position = to;
         }
     }
@@ -966,13 +1068,108 @@ impl Painter<'_> {
     }
 }
 
+/// What the Label tool shows at the point `at` that a click would name: a
+/// dot there, and a tag reading "abc" tied to it. The tag stands above and to
+/// the right, clear of the mouse pointer.
+fn label_cursor(painter: &egui::Painter, at: Pos2, fill: Color32, ink: Color32) {
+    let text = painter.layout_no_wrap("abc".into(), FontId::proportional(15.0), ink);
+    let half = text.size().y / 2.0 + 3.0;
+    // The tag's pointed end, and how far along its straight sides start.
+    let tip = at + vec2(8.0, -half - 5.0);
+    let (left, right) = (tip.x + half, tip.x + half + text.size().x + 8.0);
+    painter.line_segment([at, tip], Stroke::new(2.0_f32, fill));
+    painter.circle_filled(at, 4.0, fill);
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            tip,
+            pos2(left, tip.y - half),
+            pos2(right, tip.y - half),
+            pos2(right, tip.y + half),
+            pos2(left, tip.y + half),
+        ],
+        fill,
+        Stroke::NONE,
+    ));
+    // The hole its string goes through.
+    painter.circle_filled(tip + vec2(half * 0.65, 0.0), 2.5, ink);
+    let corner = pos2(left + 3.0, tip.y - text.size().y / 2.0);
+    painter.galley(corner, text, ink);
+}
+
 // ------------------------------------------------------- interaction ---
 
 impl Canvas {
     pub fn cancel(&mut self) {
         self.wire_start = None;
         self.drag = None;
+        self.borrowed = None;
         self.tool = Tool::Select;
+    }
+
+    /// Holding Ctrl wires and holding Alt selects, for as long as the key is
+    /// down; then the tool in use before comes back. Both together, or a
+    /// window without the keyboard, ask for neither. A drag is finished with
+    /// the tool it began with.
+    ///
+    /// True if the tool changed, or will as soon as a drag ends.
+    fn hold_tool(&mut self, modifiers: egui::Modifiers, focused: bool) -> bool {
+        let wanted = match (modifiers.command, modifiers.alt) {
+            _ if !focused => None,
+            (true, false) => Some(Tool::Wire),
+            (false, true) => Some(Tool::Select),
+            _ => None,
+        };
+        let mut changed = false;
+        if let Some(Borrowed { from, to }) = &self.borrowed {
+            if self.tool != *to {
+                // Another tool was chosen meanwhile; that choice stands.
+                self.borrowed = None;
+            } else if wanted.as_ref() != Some(to) {
+                if self.drag.is_some() {
+                    return true;
+                }
+                // A wire not finished with the borrowed tool is given up.
+                if *to == Tool::Wire {
+                    self.wire_start = None;
+                }
+                self.tool = from.clone();
+                self.borrowed = None;
+                changed = true;
+            }
+        }
+        if self.borrowed.is_none()
+            && self.drag.is_none()
+            && let Some(to) = wanted
+            && self.tool != to
+        {
+            let from = std::mem::replace(&mut self.tool, to.clone());
+            self.borrowed = Some(Borrowed { from, to });
+            changed = true;
+        }
+        changed
+    }
+
+    /// When a circuit is first shown, put its drawing in the middle of the
+    /// view, at the zoom it has. The panels can take a frame or two to settle,
+    /// so this goes on until the view is the same size twice; after that the
+    /// view is the user's. True if another frame is wanted.
+    fn centre_drawing(&mut self, view: Vec2, s: &Schematic) -> bool {
+        let Some(last) = self.centring else {
+            return false;
+        };
+        if view.x <= 0.0 || view.y <= 0.0 {
+            return false;
+        }
+        let Some(drawing) = drawing_bounds(s) else {
+            // Nothing to centre, and what is added later stays where it is put.
+            self.centring = None;
+            return false;
+        };
+        let offset = view / 2.0 - drawing.center().to_vec2() * self.camera.scale;
+        // Whole points, so that lines stay sharp.
+        self.camera.offset = offset.round();
+        self.centring = (view != last).then_some(view);
+        self.centring.is_some()
     }
 
     pub fn take_label_request(&mut self) -> Option<Point> {
@@ -987,6 +1184,102 @@ impl Canvas {
         self.label_request.is_some()
     }
 
+    /// Draw the scroll bars of the drawing shown in `view`, in the strips of
+    /// `area` beside and below it, and move the view as they are used.
+    fn scroll_bars(&mut self, ui: &mut Ui, area: Rect, view: Rect, s: &Schematic) {
+        let corner = Rect::from_min_max(view.max, area.max);
+        let tracks = [
+            Rect::from_min_max(
+                pos2(view.left(), view.bottom()),
+                pos2(view.right(), area.bottom()),
+            ),
+            Rect::from_min_max(
+                pos2(view.right(), view.top()),
+                pos2(area.right(), view.bottom()),
+            ),
+        ];
+        ui.painter()
+            .rect_filled(corner, 0.0, ui.visuals().extreme_bg_color);
+        for (axis, track) in tracks.into_iter().enumerate() {
+            let visible = Rect::from_min_max(
+                self.camera.to_grid(view.min, view.min),
+                self.camera.to_grid(view.min, view.max),
+            );
+            let held = self.scrolling.filter(|d| d.axis == axis);
+            let extent =
+                held.map_or_else(|| scroll_extent(drawing_bounds(s), visible), |d| d.extent);
+            // Along this axis, in grid units.
+            let (start, length) = (extent.min[axis], extent.size()[axis]);
+            let (from, shown) = (visible.min[axis], visible.size()[axis]);
+            let room = (length - shown).max(0.0);
+            // And on the track, in points.
+            let along = track.size()[axis];
+            let size = (along * shown / length.max(f32::EPSILON))
+                .max(MIN_THUMB)
+                .min(along);
+            let travel = along - size;
+            let part = if room > 0.0 {
+                ((from - start) / room).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let mut thumb = track;
+            thumb.min[axis] = track.min[axis] + part * travel;
+            thumb.max[axis] = thumb.min[axis] + size;
+
+            let id = ui.id().with(("schematic scroll", axis));
+            let response = ui.interact(track, id, Sense::click_and_drag());
+            if response.drag_started_by(PointerButton::Primary)
+                && let Some(press) = ui.input(|i| i.pointer.press_origin())
+                && thumb.contains(press)
+            {
+                self.scrolling = Some(ScrollDrag {
+                    axis,
+                    grab: press[axis] - thumb.min[axis],
+                    extent,
+                });
+            }
+            let mut to = None;
+            if let Some(held) = self.scrolling.filter(|d| d.axis == axis)
+                && let Some(pointer) = response.interact_pointer_pos()
+                && travel > 0.0
+            {
+                let part = (pointer[axis] - held.grab - track.min[axis]) / travel;
+                to = Some(start + part.clamp(0.0, 1.0) * room);
+            } else if response.clicked()
+                && let Some(click) = response.interact_pointer_pos()
+                && !thumb.contains(click)
+            {
+                // A click beside the thumb moves most of a screen that way.
+                let step = if click[axis] < thumb.min[axis] {
+                    -shown
+                } else {
+                    shown
+                };
+                to = Some((from + 0.9 * step).clamp(start, start + room));
+            }
+            if let Some(to) = to {
+                self.camera.offset[axis] = -to * self.camera.scale;
+            }
+            if response.drag_stopped() {
+                self.scrolling = None;
+            }
+
+            let visuals = ui.visuals();
+            let strength = if response.dragged() {
+                0.85
+            } else if response.hovered() {
+                0.65
+            } else {
+                0.45
+            };
+            let color = visuals.text_color().gamma_multiply(strength);
+            ui.painter()
+                .rect_filled(track, 0.0, visuals.extreme_bg_color);
+            ui.painter().rect_filled(thumb.shrink(2.0), 4.0, color);
+        }
+    }
+
     /// Show the canvas, handle input, and edit `doc`.
     pub fn show(
         &mut self,
@@ -997,9 +1290,17 @@ impl Canvas {
         markers: &[Marker],
         lit: &std::collections::HashSet<ComponentId>,
     ) {
-        let (response, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
-        let rect = response.rect;
+        // The drawing, with a scroll bar to its right and one below.
+        let (area, _) = ui.allocate_exact_size(ui.available_size(), Sense::hover());
+        let rect = Rect::from_min_max(area.min, (area.max - Vec2::splat(SCROLLBAR)).max(area.min));
+        let response = ui.interact(rect, ui.id().with("schematic"), Sense::click_and_drag());
+        let painter = ui.painter_at(rect);
         let origin = rect.min;
+        if self.centre_drawing(rect.size(), doc.schematic()) {
+            ui.ctx().request_repaint();
+        }
+        // First, so that what is drawn is where the bars have taken it.
+        self.scroll_bars(ui, area, rect, doc.schematic());
         let colors = Palette::for_ui(ui);
         let pointer = response.hover_pos().or(response.interact_pointer_pos());
         let grid_pointer = pointer.map(|p| self.camera.to_grid(origin, p));
@@ -1012,21 +1313,27 @@ impl Canvas {
             .and_then(|_| ui.input(|i| i.pointer.latest_pos()))
             .map(|p| snap(self.camera.to_grid(origin, p)));
 
-        // ---- navigation: zoom with the wheel, pan with middle drag ----
+        // ---- navigation: the wheel scrolls (sideways with Shift) and zooms
+        // with Ctrl, as does a pinch; the middle button drags the drawing ----
         if response.hovered() {
             let (scroll, zoom) = ui.input(|i| (i.smooth_scroll_delta, i.zoom_delta()));
-            if let Some(p) = pointer {
-                let factor = zoom * (scroll.y * 0.0025).exp();
-                if (factor - 1.0).abs() > 1e-4 {
-                    self.camera.zoom_at(origin, p, factor);
-                }
+            if let Some(p) = pointer
+                && (zoom - 1.0).abs() > 1e-4
+            {
+                self.camera.zoom_at(origin, p, zoom);
             }
+            self.camera.offset += scroll;
         }
         if response.dragged_by(PointerButton::Middle) {
             self.camera.offset += response.drag_delta();
         }
 
         // ---- keyboard ----
+        let (modifiers, focused) = ui.input(|i| (i.modifiers, i.focused));
+        if self.hold_tool(modifiers, focused) {
+            // The palette and the bottom bar show the tool too.
+            ui.ctx().request_repaint();
+        }
         if !ui.ctx().wants_keyboard_input() {
             self.keyboard(ui, doc);
         }
@@ -1044,7 +1351,7 @@ impl Canvas {
                 if response.clicked()
                     && let Some(at) = snapped
                 {
-                    doc.edit(|s| add_part(s, kind.clone(), at, rotation, mirrored));
+                    self.place(doc, kind.clone(), at, rotation, mirrored);
                 }
                 if response.clicked_by(PointerButton::Secondary) {
                     self.cancel();
@@ -1062,13 +1369,13 @@ impl Canvas {
                 let kind = press
                     .map(|p| classify_wire_press(self.wire_start.is_some(), doc.schematic(), p));
                 match kind {
-                    Some(WirePress::Grab(_)) => {
+                    Some(WirePress::Grab(_)) if self.borrowed.is_none() => {
                         // Carry the press into the Select tool: it selects
                         // the part, and a drag moves it.
                         self.tool = Tool::Select;
                         self.select_tool(&response, doc, origin, grid_pointer, snapped);
                     }
-                    Some(WirePress::Ignore) => {}
+                    Some(WirePress::Grab(_) | WirePress::Ignore) => {}
                     _ => self.wire_tool(&response, doc, snapped),
                 }
             }
@@ -1096,7 +1403,7 @@ impl Canvas {
             }
         }
 
-        // Dropped from the palette: place it and start wiring.
+        // Dropped from the palette: place it and carry on placing.
         if let Some(drag) = response.dnd_release_payload::<PartDrag>()
             && let Some(at) = drag_at
         {
@@ -1316,11 +1623,8 @@ impl Canvas {
             }
             Tool::Label => {
                 if let Some(at) = snapped {
-                    painter.circle_stroke(
-                        p.screen(to_pos(at)),
-                        4.0,
-                        Stroke::new(1.0_f32, colors.label),
-                    );
+                    let at = p.screen(to_pos(at));
+                    label_cursor(&painter, at, colors.label, colors.background);
                 }
             }
             Tool::Probe => {
@@ -1414,6 +1718,8 @@ impl Canvas {
                 self.selection.clear();
             }
         }
+        // While placing, R and X turn the part about to be placed; otherwise
+        // they turn what is selected.
         if let Tool::Place {
             rotation, mirrored, ..
         } = &mut self.tool
@@ -1424,16 +1730,11 @@ impl Canvas {
             if mirror {
                 *mirrored = !*mirrored;
             }
-            return;
-        }
-        if self.selection.is_empty() {
-            return;
-        }
-        if rotate || mirror {
+        } else if (rotate || mirror) && !self.selection.is_empty() {
             let items = self.selection.clone();
             doc.edit(|s| transform_components(s, &items, mirror));
         }
-        if delete {
+        if delete && !self.selection.is_empty() {
             let items = std::mem::take(&mut self.selection);
             doc.edit(|s| delete_items(s, &items));
         }
@@ -1505,7 +1806,7 @@ impl Canvas {
             None
         };
         if let Some(at) = corner_press {
-            self.drag = Some(Drag::Vertex { at, started: false });
+            self.drag = Some(Drag::Vertex { at, joined: None });
         } else if response.drag_started_by(PointerButton::Primary) {
             let press = response
                 .ctx
@@ -1522,7 +1823,7 @@ impl Canvas {
                     }
                     self.drag = press.map(|p| Drag::Move {
                         last: snap(p),
-                        started: false,
+                        joined: None,
                     });
                 }
                 None => {
@@ -1535,27 +1836,27 @@ impl Canvas {
             }
         }
         if response.dragged_by(PointerButton::Primary)
-            && let (Some(Drag::Move { last, started }), Some(now)) = (&mut self.drag, snapped)
+            && let (Some(Drag::Move { last, joined }), Some(now)) = (&mut self.drag, snapped)
         {
             let d = now - *last;
             if d != Point::default() {
-                if !*started {
+                let joined = joined.get_or_insert_with(|| {
                     doc.checkpoint();
-                    *started = true;
-                }
-                move_items(doc.schematic_mut(), &self.selection, d);
+                    joined_to(doc.schematic(), &self.selection)
+                });
+                move_items(doc.schematic_mut(), &self.selection, joined, d);
                 *last = now;
             }
         }
         if response.dragged_by(PointerButton::Primary)
-            && let (Some(Drag::Vertex { at, started }), Some(now)) = (&mut self.drag, snapped)
+            && let (Some(Drag::Vertex { at, joined }), Some(now)) = (&mut self.drag, snapped)
             && now != *at
         {
-            if !*started {
+            let joined = joined.get_or_insert_with(|| {
                 doc.checkpoint();
-                *started = true;
-            }
-            move_vertex(doc.schematic_mut(), *at, now);
+                joined_at(doc.schematic(), *at)
+            });
+            move_vertex(doc.schematic_mut(), joined, now);
             *at = now;
         }
         if response.drag_stopped() {
@@ -1573,7 +1874,7 @@ impl Canvas {
         if response.clicked() {
             // A plain click on a pin starts a wire from it; dragging from a
             // pin still moves the part.
-            let pin = if shift {
+            let pin = if shift || self.borrowed.is_some() {
                 None
             } else {
                 grid_pointer.and_then(|p| pin_at(doc.schematic(), p))
@@ -1699,20 +2000,37 @@ impl Canvas {
         }
     }
 
-    /// A part dropped from the palette at `at`: place it, keep it selected
-    /// (so R, X and the properties panel apply to it) and start wiring.
-    fn drop_part(&mut self, doc: &mut Document, kind: ComponentKind, at: Point) {
-        let id = doc.edit(|s| add_part(s, kind, at, Rotation::R0, false));
+    /// Add a part at `at`. It becomes the selection, so that the properties
+    /// panel and Del apply to the one just placed.
+    fn place(
+        &mut self,
+        doc: &mut Document,
+        kind: ComponentKind,
+        at: Point,
+        rotation: Rotation,
+        mirrored: bool,
+    ) {
+        let id = doc.edit(|s| add_part(s, kind, at, rotation, mirrored));
         self.selection = BTreeSet::from([Item::Component(id)]);
+    }
+
+    /// A part dropped from the palette at `at`: place it, and carry on placing
+    /// more of the same until another tool or part is chosen.
+    fn drop_part(&mut self, doc: &mut Document, kind: ComponentKind, at: Point) {
+        self.place(doc, kind.clone(), at, Rotation::R0, false);
         self.wire_start = None;
-        self.tool = Tool::Wire;
+        self.tool = Tool::Place {
+            kind,
+            rotation: Rotation::R0,
+            mirrored: false,
+        };
     }
 
     fn wire_tool(&mut self, response: &egui::Response, doc: &mut Document, snapped: Option<Point>) {
         if response.clicked_by(PointerButton::Secondary) {
             if self.wire_start.is_some() {
                 self.wire_start = None;
-            } else {
+            } else if self.borrowed.is_none() {
                 self.cancel();
             }
             return;
@@ -1748,6 +2066,194 @@ impl Canvas {
 mod tests {
     use super::*;
     use crate::examples::voltage_divider;
+
+    /// A canvas filling a headless window, driven by made-up events.
+    struct Rig {
+        ctx: egui::Context,
+        canvas: Canvas,
+        doc: Document,
+        netlist: Netlist,
+        time: f64,
+        /// What the last frame drew.
+        drawn: Vec<egui::epaint::ClippedShape>,
+    }
+
+    impl Rig {
+        const WINDOW: Vec2 = vec2(800.0, 600.0);
+
+        fn new(schematic: Schematic) -> Self {
+            let netlist = dunbrec_core::build_netlist(&schematic);
+            let mut rig = Rig {
+                ctx: egui::Context::default(),
+                canvas: Canvas::default(),
+                doc: Document::new(schematic, None),
+                netlist,
+                time: 0.0,
+                drawn: Vec::new(),
+            };
+            rig.settle();
+            rig
+        }
+
+        fn frame(&mut self, modifiers: egui::Modifiers, events: Vec<egui::Event>) {
+            self.time += 0.1;
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Self::WINDOW)),
+                time: Some(self.time),
+                modifiers,
+                events,
+                ..Default::default()
+            };
+            let (canvas, doc, netlist) = (&mut self.canvas, &mut self.doc, &self.netlist);
+            let out = self.ctx.run(input, |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| {
+                        canvas.show(ui, doc, netlist, &[], &[], &Default::default());
+                    });
+            });
+            self.drawn = out.shapes;
+        }
+
+        fn settle(&mut self) {
+            for _ in 0..30 {
+                self.frame(egui::Modifiers::NONE, vec![]);
+            }
+        }
+
+        /// Turn the wheel (towards the user is negative) over the drawing.
+        fn wheel(&mut self, lines: f32, modifiers: egui::Modifiers) {
+            let at = pos2(300.0, 300.0);
+            self.frame(modifiers, vec![egui::Event::PointerMoved(at)]);
+            self.frame(
+                modifiers,
+                vec![egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Line,
+                    delta: vec2(0.0, lines),
+                    modifiers,
+                }],
+            );
+            for _ in 0..30 {
+                self.frame(modifiers, vec![]);
+            }
+        }
+
+        fn button(&mut self, at: Pos2, pressed: bool) {
+            self.frame(
+                egui::Modifiers::NONE,
+                vec![egui::Event::PointerButton {
+                    pos: at,
+                    button: PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+        }
+
+        fn drag(&mut self, from: Pos2, to: Pos2) {
+            let moved = |p| vec![egui::Event::PointerMoved(p)];
+            self.frame(egui::Modifiers::NONE, moved(from));
+            self.button(from, true);
+            for i in 1..=10 {
+                let at = from + (to - from) * (i as f32 / 10.0);
+                self.frame(egui::Modifiers::NONE, moved(at));
+            }
+            self.button(to, false);
+            self.settle();
+        }
+
+        /// The part of the schematic in view, in grid units.
+        fn visible(&self) -> Rect {
+            let c = self.canvas.camera;
+            let size = Self::WINDOW - Vec2::splat(SCROLLBAR);
+            Rect::from_min_max(
+                c.to_grid(Pos2::ZERO, Pos2::ZERO),
+                c.to_grid(Pos2::ZERO, Pos2::ZERO + size),
+            )
+        }
+    }
+
+    #[test]
+    fn the_wheel_scrolls_and_zooms_with_ctrl() {
+        let mut rig = Rig::new(voltage_divider());
+        let start = rig.canvas.camera;
+        rig.wheel(-2.0, egui::Modifiers::NONE);
+        let down = rig.canvas.camera;
+        assert_eq!(down.scale, start.scale);
+        assert!(down.offset.y < start.offset.y, "further down the drawing");
+        assert_eq!(down.offset.x, start.offset.x);
+        rig.wheel(-2.0, egui::Modifiers::SHIFT);
+        let right = rig.canvas.camera;
+        assert!(right.offset.x < down.offset.x, "further to the right");
+        assert_eq!((right.scale, right.offset.y), (down.scale, down.offset.y));
+        // Zooming keeps what is under the pointer where it is.
+        let ctrl = egui::Modifiers {
+            ctrl: true,
+            command: true,
+            ..Default::default()
+        };
+        let at = pos2(300.0, 300.0);
+        let under = right.to_grid(Pos2::ZERO, at);
+        rig.wheel(2.0, ctrl);
+        let zoomed = rig.canvas.camera;
+        assert!(zoomed.scale > right.scale);
+        assert!(zoomed.to_grid(Pos2::ZERO, at).distance(under) < 0.01);
+    }
+
+    #[test]
+    fn the_scroll_bars_move_the_view_over_the_whole_drawing() {
+        let mut s = Schematic::new();
+        // A drawing far wider and taller than the window.
+        s.add_wire(Point::new(0, 0), Point::new(200, 0));
+        s.add_wire(Point::new(0, 0), Point::new(0, 150));
+        let mut rig = Rig::new(s);
+        let drawing = drawing_bounds(rig.doc.schematic()).unwrap();
+        let start = rig.visible();
+        let extent = scroll_extent(Some(drawing), start);
+        assert!(extent.contains_rect(drawing.expand(1.0)));
+        // The bottom bar's thumb, dragged to the far end, shows the right
+        // edge of the drawing; up and down is left alone.
+        let along = rig.canvas.camera;
+        let width = Rig::WINDOW.x - SCROLLBAR;
+        let thumb_x = (start.left() - extent.left()) / extent.width() * width + 10.0;
+        let y = Rig::WINDOW.y - SCROLLBAR / 2.0;
+        rig.drag(pos2(thumb_x, y), pos2(Rig::WINDOW.x - 1.0, y));
+        let end = rig.visible();
+        assert!(end.right() >= drawing.right(), "{end:?}");
+        assert_eq!(rig.canvas.camera.offset.y, along.offset.y);
+        assert_eq!(rig.canvas.camera.scale, along.scale);
+        assert!(rig.canvas.scrolling.is_none(), "let go");
+        // A click above the right bar's thumb pages up, one below it down.
+        let x = Rig::WINDOW.x - SCROLLBAR / 2.0;
+        let before = rig.visible().top();
+        let bottom = pos2(x, Rig::WINDOW.y - SCROLLBAR - 2.0);
+        rig.frame(
+            egui::Modifiers::NONE,
+            vec![egui::Event::PointerMoved(bottom)],
+        );
+        rig.button(bottom, true);
+        rig.button(bottom, false);
+        rig.settle();
+        let paged = rig.visible().top();
+        assert!(paged > before, "{before} then {paged}");
+        let top = pos2(x, 2.0);
+        rig.frame(egui::Modifiers::NONE, vec![egui::Event::PointerMoved(top)]);
+        rig.button(top, true);
+        rig.button(top, false);
+        rig.settle();
+        assert!(rig.visible().top() < paged);
+        // The bars edit nothing.
+        assert!(!rig.doc.is_dirty() && rig.canvas.selection.is_empty());
+    }
+
+    #[test]
+    fn an_empty_schematic_has_nothing_to_scroll_to() {
+        assert_eq!(drawing_bounds(&Schematic::new()), None);
+        let visible = Rect::from_min_size(pos2(-3.0, 2.0), vec2(40.0, 30.0));
+        assert_eq!(scroll_extent(None, visible), visible);
+        let rig = Rig::new(Schematic::new());
+        assert!(rig.canvas.scrolling.is_none());
+    }
 
     #[test]
     fn unconnected_crossings_get_a_hop_and_connected_ones_do_not() {
@@ -1838,7 +2344,8 @@ mod tests {
 
         // Moving the corner takes both wire ends and the label with it, and
         // leaves the pin end where it was.
-        move_vertex(&mut s, Point::new(6, 0), Point::new(6, 2));
+        let joined = joined_at(&s, Point::new(6, 0));
+        move_vertex(&mut s, &joined, Point::new(6, 2));
         assert_eq!(
             (s.wires[0].a, s.wires[0].b),
             (Point::new(2, 0), Point::new(6, 2))
@@ -1898,7 +2405,7 @@ mod tests {
     }
 
     #[test]
-    fn dropping_a_part_places_selects_and_starts_wiring() {
+    fn dropping_a_part_places_selects_and_goes_on_placing() {
         let mut canvas = Canvas::default();
         let mut doc = Document::default();
         let resistor = ComponentKind::Resistor { resistance: 1e3 };
@@ -1909,7 +2416,12 @@ mod tests {
         let c = &s.components[0];
         assert_eq!((c.kind.clone(), c.position), (resistor, Point::new(4, 6)));
         assert_eq!(canvas.selection, BTreeSet::from([Item::Component(c.id)]));
-        assert_eq!(canvas.tool, Tool::Wire);
+        let placing = Tool::Place {
+            kind: ComponentKind::Resistor { resistance: 1e3 },
+            rotation: Rotation::R0,
+            mirrored: false,
+        };
+        assert_eq!(canvas.tool, placing);
         assert!(canvas.wire_start.is_none());
 
         // One undo step removes it.
@@ -1927,6 +2439,350 @@ mod tests {
                 .get(crate::library::GENERIC_DIODE)
                 .is_some()
         );
+    }
+
+    /// Press `key` on a canvas.
+    fn press_key(canvas: &mut Canvas, doc: &mut Document, key: Key) {
+        let input = egui::RawInput {
+            events: vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Default::default(),
+            }],
+            ..Default::default()
+        };
+        let _ = egui::Context::default().run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| canvas.keyboard(ui, doc));
+        });
+    }
+
+    #[test]
+    fn while_placing_r_turns_the_next_part_and_del_removes_the_last() {
+        let mut canvas = Canvas::default();
+        let mut doc = Document::default();
+        let kind = ComponentKind::Resistor { resistance: 1e3 };
+        canvas.drop_part(&mut doc, kind.clone(), Point::new(0, 0));
+        canvas.place(&mut doc, kind, Point::new(0, 10), Rotation::R0, false);
+        let ids: Vec<ComponentId> = doc.schematic().components.iter().map(|c| c.id).collect();
+        // The one just placed is the selected one.
+        assert_eq!(canvas.selection, BTreeSet::from([Item::Component(ids[1])]));
+
+        press_key(&mut canvas, &mut doc, Key::R);
+        assert!(matches!(
+            canvas.tool,
+            Tool::Place { rotation, .. } if rotation == Rotation::R0.rotated_ccw()
+        ));
+        let turned = |doc: &Document| {
+            doc.schematic()
+                .components
+                .iter()
+                .any(|c| c.rotation != Rotation::R0)
+        };
+        assert!(!turned(&doc), "the placed parts stay as they are");
+
+        press_key(&mut canvas, &mut doc, Key::Delete);
+        assert_eq!(doc.schematic().components.len(), 1);
+        assert_eq!(doc.schematic().components[0].id, ids[0]);
+        assert!(matches!(canvas.tool, Tool::Place { .. }), "still placing");
+
+        // Esc leaves.
+        press_key(&mut canvas, &mut doc, Key::Escape);
+        assert_eq!(canvas.tool, Tool::Select);
+    }
+
+    #[test]
+    fn only_the_label_tool_carries_a_tag_clear_of_the_mouse_pointer() {
+        let mut rig = Rig::new(Schematic::new());
+        let mouse = pos2(300.0, 300.0);
+        // Where the tag's writing is drawn, if it is.
+        let tag = |rig: &mut Rig, tool: Tool| {
+            rig.canvas.tool = tool;
+            for _ in 0..3 {
+                rig.frame(
+                    egui::Modifiers::NONE,
+                    vec![egui::Event::PointerMoved(mouse)],
+                );
+            }
+            rig.drawn.iter().find_map(|c| match &c.shape {
+                egui::Shape::Text(t) if t.galley.text() == "abc" => {
+                    Some(Rect::from_min_size(t.pos, t.galley.size()))
+                }
+                _ => None,
+            })
+        };
+        let writing = tag(&mut rig, Tool::Label).expect("the tag is drawn");
+        // Right of the point and above it; the arrow hangs below the mouse.
+        assert!(writing.left() > mouse.x, "{writing:?}");
+        assert!(writing.bottom() < mouse.y, "{writing:?}");
+        assert!(writing.left() - mouse.x < 60.0 && mouse.y - writing.top() < 60.0);
+        for tool in [Tool::Select, Tool::Wire, Tool::Probe] {
+            assert_eq!(tag(&mut rig, tool.clone()), None, "{tool:?}");
+        }
+    }
+
+    const CTRL: egui::Modifiers = egui::Modifiers {
+        alt: false,
+        ctrl: true,
+        shift: false,
+        mac_cmd: false,
+        command: true,
+    };
+    const ALT: egui::Modifiers = egui::Modifiers::ALT;
+    const NO_KEY: egui::Modifiers = egui::Modifiers::NONE;
+
+    fn resistor_tool() -> Tool {
+        Tool::Place {
+            kind: ComponentKind::Resistor { resistance: 1e3 },
+            rotation: Rotation::R0.rotated_ccw(),
+            mirrored: true,
+        }
+    }
+
+    impl Rig {
+        /// Where the grid point `x`, `y` is drawn.
+        fn at(&self, x: i32, y: i32) -> Pos2 {
+            self.canvas
+                .camera
+                .to_screen(Pos2::ZERO, to_pos(Point::new(x, y)))
+        }
+
+        fn hold(&mut self, keys: egui::Modifiers) {
+            self.frame(keys, vec![]);
+        }
+
+        /// Move to `at` and click there with `keys` held.
+        fn click_holding(&mut self, keys: egui::Modifiers, at: Pos2) {
+            self.frame(keys, vec![egui::Event::PointerMoved(at)]);
+            for pressed in [true, false] {
+                self.press(keys, at, PointerButton::Primary, pressed);
+            }
+            // Long enough that the next click is not a double click.
+            for _ in 0..10 {
+                self.frame(keys, vec![]);
+            }
+        }
+
+        fn press(&mut self, keys: egui::Modifiers, at: Pos2, button: PointerButton, pressed: bool) {
+            self.frame(
+                keys,
+                vec![egui::Event::PointerButton {
+                    pos: at,
+                    button,
+                    pressed,
+                    modifiers: keys,
+                }],
+            );
+        }
+    }
+
+    #[test]
+    fn holding_ctrl_wires_and_letting_go_drops_an_unfinished_wire() {
+        let mut rig = Rig::new(Schematic::new());
+        rig.canvas.tool = resistor_tool();
+        rig.hold(CTRL);
+        assert_eq!(rig.canvas.tool, Tool::Wire);
+        let (a, b) = (rig.at(4, 4), rig.at(10, 4));
+        rig.click_holding(CTRL, a);
+        rig.click_holding(CTRL, b);
+        let wires = rig.doc.schematic().wires.len();
+        assert!(wires > 0, "the first piece is drawn");
+        assert!(rig.canvas.wire_start.is_some(), "and another is under way");
+        assert!(rig.doc.schematic().components.is_empty());
+        rig.hold(NO_KEY);
+        // Just as it was, turned and mirrored.
+        assert_eq!(rig.canvas.tool, resistor_tool());
+        assert!(rig.canvas.wire_start.is_none());
+        assert_eq!(rig.doc.schematic().wires.len(), wires);
+    }
+
+    #[test]
+    fn holding_alt_selects_and_the_wire_carries_on_afterwards() {
+        let mut s = Schematic::new();
+        let id = s.add_component(
+            ComponentKind::Resistor { resistance: 1e3 },
+            Point::new(10, 10),
+        );
+        let mut rig = Rig::new(s);
+        rig.canvas.tool = Tool::Wire;
+        rig.canvas.wire_start = Some(Point::new(2, 2));
+        // A click on a pin selects here; it does not start a wire.
+        rig.hold(ALT);
+        assert_eq!(rig.canvas.tool, Tool::Select);
+        let pin = rig.at(12, 10);
+        rig.click_holding(ALT, pin);
+        assert_eq!(rig.canvas.tool, Tool::Select);
+        assert_eq!(rig.canvas.selection, BTreeSet::from([Item::Component(id)]));
+
+        // A drag still going when Alt is let go is finished first.
+        let (from, to) = (rig.at(10, 10), rig.at(14, 16));
+        rig.frame(ALT, vec![egui::Event::PointerMoved(from)]);
+        rig.press(ALT, from, PointerButton::Primary, true);
+        for i in 1..=10 {
+            let keys = if i < 5 { ALT } else { NO_KEY };
+            let at = from + (to - from) * (i as f32 / 10.0);
+            rig.frame(keys, vec![egui::Event::PointerMoved(at)]);
+            assert_eq!(rig.canvas.tool, Tool::Select, "step {i}");
+        }
+        rig.press(NO_KEY, to, PointerButton::Primary, false);
+        rig.settle();
+        let moved = rig.doc.schematic().component(id).unwrap().position;
+        assert_eq!(moved, Point::new(14, 16));
+        assert_eq!(rig.canvas.tool, Tool::Wire);
+        assert_eq!(rig.canvas.wire_start, Some(Point::new(2, 2)));
+        assert!(rig.doc.schematic().wires.is_empty());
+    }
+
+    #[test]
+    fn a_borrowed_wire_tool_stays_a_wire_tool() {
+        let mut s = Schematic::new();
+        s.add_component(
+            ComponentKind::Resistor { resistance: 1e3 },
+            Point::new(10, 10),
+        );
+        let mut rig = Rig::new(s);
+        rig.canvas.tool = Tool::Label;
+        // Neither a part's body nor a right-click leaves it.
+        let body = rig.at(10, 10);
+        rig.click_holding(CTRL, body);
+        assert_eq!(rig.canvas.tool, Tool::Wire);
+        for pressed in [true, false] {
+            rig.press(CTRL, body, PointerButton::Secondary, pressed);
+        }
+        rig.hold(CTRL);
+        assert_eq!(rig.canvas.tool, Tool::Wire);
+        rig.hold(NO_KEY);
+        assert_eq!(rig.canvas.tool, Tool::Label);
+    }
+
+    #[test]
+    fn which_keys_borrow_a_tool() {
+        let mut canvas = Canvas {
+            tool: Tool::Probe,
+            ..Canvas::default()
+        };
+        let both = egui::Modifiers { alt: true, ..CTRL };
+        // Both keys, as AltGr sends, and Shift ask for nothing.
+        for keys in [NO_KEY, both, egui::Modifiers::SHIFT] {
+            assert!(!canvas.hold_tool(keys, true));
+            assert_eq!(canvas.tool, Tool::Probe);
+        }
+        // From one key to the other, and then both.
+        for (keys, tool) in [(CTRL, Tool::Wire), (ALT, Tool::Select), (both, Tool::Probe)] {
+            assert!(canvas.hold_tool(keys, true));
+            assert_eq!(canvas.tool, tool);
+        }
+        // Leaving the window lets go, whatever the keys seem to be.
+        canvas.hold_tool(ALT, true);
+        canvas.hold_tool(ALT, false);
+        assert_eq!(canvas.tool, Tool::Probe);
+        // A tool chosen while a key is down is kept.
+        canvas.hold_tool(CTRL, true);
+        canvas.tool = Tool::Label;
+        canvas.hold_tool(NO_KEY, true);
+        assert_eq!(canvas.tool, Tool::Label);
+        // Already the tool the key gives: nothing to go back to.
+        canvas.tool = Tool::Wire;
+        assert!(!canvas.hold_tool(CTRL, true));
+        assert!(!canvas.hold_tool(NO_KEY, true));
+        assert_eq!(canvas.tool, Tool::Wire);
+    }
+
+    /// Drag from one screen point to another one grid step at a time, so
+    /// that everything on the way is passed over.
+    fn drag_slowly(rig: &mut Rig, from: Point, to: Point) {
+        let (a, b) = (rig.at(from.x, from.y), rig.at(to.x, to.y));
+        let steps = (to.x - from.x).abs().max((to.y - from.y).abs()) * 2;
+        rig.frame(NO_KEY, vec![egui::Event::PointerMoved(a)]);
+        rig.press(NO_KEY, a, PointerButton::Primary, true);
+        for i in 1..=steps {
+            let at = a + (b - a) * (i as f32 / steps as f32);
+            rig.frame(NO_KEY, vec![egui::Event::PointerMoved(at)]);
+        }
+        rig.press(NO_KEY, b, PointerButton::Primary, false);
+        rig.settle();
+    }
+
+    #[test]
+    fn a_dragged_part_does_not_pick_up_wires_it_passes() {
+        let mut s = Schematic::new();
+        let id = s.add_component(
+            ComponentKind::Resistor { resistance: 1e3 },
+            Point::new(6, 6),
+        );
+        // One wire joined to its left pin, and two it will pass over: its
+        // pins cross their ends on the way.
+        s.add_wire(Point::new(4, 6), Point::new(4, 2));
+        s.add_wire(Point::new(14, 6), Point::new(14, 2));
+        s.add_wire(Point::new(18, 6), Point::new(22, 6));
+        let mut rig = Rig::new(s);
+        drag_slowly(&mut rig, Point::new(6, 6), Point::new(26, 6));
+        let s = rig.doc.schematic();
+        assert_eq!(s.component(id).unwrap().position, Point::new(26, 6));
+        let ends: Vec<(Point, Point)> = s.wires.iter().map(|w| (w.a, w.b)).collect();
+        assert_eq!(
+            ends,
+            [
+                (Point::new(24, 6), Point::new(4, 2)),
+                (Point::new(14, 6), Point::new(14, 2)),
+                (Point::new(18, 6), Point::new(22, 6)),
+            ]
+        );
+        // One undo step puts it all back.
+        assert!(rig.doc.undo());
+        assert_eq!(rig.doc.schematic().wires[0].a, Point::new(4, 6));
+    }
+
+    #[test]
+    fn a_dragged_wire_end_does_not_pick_up_what_it_passes() {
+        let mut s = Schematic::new();
+        s.add_wire(Point::new(4, 4), Point::new(4, 8));
+        s.add_wire(Point::new(10, 4), Point::new(10, 8));
+        s.add_label("OTHER", Point::new(10, 4));
+        let mut rig = Rig::new(s);
+        drag_slowly(&mut rig, Point::new(4, 4), Point::new(16, 4));
+        let s = rig.doc.schematic();
+        assert_eq!(s.wires[0].a, Point::new(16, 4));
+        assert_eq!(s.wires[1].a, Point::new(10, 4));
+        assert_eq!(s.labels[0].position, Point::new(10, 4));
+    }
+
+    #[test]
+    fn a_circuit_is_first_shown_in_the_middle_of_the_view() {
+        // Far from where an uncentred view would look, and large or small.
+        for far in [Point::new(300, 200), Point::new(-150, -90)] {
+            let mut s = Schematic::new();
+            s.add_component(ComponentKind::Resistor { resistance: 1e3 }, far);
+            s.add_wire(far + Point::new(2, 0), far + Point::new(12, 8));
+            let drawing = drawing_bounds(&s).unwrap();
+            let mut rig = Rig::new(s);
+            let view = Rig::WINDOW - Vec2::splat(SCROLLBAR);
+            let at = rig.canvas.camera.to_screen(Pos2::ZERO, drawing.center());
+            assert!(at.distance((view / 2.0).to_pos2()) <= 1.0, "{at:?}");
+            assert_eq!(rig.canvas.camera.scale, Camera::default().scale);
+            // From then on the view stays where the user takes it.
+            rig.wheel(-2.0, egui::Modifiers::NONE);
+            let scrolled = rig.canvas.camera.offset;
+            rig.settle();
+            assert_eq!(rig.canvas.camera.offset, scrolled);
+        }
+    }
+
+    #[test]
+    fn an_empty_circuit_keeps_its_view_when_the_first_part_arrives() {
+        let mut rig = Rig::new(Schematic::new());
+        let start = rig.canvas.camera.offset;
+        assert_eq!(start, Camera::default().offset);
+        rig.canvas.place(
+            &mut rig.doc,
+            ComponentKind::Resistor { resistance: 1e3 },
+            Point::new(30, 20),
+            Rotation::R0,
+            false,
+        );
+        rig.settle();
+        assert_eq!(rig.canvas.camera.offset, start);
     }
 
     #[test]
@@ -2031,7 +2887,8 @@ mod tests {
         let mut s = voltage_divider();
         let r1 = s.components[1].id;
         let items: BTreeSet<Item> = [Item::Component(r1)].into();
-        move_items(&mut s, &items, Point::new(0, -3));
+        let joined = joined_to(&s, &items);
+        move_items(&mut s, &items, &joined, Point::new(0, -3));
         // Wire from V1 (0,-2) to R1's left pin (2,-2) now ends at (2,-5).
         assert!(
             s.wires
